@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, BufRead, BufReader, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -339,6 +339,22 @@ fn clear_cli_status_line() -> Result<()> {
     Ok(())
 }
 
+fn print_final_stats(command: &[String], out: &StreamTail, err: &StreamTail, started: Instant) {
+    eprintln!(
+        "time={:.1?} stdout L:{} W:{} C:{} B:{} stderr L:{} W:{} C:{} B:{} cmd={}",
+        started.elapsed(),
+        out.stats.lines,
+        out.stats.words,
+        out.stats.chars,
+        out.stats.bytes,
+        err.stats.lines,
+        err.stats.words,
+        err.stats.chars,
+        err.stats.bytes,
+        command.join(" ")
+    );
+}
+
 fn run_command(command: Vec<String>, cfg: &Config, tui: bool) -> Result<HistoryEntry> {
     anyhow::ensure!(!command.is_empty(), "usage: wcc -- cmd args   or   wcc gui -- cmd args");
     let term = Arc::new(AtomicBool::new(false));
@@ -348,6 +364,8 @@ fn run_command(command: Vec<String>, cfg: &Config, tui: bool) -> Result<HistoryE
     let started = Instant::now();
     let timestamp = Utc::now();
     let id = timestamp.timestamp_millis().to_string();
+    let interactive_stdin = io::stdin().is_terminal();
+    let show_live_stats = !tui && !interactive_stdin;
 
     let mut child = Command::new(&command[0])
         .args(&command[1..])
@@ -371,14 +389,17 @@ fn run_command(command: Vec<String>, cfg: &Config, tui: bool) -> Result<HistoryE
     if tui {
         run_tui_loop(&command, &mut child, rx, &mut out, &mut err, started, &term, cfg)?;
     } else {
-        run_cli_loop(&command, &mut child, rx, &mut out, &mut err, started, &term, &cfg.retain)?;
+        run_cli_loop(&command, &mut child, rx, &mut out, &mut err, started, &term, &cfg.retain, show_live_stats)?;
     }
 
     let status = child.wait().ok();
     let killed = term.load(Ordering::Relaxed) && status.as_ref().and_then(|s| s.code()).is_none();
     let duration_ms = started.elapsed().as_millis();
 
-    clear_cli_status_line().ok();
+    if show_live_stats {
+        clear_cli_status_line().ok();
+    }
+    print_final_stats(&command, &out, &err, started);
     let _ = set_clipboard(&command, &out.content, &err.content);
 
     let entry = HistoryEntry {
@@ -399,31 +420,51 @@ fn run_command(command: Vec<String>, cfg: &Config, tui: bool) -> Result<HistoryE
     Ok(entry)
 }
 
-fn run_cli_loop(command: &[String], child: &mut Child, rx: Receiver<Msg>, out: &mut StreamTail, err: &mut StreamTail, started: Instant, term: &Arc<AtomicBool>, retain: &RetainPolicy) -> Result<()> {
+fn run_cli_loop(
+    command: &[String],
+    child: &mut Child,
+    rx: Receiver<Msg>,
+    out: &mut StreamTail,
+    err: &mut StreamTail,
+    started: Instant,
+    term: &Arc<AtomicBool>,
+    retain: &RetainPolicy,
+    show_live_stats: bool,
+) -> Result<()> {
     let mut last_status = Instant::now();
-    println!();
+    if show_live_stats {
+        println!();
+    }
     loop {
         while let Ok(msg) = rx.try_recv() {
-            clear_cli_status_line()?;
+            if show_live_stats {
+                clear_cli_status_line()?;
+            }
             match msg {
                 Msg::Stdout(s) => { out.push(&s, retain); print!("{s}"); io::stdout().flush()?; }
                 Msg::Stderr(s) => { err.push(&s, retain); eprint!("{s}"); io::stderr().flush()?; }
             }
-            draw_cli_status(command, out, err, started)?;
+            if show_live_stats {
+                draw_cli_status(command, out, err, started)?;
+            }
         }
-        if last_status.elapsed() >= Duration::from_millis(120) {
+        if show_live_stats && last_status.elapsed() >= Duration::from_millis(120) {
             draw_cli_status(command, out, err, started)?;
             last_status = Instant::now();
         }
         if term.load(Ordering::Relaxed) { let _ = child.kill(); break; }
         if child.try_wait()?.is_some() {
             while let Ok(msg) = rx.try_recv() {
-                clear_cli_status_line()?;
+                if show_live_stats {
+                    clear_cli_status_line()?;
+                }
                 match msg {
                     Msg::Stdout(s) => { out.push(&s, retain); print!("{s}"); io::stdout().flush()?; }
                     Msg::Stderr(s) => { err.push(&s, retain); eprint!("{s}"); io::stderr().flush()?; }
                 }
-                draw_cli_status(command, out, err, started)?;
+                if show_live_stats {
+                    draw_cli_status(command, out, err, started)?;
+                }
             }
             break;
         }
