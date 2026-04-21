@@ -18,16 +18,21 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use crossterm::{
+    cursor::MoveToColumn,
     event::{self, Event, KeyCode},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    style::{Color as TermColor, Print, ResetColor, SetForegroundColor},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
 };
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap},
+    widgets::{Block, Borders, Cell, Clear as TuiClear, Paragraph, Row, Table, Wrap},
     Frame, Terminal,
 };
 use serde::{Deserialize, Serialize};
@@ -45,14 +50,12 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Mode>,
 
-    /// Command to run: wcc -- cmd args...
     #[arg(trailing_var_arg = true)]
     cmd: Vec<String>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Mode {
-    /// Ratatui interface with history and live stats
     Gui {
         #[arg(trailing_var_arg = true)]
         cmd: Vec<String>,
@@ -279,14 +282,53 @@ fn save_history(cfg: &Config, entry: &HistoryEntry) -> Result<()> {
 }
 
 fn set_clipboard(command: &[String], stdout: &str, stderr: &str) -> Result<()> {
-    let mut cb = Clipboard::new().context("clipboard init failed")?;
     let payload = format!(
         "$ {}\n\n[stdout]\n{}\n\n[stderr]\n{}",
         command.join(" "),
         stdout,
         stderr
     );
-    cb.set_text(payload)?;
+
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            return set_clipboard_wayland(&payload);
+        }
+    }
+
+    set_clipboard_arboard(&payload)
+}
+
+#[cfg(target_os = "linux")]
+fn set_clipboard_wayland(payload: &str) -> Result<()> {
+    let mut child = Command::new("wl-copy")
+        .arg("--type")
+        .arg("text/plain;charset=utf-8")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to spawn wl-copy")?;
+
+    {
+        let mut stdin = child.stdin.take().context("failed to open wl-copy stdin")?;
+        stdin.write_all(payload.as_bytes())?;
+        stdin.flush()?;
+    }
+
+    // Do NOT kill wl-copy. Let it daemonize/background itself normally on Wayland.
+    // That is the intended behavior and helps the clipboard remain available.
+    let _ = child.wait();
+    Ok(())
+}
+
+fn set_clipboard_arboard(payload: &str) -> Result<()> {
+    let mut cb = Clipboard::new().context("clipboard init failed")?;
+    cb.set_text(payload.to_string())?;
+    #[cfg(target_os = "linux")]
+    {
+        thread::sleep(Duration::from_millis(200));
+    }
     Ok(())
 }
 
@@ -310,6 +352,52 @@ fn spawn_reader<R: io::Read + Send + 'static>(reader: R, tx: Sender<Msg>, is_err
             }
         }
     });
+}
+
+fn draw_cli_status(
+    command: &[String],
+    out: &StreamTail,
+    err: &StreamTail,
+    started: Instant,
+) -> Result<()> {
+    let mut stdout = io::stdout();
+
+    execute!(
+        stdout,
+        MoveToColumn(0),
+        Clear(ClearType::CurrentLine),
+        SetForegroundColor(TermColor::Cyan),
+        Print("time "),
+        ResetColor,
+        Print(format!("{:.1?} ", started.elapsed())),
+        SetForegroundColor(TermColor::Green),
+        Print("stdout "),
+        ResetColor,
+        Print(format!(
+            "L:{} W:{} C:{} B:{} ",
+            out.stats.lines, out.stats.words, out.stats.chars, out.stats.bytes
+        )),
+        SetForegroundColor(TermColor::Red),
+        Print("stderr "),
+        ResetColor,
+        Print(format!(
+            "L:{} W:{} C:{} B:{} ",
+            err.stats.lines, err.stats.words, err.stats.chars, err.stats.bytes
+        )),
+        SetForegroundColor(TermColor::DarkGrey),
+        Print(format!("| {}", command.join(" "))),
+        ResetColor,
+        Print("\r")
+    )?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn clear_cli_status_line() -> Result<()> {
+    let mut stdout = io::stdout();
+    execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+    stdout.flush()?;
+    Ok(())
 }
 
 fn run_command(command: Vec<String>, cfg: &Config, tui: bool) -> Result<HistoryEntry> {
@@ -346,7 +434,7 @@ fn run_command(command: Vec<String>, cfg: &Config, tui: bool) -> Result<HistoryE
     if tui {
         run_tui_loop(&command, &mut child, rx, &mut out, &mut err, started, &term, cfg)?;
     } else {
-        run_cli_loop(&mut child, rx, &mut out, &mut err, &term, &cfg.retain)?;
+        run_cli_loop(&command, &mut child, rx, &mut out, &mut err, started, &term, &cfg.retain)?;
     }
 
     let status = child.wait().ok();
@@ -354,6 +442,7 @@ fn run_command(command: Vec<String>, cfg: &Config, tui: bool) -> Result<HistoryE
         && status.as_ref().and_then(|s| s.code()).is_none();
     let duration_ms = started.elapsed().as_millis();
 
+    clear_cli_status_line().ok();
     let _ = set_clipboard(&command, &out.content, &err.content);
 
     let entry = HistoryEntry {
@@ -376,27 +465,40 @@ fn run_command(command: Vec<String>, cfg: &Config, tui: bool) -> Result<HistoryE
 }
 
 fn run_cli_loop(
+    command: &[String],
     child: &mut Child,
     rx: Receiver<Msg>,
     out: &mut StreamTail,
     err: &mut StreamTail,
+    started: Instant,
     term: &Arc<AtomicBool>,
     retain: &RetainPolicy,
 ) -> Result<()> {
+    let mut last_status = Instant::now();
+
+    println!();
+
     loop {
         while let Ok(msg) = rx.try_recv() {
+            clear_cli_status_line()?;
             match msg {
                 Msg::Stdout(s) => {
+                    out.push(&s, retain);
                     print!("{s}");
                     io::stdout().flush()?;
-                    out.push(&s, retain);
                 }
                 Msg::Stderr(s) => {
+                    err.push(&s, retain);
                     eprint!("{s}");
                     io::stderr().flush()?;
-                    err.push(&s, retain);
                 }
             }
+            draw_cli_status(command, out, err, started)?;
+        }
+
+        if last_status.elapsed() >= Duration::from_millis(120) {
+            draw_cli_status(command, out, err, started)?;
+            last_status = Instant::now();
         }
 
         if term.load(Ordering::Relaxed) {
@@ -406,18 +508,20 @@ fn run_cli_loop(
 
         if child.try_wait()?.is_some() {
             while let Ok(msg) = rx.try_recv() {
+                clear_cli_status_line()?;
                 match msg {
                     Msg::Stdout(s) => {
+                        out.push(&s, retain);
                         print!("{s}");
                         io::stdout().flush()?;
-                        out.push(&s, retain);
                     }
                     Msg::Stderr(s) => {
+                        err.push(&s, retain);
                         eprint!("{s}");
                         io::stderr().flush()?;
-                        err.push(&s, retain);
                     }
                 }
+                draw_cli_status(command, out, err, started)?;
             }
             break;
         }
@@ -661,7 +765,7 @@ fn draw_ui(
     let details = Paragraph::new(selected_text)
         .wrap(Wrap { trim: false })
         .block(Block::default().borders(Borders::ALL).title("selected history"));
-    f.render_widget(Clear, layout[3]);
+    f.render_widget(TuiClear, layout[3]);
     f.render_widget(details, layout[3]);
 }
 
