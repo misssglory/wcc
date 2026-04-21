@@ -41,15 +41,10 @@ use signal_hook::flag;
 use thiserror::Error;
 
 #[derive(Parser, Debug)]
-#[command(
-    author,
-    version,
-    about = "Watch command output, store compact history, and copy command/stdout/stderr to clipboard"
-)]
+#[command(author, version, about = "Watch command output, keep history, and copy command/stdout/stderr to clipboard")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Mode>,
-
     #[arg(trailing_var_arg = true)]
     cmd: Vec<String>,
 }
@@ -131,10 +126,7 @@ struct StreamTail {
 
 impl StreamTail {
     fn new() -> Self {
-        Self {
-            content: String::new(),
-            stats: TextStats::default(),
-        }
+        Self { content: String::new(), stats: TextStats::default() }
     }
 
     fn push(&mut self, chunk: &str, retain: &RetainPolicy) {
@@ -169,34 +161,24 @@ fn trim_tail(input: &str, retain: &RetainPolicy) -> String {
     match retain.mode {
         RetainMode::Bytes => {
             let bytes = input.as_bytes();
-            if bytes.len() <= retain.limit {
-                return input.to_string();
-            }
+            if bytes.len() <= retain.limit { return input.to_string(); }
             String::from_utf8_lossy(&bytes[bytes.len() - retain.limit..]).to_string()
         }
         RetainMode::Chars => {
             let chars: Vec<char> = input.chars().collect();
-            if chars.len() <= retain.limit {
-                return input.to_string();
-            }
+            if chars.len() <= retain.limit { return input.to_string(); }
             chars[chars.len() - retain.limit..].iter().collect()
         }
         RetainMode::Lines => {
             let lines: Vec<&str> = input.lines().collect();
-            if lines.len() <= retain.limit {
-                return input.to_string();
-            }
+            if lines.len() <= retain.limit { return input.to_string(); }
             let mut s = lines[lines.len() - retain.limit..].join("\n");
-            if input.ends_with('\n') {
-                s.push('\n');
-            }
+            if input.ends_with('\n') { s.push('\n'); }
             s
         }
         RetainMode::Words => {
             let words: Vec<&str> = input.split_whitespace().collect();
-            if words.len() <= retain.limit {
-                return input.to_string();
-            }
+            if words.len() <= retain.limit { return input.to_string(); }
             words[words.len() - retain.limit..].join(" ")
         }
     }
@@ -205,26 +187,19 @@ fn trim_tail(input: &str, retain: &RetainPolicy) -> String {
 fn load_config() -> Result<Config> {
     let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
     path.push("wcc/config.toml");
-
     if path.exists() {
-        let data =
-            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let data = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
         Ok(toml::from_str(&data).context("parsing config")?)
     } else {
         let cfg = Config::default();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
         fs::write(&path, toml::to_string_pretty(&cfg)?)?;
         Ok(cfg)
     }
 }
 
 fn compress_if_needed(s: &str, threshold: usize) -> Result<Option<String>> {
-    if s.as_bytes().len() < threshold {
-        return Ok(None);
-    }
-
+    if s.as_bytes().len() < threshold { return Ok(None); }
     let mut enc = GzEncoder::new(Vec::new(), Compression::default());
     enc.write_all(s.as_bytes())?;
     Ok(Some(B64.encode(enc.finish()?)))
@@ -239,15 +214,11 @@ fn decompress_b64(s: &str) -> Result<String> {
 }
 
 fn history_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    if !dir.exists() {
-        return Ok(vec![]);
-    }
-
+    if !dir.exists() { return Ok(vec![]); }
     let mut files: Vec<_> = fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|x| x.path()))
         .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
         .collect();
-
     files.sort();
     files.reverse();
     Ok(files)
@@ -255,23 +226,15 @@ fn history_files(dir: &Path) -> Result<Vec<PathBuf>> {
 
 fn load_history(dir: &Path) -> Result<Vec<HistoryEntry>> {
     let mut entries = Vec::new();
-
     for p in history_files(dir)? {
         let txt = fs::read_to_string(&p)?;
-        if let Ok(entry) = serde_json::from_str::<HistoryEntry>(&txt) {
-            entries.push(entry);
-        }
+        if let Ok(entry) = serde_json::from_str::<HistoryEntry>(&txt) { entries.push(entry); }
     }
-
     Ok(entries)
 }
 
 fn history_path_for(dir: &Path, entry: &HistoryEntry) -> PathBuf {
-    dir.join(format!(
-        "{}-{}.json",
-        entry.timestamp.format("%Y%m%dT%H%M%SZ"),
-        entry.id
-    ))
+    dir.join(format!("{}-{}.json", entry.timestamp.format("%Y%m%dT%H%M%SZ"), entry.id))
 }
 
 fn save_history(cfg: &Config, entry: &HistoryEntry) -> Result<()> {
@@ -282,71 +245,42 @@ fn save_history(cfg: &Config, entry: &HistoryEntry) -> Result<()> {
 }
 
 fn set_clipboard(command: &[String], stdout: &str, stderr: &str) -> Result<()> {
-    let payload = format!(
-        "$ {}\n\n[stdout]\n{}\n\n[stderr]\n{}",
-        command.join(" "),
-        stdout,
-        stderr
-    );
-
+    let payload = format!("$ {}\n\n[stdout]\n{}\n\n[stderr]\n{}", command.join(" "), stdout, stderr);
     #[cfg(target_os = "linux")]
     {
         if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-            return set_clipboard_wayland(&payload);
+            let mut child = Command::new("wl-copy")
+                .arg("--type")
+                .arg("text/plain;charset=utf-8")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .context("failed to spawn wl-copy")?;
+            {
+                let mut stdin = child.stdin.take().context("failed to open wl-copy stdin")?;
+                stdin.write_all(payload.as_bytes())?;
+                stdin.flush()?;
+            }
+            let _ = child.wait();
+            return Ok(());
         }
     }
-
-    set_clipboard_arboard(&payload)
-}
-
-#[cfg(target_os = "linux")]
-fn set_clipboard_wayland(payload: &str) -> Result<()> {
-    let mut child = Command::new("wl-copy")
-        .arg("--type")
-        .arg("text/plain;charset=utf-8")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to spawn wl-copy")?;
-
-    {
-        let mut stdin = child.stdin.take().context("failed to open wl-copy stdin")?;
-        stdin.write_all(payload.as_bytes())?;
-        stdin.flush()?;
-    }
-
-    // Do NOT kill wl-copy. Let it daemonize/background itself normally on Wayland.
-    // That is the intended behavior and helps the clipboard remain available.
-    let _ = child.wait();
-    Ok(())
-}
-
-fn set_clipboard_arboard(payload: &str) -> Result<()> {
     let mut cb = Clipboard::new().context("clipboard init failed")?;
-    cb.set_text(payload.to_string())?;
-    #[cfg(target_os = "linux")]
-    {
-        thread::sleep(Duration::from_millis(200));
-    }
+    cb.set_text(payload)?;
     Ok(())
 }
 
 fn spawn_reader<R: io::Read + Send + 'static>(reader: R, tx: Sender<Msg>, is_err: bool) {
     thread::spawn(move || {
         let mut br = BufReader::new(reader);
-
         loop {
             let mut buf = Vec::new();
             match br.read_until(b'\n', &mut buf) {
                 Ok(0) => break,
                 Ok(_) => {
                     let s = String::from_utf8_lossy(&buf).to_string();
-                    let _ = tx.send(if is_err {
-                        Msg::Stderr(s)
-                    } else {
-                        Msg::Stdout(s)
-                    });
+                    let _ = tx.send(if is_err { Msg::Stderr(s) } else { Msg::Stdout(s) });
                 }
                 Err(_) => break,
             }
@@ -354,14 +288,25 @@ fn spawn_reader<R: io::Read + Send + 'static>(reader: R, tx: Sender<Msg>, is_err
     });
 }
 
-fn draw_cli_status(
-    command: &[String],
-    out: &StreamTail,
-    err: &StreamTail,
-    started: Instant,
-) -> Result<()> {
-    let mut stdout = io::stdout();
+fn spawn_stdin_forwarder(mut child_stdin: std::process::ChildStdin) {
+    thread::spawn(move || {
+        let mut input = io::stdin();
+        let mut buf = [0u8; 4096];
+        loop {
+            match input.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if child_stdin.write_all(&buf[..n]).is_err() { break; }
+                    if child_stdin.flush().is_err() { break; }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
 
+fn draw_cli_status(command: &[String], out: &StreamTail, err: &StreamTail, started: Instant) -> Result<()> {
+    let mut stdout = io::stdout();
     execute!(
         stdout,
         MoveToColumn(0),
@@ -373,17 +318,11 @@ fn draw_cli_status(
         SetForegroundColor(TermColor::Green),
         Print("stdout "),
         ResetColor,
-        Print(format!(
-            "L:{} W:{} C:{} B:{} ",
-            out.stats.lines, out.stats.words, out.stats.chars, out.stats.bytes
-        )),
+        Print(format!("L:{} W:{} C:{} B:{} ", out.stats.lines, out.stats.words, out.stats.chars, out.stats.bytes)),
         SetForegroundColor(TermColor::Red),
         Print("stderr "),
         ResetColor,
-        Print(format!(
-            "L:{} W:{} C:{} B:{} ",
-            err.stats.lines, err.stats.words, err.stats.chars, err.stats.bytes
-        )),
+        Print(format!("L:{} W:{} C:{} B:{} ", err.stats.lines, err.stats.words, err.stats.chars, err.stats.bytes)),
         SetForegroundColor(TermColor::DarkGrey),
         Print(format!("| {}", command.join(" "))),
         ResetColor,
@@ -401,11 +340,7 @@ fn clear_cli_status_line() -> Result<()> {
 }
 
 fn run_command(command: Vec<String>, cfg: &Config, tui: bool) -> Result<HistoryEntry> {
-    anyhow::ensure!(
-        !command.is_empty(),
-        "usage: wcc -- cmd args   or   wcc gui -- cmd args"
-    );
-
+    anyhow::ensure!(!command.is_empty(), "usage: wcc -- cmd args   or   wcc gui -- cmd args");
     let term = Arc::new(AtomicBool::new(false));
     flag::register(SIGINT, Arc::clone(&term))?;
     flag::register(SIGTERM, Arc::clone(&term))?;
@@ -416,6 +351,7 @@ fn run_command(command: Vec<String>, cfg: &Config, tui: bool) -> Result<HistoryE
 
     let mut child = Command::new(&command[0])
         .args(&command[1..])
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -423,6 +359,7 @@ fn run_command(command: Vec<String>, cfg: &Config, tui: bool) -> Result<HistoryE
 
     let stdout = child.stdout.take().context("missing child stdout")?;
     let stderr = child.stderr.take().context("missing child stderr")?;
+    if let Some(stdin) = child.stdin.take() { spawn_stdin_forwarder(stdin); }
 
     let (tx, rx) = mpsc::channel();
     spawn_reader(stdout, tx.clone(), false);
@@ -438,8 +375,7 @@ fn run_command(command: Vec<String>, cfg: &Config, tui: bool) -> Result<HistoryE
     }
 
     let status = child.wait().ok();
-    let killed = term.load(Ordering::Relaxed)
-        && status.as_ref().and_then(|s| s.code()).is_none();
+    let killed = term.load(Ordering::Relaxed) && status.as_ref().and_then(|s| s.code()).is_none();
     let duration_ms = started.elapsed().as_millis();
 
     clear_cli_status_line().ok();
@@ -459,99 +395,50 @@ fn run_command(command: Vec<String>, cfg: &Config, tui: bool) -> Result<HistoryE
         stdout_compressed_b64: compress_if_needed(&out.content, cfg.compress_above_bytes)?,
         stderr_compressed_b64: compress_if_needed(&err.content, cfg.compress_above_bytes)?,
     };
-
     save_history(cfg, &entry)?;
     Ok(entry)
 }
 
-fn run_cli_loop(
-    command: &[String],
-    child: &mut Child,
-    rx: Receiver<Msg>,
-    out: &mut StreamTail,
-    err: &mut StreamTail,
-    started: Instant,
-    term: &Arc<AtomicBool>,
-    retain: &RetainPolicy,
-) -> Result<()> {
+fn run_cli_loop(command: &[String], child: &mut Child, rx: Receiver<Msg>, out: &mut StreamTail, err: &mut StreamTail, started: Instant, term: &Arc<AtomicBool>, retain: &RetainPolicy) -> Result<()> {
     let mut last_status = Instant::now();
-
     println!();
-
     loop {
         while let Ok(msg) = rx.try_recv() {
             clear_cli_status_line()?;
             match msg {
-                Msg::Stdout(s) => {
-                    out.push(&s, retain);
-                    print!("{s}");
-                    io::stdout().flush()?;
-                }
-                Msg::Stderr(s) => {
-                    err.push(&s, retain);
-                    eprint!("{s}");
-                    io::stderr().flush()?;
-                }
+                Msg::Stdout(s) => { out.push(&s, retain); print!("{s}"); io::stdout().flush()?; }
+                Msg::Stderr(s) => { err.push(&s, retain); eprint!("{s}"); io::stderr().flush()?; }
             }
             draw_cli_status(command, out, err, started)?;
         }
-
         if last_status.elapsed() >= Duration::from_millis(120) {
             draw_cli_status(command, out, err, started)?;
             last_status = Instant::now();
         }
-
-        if term.load(Ordering::Relaxed) {
-            let _ = child.kill();
-            break;
-        }
-
+        if term.load(Ordering::Relaxed) { let _ = child.kill(); break; }
         if child.try_wait()?.is_some() {
             while let Ok(msg) = rx.try_recv() {
                 clear_cli_status_line()?;
                 match msg {
-                    Msg::Stdout(s) => {
-                        out.push(&s, retain);
-                        print!("{s}");
-                        io::stdout().flush()?;
-                    }
-                    Msg::Stderr(s) => {
-                        err.push(&s, retain);
-                        eprint!("{s}");
-                        io::stderr().flush()?;
-                    }
+                    Msg::Stdout(s) => { out.push(&s, retain); print!("{s}"); io::stdout().flush()?; }
+                    Msg::Stderr(s) => { err.push(&s, retain); eprint!("{s}"); io::stderr().flush()?; }
                 }
                 draw_cli_status(command, out, err, started)?;
             }
             break;
         }
-
         thread::sleep(Duration::from_millis(30));
     }
-
     Ok(())
 }
 
-fn run_tui_loop(
-    command: &[String],
-    child: &mut Child,
-    rx: Receiver<Msg>,
-    out: &mut StreamTail,
-    err: &mut StreamTail,
-    started: Instant,
-    term: &Arc<AtomicBool>,
-    cfg: &Config,
-) -> Result<()> {
+fn run_tui_loop(command: &[String], child: &mut Child, rx: Receiver<Msg>, out: &mut StreamTail, err: &mut StreamTail, started: Instant, term: &Arc<AtomicBool>, cfg: &Config) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-
-    let mut state = TuiState {
-        history: load_history(&cfg.history_dir)?,
-        selected: 0,
-    };
+    let mut state = TuiState { history: load_history(&cfg.history_dir)?, selected: 0 };
 
     let result = loop {
         while let Ok(msg) = rx.try_recv() {
@@ -560,62 +447,27 @@ fn run_tui_loop(
                 Msg::Stderr(s) => err.push(&s, &cfg.retain),
             }
         }
-
         terminal.draw(|f| draw_ui(f, &state, command, out, err, started))?;
-
-        if term.load(Ordering::Relaxed) {
-            let _ = child.kill();
-            break Ok(());
-        }
-
-        if child.try_wait()?.is_some() {
-            break Ok(());
-        }
-
+        if term.load(Ordering::Relaxed) { let _ = child.kill(); break Ok(()); }
+        if child.try_wait()?.is_some() { break Ok(()); }
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(k) = event::read()? {
                 match k.code {
-                    KeyCode::Char('q') => {
-                        let _ = child.kill();
-                        break Ok(());
-                    }
-                    KeyCode::Down => {
-                        if state.selected + 1 < state.history.len() {
-                            state.selected += 1;
-                        }
-                    }
-                    KeyCode::Up => {
-                        if state.selected > 0 {
-                            state.selected -= 1;
-                        }
-                    }
+                    KeyCode::Char('q') => { let _ = child.kill(); break Ok(()); }
+                    KeyCode::Down => if state.selected + 1 < state.history.len() { state.selected += 1; },
+                    KeyCode::Up => if state.selected > 0 { state.selected -= 1; },
                     KeyCode::Char('d') => {
                         if let Some(entry) = state.history.get(state.selected) {
                             let path = history_path_for(&cfg.history_dir, entry);
                             let _ = fs::remove_file(path);
                             state.history = load_history(&cfg.history_dir)?;
-                            if state.history.is_empty() {
-                                state.selected = 0;
-                            } else {
-                                state.selected =
-                                    state.selected.min(state.history.len().saturating_sub(1));
-                            }
+                            state.selected = state.selected.min(state.history.len().saturating_sub(1));
                         }
                     }
                     KeyCode::Char('c') => {
                         if let Some(entry) = state.history.get(state.selected) {
-                            let stdout = entry
-                                .stdout_compressed_b64
-                                .as_ref()
-                                .and_then(|s| decompress_b64(s).ok())
-                                .unwrap_or_else(|| entry.stdout_tail.clone());
-
-                            let stderr = entry
-                                .stderr_compressed_b64
-                                .as_ref()
-                                .and_then(|s| decompress_b64(s).ok())
-                                .unwrap_or_else(|| entry.stderr_tail.clone());
-
+                            let stdout = entry.stdout_compressed_b64.as_ref().and_then(|s| decompress_b64(s).ok()).unwrap_or_else(|| entry.stdout_tail.clone());
+                            let stderr = entry.stderr_compressed_b64.as_ref().and_then(|s| decompress_b64(s).ok()).unwrap_or_else(|| entry.stderr_tail.clone());
                             let _ = set_clipboard(&entry.command, &stdout, &stderr);
                         }
                     }
@@ -631,140 +483,47 @@ fn run_tui_loop(
     result
 }
 
-fn draw_ui(
-    f: &mut Frame,
-    state: &TuiState,
-    command: &[String],
-    out: &StreamTail,
-    err: &StreamTail,
-    started: Instant,
-) {
+fn draw_ui(f: &mut Frame, state: &TuiState, command: &[String], out: &StreamTail, err: &StreamTail, started: Instant) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(8),
-            Constraint::Min(10),
-            Constraint::Length(10),
-        ])
+        .constraints([Constraint::Length(3), Constraint::Length(8), Constraint::Min(10), Constraint::Length(10)])
         .split(f.size());
 
-    let header = Paragraph::new(format!(
-        "running: {} | q quit | d delete | c copy | elapsed: {:.1?}",
-        command.join(" "),
-        started.elapsed()
-    ))
-    .block(Block::default().borders(Borders::ALL).title("wcc --gui"));
+    let header = Paragraph::new(format!("running: {} | q quit | d delete | c copy | elapsed: {:.1?}", command.join(" "), started.elapsed()))
+        .block(Block::default().borders(Borders::ALL).title("wcc --gui"));
     f.render_widget(header, layout[0]);
 
     let rows = vec![
-        Row::new(vec![
-            Cell::from("stdout"),
-            Cell::from(out.stats.lines.to_string()),
-            Cell::from(out.stats.words.to_string()),
-            Cell::from(out.stats.chars.to_string()),
-            Cell::from(out.stats.bytes.to_string()),
-        ]),
-        Row::new(vec![
-            Cell::from("stderr"),
-            Cell::from(err.stats.lines.to_string()),
-            Cell::from(err.stats.words.to_string()),
-            Cell::from(err.stats.chars.to_string()),
-            Cell::from(err.stats.bytes.to_string()),
-        ]),
+        Row::new(vec![Cell::from("stdout"), Cell::from(out.stats.lines.to_string()), Cell::from(out.stats.words.to_string()), Cell::from(out.stats.chars.to_string()), Cell::from(out.stats.bytes.to_string())]),
+        Row::new(vec![Cell::from("stderr"), Cell::from(err.stats.lines.to_string()), Cell::from(err.stats.words.to_string()), Cell::from(err.stats.chars.to_string()), Cell::from(err.stats.bytes.to_string())]),
     ];
-
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Length(12),
-        ],
-    )
-    .header(Row::new(vec![
-        Cell::from("stream"),
-        Cell::from("lines"),
-        Cell::from("words"),
-        Cell::from("chars"),
-        Cell::from("bytes"),
-    ]))
-    .block(Block::default().borders(Borders::ALL).title("live stats"));
+    let table = Table::new(rows, [Constraint::Length(10), Constraint::Length(10), Constraint::Length(10), Constraint::Length(10), Constraint::Length(12)])
+        .header(Row::new(vec![Cell::from("stream"), Cell::from("lines"), Cell::from("words"), Cell::from("chars"), Cell::from("bytes")]))
+        .block(Block::default().borders(Borders::ALL).title("live stats"));
     f.render_widget(table, layout[1]);
 
-    let mid = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(layout[2]);
-
-    let hist_rows: Vec<Row> = state
-        .history
-        .iter()
-        .enumerate()
-        .take(200)
-        .map(|(i, h)| {
-            let style = if i == state.selected {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default()
-            };
-
-            Row::new(vec![
-                Cell::from(h.timestamp.format("%m-%d %H:%M:%S").to_string()),
-                Cell::from(h.command.join(" ")),
-                Cell::from(format!("{} ms", h.duration_ms)),
-            ])
-            .style(style)
-        })
-        .collect();
-
-    let hist = Table::new(
-        hist_rows,
-        [
-            Constraint::Length(15),
-            Constraint::Percentage(60),
-            Constraint::Length(12),
-        ],
-    )
-    .block(Block::default().borders(Borders::ALL).title("history"));
+    let mid = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(45), Constraint::Percentage(55)]).split(layout[2]);
+    let hist_rows: Vec<Row> = state.history.iter().enumerate().take(200).map(|(i, h)| {
+        let style = if i == state.selected { Style::default().fg(Color::Yellow) } else { Style::default() };
+        Row::new(vec![Cell::from(h.timestamp.format("%m-%d %H:%M:%S").to_string()), Cell::from(h.command.join(" ")), Cell::from(format!("{} ms", h.duration_ms))]).style(style)
+    }).collect();
+    let hist = Table::new(hist_rows, [Constraint::Length(15), Constraint::Percentage(60), Constraint::Length(12)]).block(Block::default().borders(Borders::ALL).title("history"));
     f.render_widget(hist, mid[0]);
 
-    let current = Paragraph::new(format!(
-        "[stdout]\n{}\n[stderr]\n{}",
-        out.content, err.content
-    ))
-    .wrap(Wrap { trim: false })
-    .block(Block::default().borders(Borders::ALL).title("current tail"));
+    let current = Paragraph::new(format!("[stdout]\n{}\n[stderr]\n{}", out.content, err.content)).wrap(Wrap { trim: false }).block(Block::default().borders(Borders::ALL).title("current tail"));
     f.render_widget(current, mid[1]);
 
-    let selected_text = state
-        .history
-        .get(state.selected)
-        .map(|h| {
-            format!(
-                "command: {}\nexit: {:?} killed: {}\nstdout lines:{} words:{} chars:{} bytes:{}\nstderr lines:{} words:{} chars:{} bytes:{}\n\nstdout tail:\n{}\n\nstderr tail:\n{}",
-                h.command.join(" "),
-                h.exit_code,
-                h.killed,
-                h.stdout_stats.lines,
-                h.stdout_stats.words,
-                h.stdout_stats.chars,
-                h.stdout_stats.bytes,
-                h.stderr_stats.lines,
-                h.stderr_stats.words,
-                h.stderr_stats.chars,
-                h.stderr_stats.bytes,
-                h.stdout_tail,
-                h.stderr_tail
-            )
-        })
-        .unwrap_or_else(|| "no history".to_string());
+    let selected_text = state.history.get(state.selected).map(|h| {
+        format!(
+            "command: {}\nexit: {:?} killed: {}\nstdout lines:{} words:{} chars:{} bytes:{}\nstderr lines:{} words:{} chars:{} bytes:{}\n\nstdout tail:\n{}\n\nstderr tail:\n{}",
+            h.command.join(" "), h.exit_code, h.killed,
+            h.stdout_stats.lines, h.stdout_stats.words, h.stdout_stats.chars, h.stdout_stats.bytes,
+            h.stderr_stats.lines, h.stderr_stats.words, h.stderr_stats.chars, h.stderr_stats.bytes,
+            h.stdout_tail, h.stderr_tail
+        )
+    }).unwrap_or_else(|| "no history".to_string());
 
-    let details = Paragraph::new(selected_text)
-        .wrap(Wrap { trim: false })
-        .block(Block::default().borders(Borders::ALL).title("selected history"));
+    let details = Paragraph::new(selected_text).wrap(Wrap { trim: false }).block(Block::default().borders(Borders::ALL).title("selected history"));
     f.render_widget(TuiClear, layout[3]);
     f.render_widget(details, layout[3]);
 }
@@ -772,30 +531,18 @@ fn draw_ui(
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = load_config()?;
-
     match cli.command {
         Some(Mode::Gui { cmd }) => {
             let cmd = if cmd.is_empty() { cli.cmd } else { cmd };
-            if cmd.is_empty() {
-                return Err(WccError::NoCommand.into());
-            }
+            if cmd.is_empty() { return Err(WccError::NoCommand.into()); }
             let entry = run_command(cmd, &cfg, true)?;
-            eprintln!(
-                "copied to clipboard after completion, exit={:?}",
-                entry.exit_code
-            );
+            eprintln!("copied to clipboard after completion, exit={:?}", entry.exit_code);
         }
         None => {
-            if cli.cmd.is_empty() {
-                return Err(WccError::NoCommand.into());
-            }
+            if cli.cmd.is_empty() { return Err(WccError::NoCommand.into()); }
             let entry = run_command(cli.cmd, &cfg, false)?;
-            eprintln!(
-                "copied to clipboard after completion, exit={:?}",
-                entry.exit_code
-            );
+            eprintln!("copied to clipboard after completion, exit={:?}", entry.exit_code);
         }
     }
-
     Ok(())
 }
