@@ -11,11 +11,34 @@ path = "src/bin/wcn.rs"
 name = "wcp"
 path = "src/bin/wcp.rs"
 
+[[bin]]
+name = "wcc"
+path = "src/main.rs"
+
+[[bin]]
+name = "wcu"
+path = "src/bin/wcu.rs"
+
 [dependencies]
+# Common dependencies
 anyhow = "1.0"
 arboard = "3.2"
 regex = "1.9"
 similar = "2.2"
+
+# Dependencies for wcc and wcu
+base64 = "0.21"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.4", features = ["derive"] }
+crossterm = "0.27"
+dirs = "5.0"
+flate2 = "1.0"
+ratatui = "0.24"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+signal-hook = "0.3"
+thiserror = "1.0"
+toml = "0.8"
 
 [lib]
 name = "wcc"

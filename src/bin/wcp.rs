@@ -192,7 +192,13 @@ fn map_lines_to_function(src: &str) -> BTreeMap<usize, String> {
     let mut current = "<global>".to_string();
     for (idx, line) in src.lines().enumerate() {
         if let Some(name) = detect_function_name(line) {
-            current = name;
+            // Clean up the name - remove 'pub' if present at the start
+            let clean_name = name
+                .trim_start()
+                .strip_prefix("pub ")
+                .unwrap_or(&name)
+                .to_string();
+            current = clean_name;
         }
         map.insert(idx, current.clone());
     }
@@ -201,27 +207,72 @@ fn map_lines_to_function(src: &str) -> BTreeMap<usize, String> {
 
 fn detect_function_name(line: &str) -> Option<String> {
     let trimmed = line.trim();
-    let prefixes = [
-        "fn ", "pub fn ", "pub(crate) fn ", "def ", "function ", "class ", "impl ",
-    ];
-    for p in prefixes {
-        if let Some(rest) = trimmed.strip_prefix(p) {
-            let name: String = rest
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':' || *c == '<' || *c == '>')
-                .collect();
-            if !name.is_empty() {
-                return Some(format!("{}{}", p.trim(), name));
-            }
-        }
-    }
-    if trimmed.contains('(') && trimmed.ends_with('{') {
-        let before = trimmed.split('(').next().unwrap_or(trimmed).trim();
-        let name = before.split_whitespace().last().unwrap_or(before);
-        if !name.is_empty() {
+    
+    // Handle Rust-style function definitions
+    if trimmed.contains("fn ") {
+        // Extract just the function name after 'fn' and before any parentheses or generics
+        let after_fn = trimmed.split("fn ").nth(1)?;
+        let name = after_fn
+            .split(|c: char| c == '(' || c == '<' || c == ' ' || c == '{')
+            .next()?;
+        if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
             return Some(name.to_string());
         }
     }
+    
+    // Handle Python function definitions
+    if trimmed.contains("def ") {
+        let after_def = trimmed.split("def ").nth(1)?;
+        let name = after_def
+            .split(|c: char| c == '(' || c == ' ' || c == ':')
+            .next()?;
+        if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Some(name.to_string());
+        }
+    }
+    
+    // Handle JavaScript/TypeScript function definitions
+    if trimmed.contains("function ") {
+        let after_fn = trimmed.split("function ").nth(1)?;
+        let name = after_fn
+            .split(|c: char| c == '(' || c == ' ' || c == '{')
+            .next()?;
+        if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Some(name.to_string());
+        }
+    }
+    
+    // Handle class definitions
+    if trimmed.contains("class ") {
+        let after_class = trimmed.split("class ").nth(1)?;
+        let name = after_class
+            .split(|c: char| c == ' ' || c == '{' || c == ':')
+            .next()?;
+        if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Some(name.to_string());
+        }
+    }
+    
+    // Handle impl blocks (Rust)
+    if trimmed.contains("impl ") {
+        let after_impl = trimmed.split("impl ").nth(1)?;
+        let name = after_impl
+            .split(|c: char| c == ' ' || c == '<' || c == '{')
+            .next()?;
+        if !name.is_empty() {
+            return Some(format!("impl {}", name));
+        }
+    }
+    
+    // Handle C-style function definitions (return type function_name())
+    if trimmed.contains('(') && trimmed.ends_with('{') && !trimmed.starts_with("//") {
+        let before_paren = trimmed.split('(').next()?;
+        let name = before_paren.split_whitespace().last()?;
+        if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Some(name.to_string());
+        }
+    }
+    
     None
 }
 

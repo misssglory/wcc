@@ -538,7 +538,8 @@ fn draw_ui(f: &mut Frame, state: &TuiState, command: &[String], out: &StreamTail
         Row::new(vec![Cell::from("stdout"), Cell::from(out.stats.lines.to_string()), Cell::from(out.stats.words.to_string()), Cell::from(out.stats.chars.to_string()), Cell::from(out.stats.bytes.to_string())]),
         Row::new(vec![Cell::from("stderr"), Cell::from(err.stats.lines.to_string()), Cell::from(err.stats.words.to_string()), Cell::from(err.stats.chars.to_string()), Cell::from(err.stats.bytes.to_string())]),
     ];
-    let table = Table::new(rows, [Constraint::Length(10), Constraint::Length(10), Constraint::Length(10), Constraint::Length(10), Constraint::Length(12)])
+    let table = Table::new(rows)
+        .widths(&[Constraint::Length(10), Constraint::Length(10), Constraint::Length(10), Constraint::Length(10), Constraint::Length(12)])
         .header(Row::new(vec![Cell::from("stream"), Cell::from("lines"), Cell::from("words"), Cell::from("chars"), Cell::from("bytes")]))
         .block(Block::default().borders(Borders::ALL).title("live stats"));
     f.render_widget(table, layout[1]);
@@ -548,7 +549,9 @@ fn draw_ui(f: &mut Frame, state: &TuiState, command: &[String], out: &StreamTail
         let style = if i == state.selected { Style::default().fg(Color::Yellow) } else { Style::default() };
         Row::new(vec![Cell::from(h.timestamp.format("%m-%d %H:%M:%S").to_string()), Cell::from(h.command.join(" ")), Cell::from(format!("{} ms", h.duration_ms))]).style(style)
     }).collect();
-    let hist = Table::new(hist_rows, [Constraint::Length(15), Constraint::Percentage(60), Constraint::Length(12)]).block(Block::default().borders(Borders::ALL).title("history"));
+    let hist = Table::new(hist_rows)
+        .widths(&[Constraint::Length(15), Constraint::Percentage(60), Constraint::Length(12)])
+        .block(Block::default().borders(Borders::ALL).title("history"));
     f.render_widget(hist, mid[0]);
 
     let current = Paragraph::new(format!("[stdout]\n{}\n[stderr]\n{}", out.content, err.content)).wrap(Wrap { trim: false }).block(Block::default().borders(Borders::ALL).title("current tail"));

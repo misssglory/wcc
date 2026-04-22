@@ -1,4 +1,3 @@
-// src/common.rs
 use std::path::Path;
 use anyhow::{Context, Result};
 use arboard::Clipboard;
@@ -81,7 +80,6 @@ pub fn get_clipboard_text() -> Result<String> {
             }
         }
         
-        // Try xclip as fallback for X11
         let out = Command::new("xclip")
             .arg("-selection")
             .arg("clipboard")
@@ -106,45 +104,14 @@ pub fn comment_prefix(path: &Path, ext: &str) -> &'static str {
 
     if matches!(
         ext,
-        "rs"
-            | "c"
-            | "cc"
-            | "cpp"
-            | "cxx"
-            | "h"
-            | "hpp"
-            | "js"
-            | "jsx"
-            | "ts"
-            | "tsx"
-            | "java"
-            | "kt"
-            | "kts"
-            | "go"
-            | "swift"
-            | "scala"
-            | "cs"
-            | "dart"
+        "rs" | "c" | "cc" | "cpp" | "cxx" | "h" | "hpp" | "js" | "jsx" | "ts" | "tsx"
+            | "java" | "kt" | "kts" | "go" | "swift" | "scala" | "cs" | "dart"
     ) {
         "//"
     } else if matches!(
         ext,
-        "py"
-            | "sh"
-            | "bash"
-            | "zsh"
-            | "fish"
-            | "nix"
-            | "yaml"
-            | "yml"
-            | "toml"
-            | "ini"
-            | "conf"
-            | "rb"
-            | "pl"
-            | "mk"
-            | "make"
-            | "env"
+        "py" | "sh" | "bash" | "zsh" | "fish" | "nix" | "yaml" | "yml" | "toml" | "ini"
+            | "conf" | "rb" | "pl" | "mk" | "make" | "env"
     ) || filename == "dockerfile"
         || filename == "makefile"
     {
@@ -166,8 +133,6 @@ pub fn regex_escape(s: &str) -> String {
     escaped
 }
 
-// Simple bright heatmap colors for black background
-// Even smallest values are clearly visible
 pub fn heatmap_color_lines(value: usize) -> String {
     let (r, g, b) = get_bright_color(value, 2000);
     format!("\x1b[38;2;{};{};{}m{}\x1b[0m", r, g, b, value)
@@ -190,31 +155,24 @@ pub fn heatmap_color_bytes(value: usize) -> String {
 
 fn get_bright_color(value: usize, max: usize) -> (u8, u8, u8) {
     if value == 0 {
-        // Bright cyan for zero
         return (0, 200, 200);
     }
     
     let ratio = (value as f64 / max as f64).min(1.0);
     
-    // Always keep colors bright (minimum 150 in at least one channel)
     if ratio < 0.2 {
-        // Bright cyan to bright green-blue
         let t = ratio / 0.2;
         (0, 150 + (t * 105.0) as u8, 200)
     } else if ratio < 0.4 {
-        // Bright green-blue to bright green
         let t = (ratio - 0.2) / 0.2;
         ((t * 100.0) as u8, 255, 200 - (t * 100.0) as u8)
     } else if ratio < 0.6 {
-        // Bright green to bright yellow
         let t = (ratio - 0.4) / 0.2;
         (100 + (t * 155.0) as u8, 255, 100 - (t * 100.0) as u8)
     } else if ratio < 0.8 {
-        // Bright yellow to bright orange
         let t = (ratio - 0.6) / 0.2;
         (255, 255 - (t * 100.0) as u8, 0)
     } else {
-        // Bright orange to bright red
         let t = (ratio - 0.8) / 0.2;
         (255, 155 - (t * 155.0) as u8, 0)
     }

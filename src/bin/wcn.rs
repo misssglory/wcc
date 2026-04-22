@@ -1,24 +1,12 @@
-// wcn.rs
+// src/bin/wcn.rs
 use std::{
     env,
     fs,
-    io::Write,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    thread,
-    time::Duration,
 };
 
 use anyhow::{bail, Context, Result};
-use arboard::Clipboard;
-
-#[derive(Debug, Clone, Default)]
-struct TextStats {
-    lines: usize,
-    words: usize,
-    chars: usize,
-    bytes: usize,
-}
+use wcc::common::*;
 
 #[derive(Debug, Default)]
 struct Args {
@@ -42,11 +30,13 @@ fn main() -> Result<()> {
     // Extract content based on flags
     let extracted_content = extract_content(&content, &args, &path)?;
 
-    let filename = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .context("failed to extract filename")?
-        .to_string();
+    // Get relative path for display
+    let current_dir = env::current_dir()?;
+    let relative_path = path
+        .strip_prefix(&current_dir)
+        .unwrap_or(&path)
+        .to_path_buf();
+    let filename = relative_path.display().to_string();
 
     let ext = path
         .extension()
@@ -65,7 +55,7 @@ fn main() -> Result<()> {
     set_clipboard(&payload)?;
     let stats = calc_stats(&payload);
 
-    print_stats(&path, &stats, &args);
+    print_stats(&relative_path, &stats, &args);
 
     Ok(())
 }
@@ -167,7 +157,7 @@ fn extract_function(content: &str, func_name: &str, ext: &str) -> Result<String>
     let lines: Vec<&str> = content.lines().collect();
     let escaped_name = regex_escape(func_name);
     
-    // Language-specific function patterns - now using String instead of &str
+    // Language-specific function patterns
     let patterns: Vec<String> = match ext {
         "rs" => vec![
             format!(r"fn\s+{}", escaped_name),
@@ -186,7 +176,7 @@ fn extract_function(content: &str, func_name: &str, ext: &str) -> Result<String>
             format!(r"class\s+{}", escaped_name),
         ],
         "c" | "cc" | "cpp" | "h" | "hpp" => vec![
-            format!(r"{}", escaped_name), // Function name followed by (
+            format!(r"{}", escaped_name),
             format!(r"class\s+{}", escaped_name),
         ],
         "go" => vec![
@@ -196,7 +186,6 @@ fn extract_function(content: &str, func_name: &str, ext: &str) -> Result<String>
         _ => vec![escaped_name],
     };
     
-    // Join patterns with OR operator
     let pattern = patterns.join("|");
     let re = regex::Regex::new(&format!(r"(?m)^{}$", pattern))
         .context("failed to create function regex")?;
@@ -210,8 +199,6 @@ fn extract_function(content: &str, func_name: &str, ext: &str) -> Result<String>
     }
     
     let start = func_start.context(format!("function '{}' not found", func_name))?;
-    
-    // Find the end of the function based on indentation/braces
     let end = find_function_end(&lines, start, ext);
     
     Ok(lines[start..=end].join("\n"))
@@ -225,7 +212,6 @@ fn find_function_end(lines: &[&str], start: usize, ext: &str) -> usize {
     for i in start..lines.len() {
         let line = lines[i];
         
-        // Count braces and parentheses
         for ch in line.chars() {
             match ch {
                 '{' => {
@@ -247,13 +233,11 @@ fn find_function_end(lines: &[&str], start: usize, ext: &str) -> usize {
             }
         }
         
-        // For Python (no braces), look for dedent or blank line
         if ext == "py" {
             if i > start {
                 let current_indent = line.len() - line.trim_start().len();
                 let start_indent = lines[start].len() - lines[start].trim_start().len();
                 
-                // Function ended when we find a line with less indentation or empty line
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -264,12 +248,10 @@ fn find_function_end(lines: &[&str], start: usize, ext: &str) -> usize {
             continue;
         }
         
-        // For brace-based languages
         if found_opening_brace && brace_count == 0 && paren_count == 0 {
             return i;
         }
         
-        // If no braces found, look for semicolon (C-style single statement)
         if !found_opening_brace && i > start {
             if line.contains(';') && !line.contains('{') {
                 return i;
@@ -280,89 +262,11 @@ fn find_function_end(lines: &[&str], start: usize, ext: &str) -> usize {
     lines.len() - 1
 }
 
-fn regex_escape(s: &str) -> String {
-    let special_chars = r".*+?^${}()|[]\";
-    let mut escaped = String::with_capacity(s.len() * 2);
-    for c in s.chars() {
-        if special_chars.contains(c) {
-            escaped.push('\\');
-        }
-        escaped.push(c);
-    }
-    escaped
-}
-
 fn header_present(content: &str, filename: &str) -> bool {
     content
         .lines()
         .take(2)
         .any(|line| line.contains(filename))
-}
-
-fn comment_prefix(path: &Path, ext: &str) -> &'static str {
-    let filename = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    if matches!(
-        ext,
-        "rs"
-            | "c"
-            | "cc"
-            | "cpp"
-            | "cxx"
-            | "h"
-            | "hpp"
-            | "js"
-            | "jsx"
-            | "ts"
-            | "tsx"
-            | "java"
-            | "kt"
-            | "kts"
-            | "go"
-            | "swift"
-            | "scala"
-            | "cs"
-            | "dart"
-    ) {
-        "//"
-    } else if matches!(
-        ext,
-        "py"
-            | "sh"
-            | "bash"
-            | "zsh"
-            | "fish"
-            | "nix"
-            | "yaml"
-            | "yml"
-            | "toml"
-            | "ini"
-            | "conf"
-            | "rb"
-            | "pl"
-            | "mk"
-            | "make"
-            | "env"
-    ) || filename == "dockerfile"
-        || filename == "makefile"
-    {
-        "#"
-    } else {
-        "#"
-    }
-}
-
-fn calc_stats(s: &str) -> TextStats {
-    TextStats {
-        lines: s.bytes().filter(|b| *b == b'\n').count(),
-        words: s.split_whitespace().count(),
-        chars: s.chars().count(),
-        bytes: s.as_bytes().len(),
-    }
 }
 
 fn print_stats(path: &Path, stats: &TextStats, args: &Args) {
@@ -389,48 +293,4 @@ fn print_stats(path: &Path, stats: &TextStats, args: &Args) {
         "\x1b[36mfile\x1b[0m {}{}  \x1b[33mlines\x1b[0m {}  \x1b[33mwords\x1b[0m {}  \x1b[33mchars\x1b[0m {}  \x1b[33mbytes\x1b[0m {}",
         file, flag_str, stats.lines, stats.words, stats.chars, stats.bytes
     );
-}
-
-fn set_clipboard(payload: &str) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-            return set_clipboard_wayland(payload);
-        }
-    }
-
-    set_clipboard_arboard(payload)
-}
-
-#[cfg(target_os = "linux")]
-fn set_clipboard_wayland(payload: &str) -> Result<()> {
-    let mut child = Command::new("wl-copy")
-        .arg("--type")
-        .arg("text/plain;charset=utf-8")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to spawn wl-copy")?;
-
-    {
-        let mut stdin = child.stdin.take().context("failed to open wl-copy stdin")?;
-        stdin.write_all(payload.as_bytes())?;
-        stdin.flush()?;
-    }
-
-    let _ = child.wait();
-    Ok(())
-}
-
-fn set_clipboard_arboard(payload: &str) -> Result<()> {
-    let mut cb = Clipboard::new().context("clipboard init failed")?;
-    cb.set_text(payload.to_string())?;
-
-    #[cfg(target_os = "linux")]
-    {
-        thread::sleep(Duration::from_millis(200));
-    }
-
-    Ok(())
 }
