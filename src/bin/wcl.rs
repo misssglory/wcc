@@ -1,16 +1,43 @@
 use std::{
+    collections::BTreeMap,
     env,
     fs,
     io::Write,
     path::{Path, PathBuf},
     process::Command,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     thread,
     time::Duration,
 };
 
 use anyhow::{bail, Context, Result};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use wcc::common::*;
+
+#[derive(Debug, Clone, Default)]
+struct FunctionInfo {
+    name: String,
+    lines: usize,
+    words: usize,
+    chars: usize,
+    start_line: usize,
+    end_line: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ClassInfo {
+    name: String,
+    lines: usize,
+    words: usize,
+    chars: usize,
+    start_line: usize,
+    end_line: usize,
+    methods: Vec<FunctionInfo>,
+}
 
 #[derive(Debug, Clone, Default)]
 struct FileStats {
@@ -19,10 +46,10 @@ struct FileStats {
     words: usize,
     chars: usize,
     bytes: usize,
-    functions: Vec<String>,
-    classes: Vec<String>,
-    structs: Vec<String>,
+    functions: Vec<FunctionInfo>,
+    classes: Vec<ClassInfo>,
     error: Option<String>,
+    uses: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -32,6 +59,8 @@ struct DirectoryStats {
     total_words: usize,
     total_chars: usize,
     total_bytes: usize,
+    total_functions: usize,
+    total_classes: usize,
     file_stats: Vec<FileStats>,
 }
 
@@ -43,7 +72,15 @@ struct Config {
     show_empty_files: bool,
     show_stats_per_file: bool,
     show_function_details: bool,
+    show_class_details: bool,
+    show_usage_stats: bool,
     max_files_to_display: usize,
+    min_function_lines: usize,
+    min_class_lines: usize,
+    max_functions_per_file: usize,
+    max_classes_per_file: usize,
+    parallel_processing: bool,
+    max_threads: usize,
 }
 
 impl Default for Config {
@@ -51,56 +88,37 @@ impl Default for Config {
         Self {
             max_file_size_kb: 50,
             skip_patterns: vec![
-                ".o".to_string(),
-                ".pyc".to_string(),
-                ".pyo".to_string(),
-                ".so".to_string(),
-                ".dll".to_string(),
-                ".dylib".to_string(),
-                ".exe".to_string(),
-                ".class".to_string(),
-                ".jar".to_string(),
-                ".war".to_string(),
-                ".ear".to_string(),
-                ".zip".to_string(),
-                ".tar".to_string(),
-                ".gz".to_string(),
-                ".bz2".to_string(),
-                ".xz".to_string(),
-                ".7z".to_string(),
-                ".rar".to_string(),
-                ".png".to_string(),
-                ".jpg".to_string(),
-                ".jpeg".to_string(),
-                ".gif".to_string(),
-                ".bmp".to_string(),
-                ".ico".to_string(),
-                ".mp3".to_string(),
-                ".mp4".to_string(),
-                ".avi".to_string(),
-                ".mov".to_string(),
-                ".pdf".to_string(),
-                ".doc".to_string(),
+                ".o".to_string(), ".pyc".to_string(), ".pyo".to_string(),
+                ".so".to_string(), ".dll".to_string(), ".dylib".to_string(),
+                ".exe".to_string(), ".class".to_string(), ".jar".to_string(),
+                ".war".to_string(), ".ear".to_string(), ".zip".to_string(),
+                ".tar".to_string(), ".gz".to_string(), ".bz2".to_string(),
+                ".xz".to_string(), ".7z".to_string(), ".rar".to_string(),
+                ".png".to_string(), ".jpg".to_string(), ".jpeg".to_string(),
+                ".gif".to_string(), ".bmp".to_string(), ".ico".to_string(),
+                ".mp3".to_string(), ".mp4".to_string(), ".avi".to_string(),
+                ".mov".to_string(), ".pdf".to_string(), ".doc".to_string(),
                 ".docx".to_string(),
             ],
             skip_dirs: vec![
-                "target".to_string(),
-                "node_modules".to_string(),
-                ".git".to_string(),
-                ".svn".to_string(),
-                ".hg".to_string(),
-                "build".to_string(),
-                "dist".to_string(),
-                "__pycache__".to_string(),
-                ".cache".to_string(),
-                ".cargo".to_string(),
-                ".idea".to_string(),
+                "target".to_string(), "node_modules".to_string(),
+                ".git".to_string(), ".svn".to_string(), ".hg".to_string(),
+                "build".to_string(), "dist".to_string(), "__pycache__".to_string(),
+                ".cache".to_string(), ".cargo".to_string(), ".idea".to_string(),
                 ".vscode".to_string(),
             ],
             show_empty_files: false,
             show_stats_per_file: true,
             show_function_details: true,
+            show_class_details: true,
+            show_usage_stats: false,
             max_files_to_display: 500,
+            min_function_lines: 1,
+            min_class_lines: 1,
+            max_functions_per_file: 100,
+            max_classes_per_file: 50,
+            parallel_processing: true,
+            max_threads: 8,
         }
     }
 }
@@ -108,13 +126,11 @@ impl Default for Config {
 fn load_config() -> Result<Config> {
     let mut config_paths = vec![];
 
-    // User config directory
     if let Some(mut path) = dirs::config_dir() {
         path.push("wcl/config.toml");
         config_paths.push(path);
     }
 
-    // Current directory config
     if let Ok(current_dir) = env::current_dir() {
         let mut path = current_dir.clone();
         path.push(".wclrc");
@@ -125,13 +141,11 @@ fn load_config() -> Result<Config> {
         config_paths.push(path2);
     }
 
-    // Home directory config
     if let Some(mut path) = dirs::home_dir() {
         path.push(".wclrc");
         config_paths.push(path);
     }
 
-    // Try each config path
     for path in config_paths {
         if path.exists() {
             let data = fs::read_to_string(&path)
@@ -143,7 +157,6 @@ fn load_config() -> Result<Config> {
         }
     }
 
-    // Create default config in user config directory if it doesn't exist
     if let Some(mut path) = dirs::config_dir() {
         path.push("wcl");
         fs::create_dir_all(&path)?;
@@ -160,16 +173,13 @@ fn load_config() -> Result<Config> {
 }
 
 fn should_skip_file(path: &Path, config: &Config) -> bool {
-    // Check if file is too large
     if let Ok(metadata) = fs::metadata(path) {
         let size_kb = metadata.len() / 1024;
         if size_kb > config.max_file_size_kb as u64 {
-            eprintln!("  ⚠ Skipping {} ({} KB > {} KB limit)", path.display(), size_kb, config.max_file_size_kb);
             return true;
         }
     }
 
-    // Check extension patterns
     if let Some(ext) = path.extension() {
         let ext_str = format!(".{}", ext.to_string_lossy().to_lowercase());
         for pattern in &config.skip_patterns {
@@ -179,7 +189,6 @@ fn should_skip_file(path: &Path, config: &Config) -> bool {
         }
     }
 
-    // Check if it's a binary file (by content)
     if let Ok(content) = fs::read(path) {
         if content.iter().take(1024).any(|&b| b == 0) {
             return true;
@@ -201,136 +210,228 @@ fn should_skip_dir(path: &Path, config: &Config) -> bool {
     false
 }
 
-fn detect_functions_in_file(content: &str, ext: &str) -> Vec<String> {
+fn extract_function_body(lines: &[&str], start_idx: usize, ext: &str) -> usize {
+    let mut brace_count = 0;
+    let mut paren_count = 0;
+    let mut found_opening_brace = false;
+    
+    for i in start_idx..lines.len().min(start_idx + 500) {
+        let line = lines[i];
+        
+        for ch in line.chars() {
+            match ch {
+                '{' => {
+                    brace_count += 1;
+                    found_opening_brace = true;
+                }
+                '}' => {
+                    if brace_count > 0 {
+                        brace_count -= 1;
+                    }
+                }
+                '(' => paren_count += 1,
+                ')' => {
+                    if paren_count > 0 {
+                        paren_count -= 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        
+        if ext == "py" {
+            if i > start_idx {
+                let current_indent = line.len() - line.trim_start().len();
+                let start_indent = lines[start_idx].len() - lines[start_idx].trim_start().len();
+                if current_indent <= start_indent && !line.trim().is_empty() {
+                    return i - 1;
+                }
+            }
+            continue;
+        }
+        
+        if found_opening_brace && brace_count == 0 && paren_count == 0 {
+            return i;
+        }
+    }
+    
+    start_idx
+}
+
+fn detect_functions_in_file(content: &str, ext: &str, config: &Config) -> Vec<FunctionInfo> {
     let mut functions = Vec::new();
     let lines: Vec<&str> = content.lines().collect();
     
-    for line in lines.iter().take(500) {
+    for (idx, line) in lines.iter().enumerate().take(2000) {
         let trimmed = line.trim();
+        let mut func_name = None;
         
         match ext {
             "rs" => {
                 if trimmed.contains("fn ") && !trimmed.contains("//") {
-                    if let Some(name) = extract_function_name(trimmed, "fn ") {
-                        functions.push(name);
-                    }
+                    func_name = extract_function_name(trimmed, "fn ");
                 }
             }
             "py" => {
                 if trimmed.contains("def ") && !trimmed.starts_with('#') {
-                    if let Some(name) = extract_function_name(trimmed, "def ") {
-                        functions.push(name);
-                    }
+                    func_name = extract_function_name(trimmed, "def ");
                 }
             }
             "js" | "ts" | "jsx" | "tsx" => {
                 if trimmed.contains("function ") && !trimmed.contains("//") {
-                    if let Some(name) = extract_function_name(trimmed, "function ") {
-                        functions.push(name);
-                    }
+                    func_name = extract_function_name(trimmed, "function ");
                 } else if trimmed.contains("=>") && trimmed.contains("const ") {
-                    if let Some(name) = extract_arrow_function_name(trimmed) {
-                        functions.push(name);
-                    }
+                    func_name = extract_arrow_function_name(trimmed);
                 }
             }
             "c" | "cc" | "cpp" | "h" | "hpp" => {
                 if trimmed.contains('(') && trimmed.contains(')') && !trimmed.starts_with("//") && !trimmed.starts_with("/*") {
-                    if let Some(name) = extract_c_function_name(trimmed) {
-                        functions.push(name);
-                    }
+                    func_name = extract_c_function_name(trimmed);
                 }
             }
             "go" => {
                 if trimmed.contains("func ") {
-                    if let Some(name) = extract_function_name(trimmed, "func ") {
-                        functions.push(name);
-                    }
+                    func_name = extract_function_name(trimmed, "func ");
                 }
             }
             _ => {}
         }
-
-        if functions.len() >= 50 {
-            break;
+        
+        if let Some(name) = func_name {
+            let end_idx = extract_function_body(&lines, idx, ext);
+            if end_idx > idx {
+                let func_content = lines[idx..=end_idx].join("\n");
+                let stats = calc_stats(&func_content);
+                
+                if stats.lines >= config.min_function_lines {
+                    functions.push(FunctionInfo {
+                        name,
+                        lines: stats.lines,
+                        words: stats.words,
+                        chars: stats.chars,
+                        start_line: idx + 1,
+                        end_line: end_idx + 1,
+                    });
+                }
+            }
+            
+            if functions.len() >= config.max_functions_per_file {
+                break;
+            }
         }
     }
     
-    functions.sort();
-    functions.dedup();
     functions
 }
 
-fn detect_classes_in_file(content: &str, ext: &str) -> Vec<String> {
+fn detect_classes_in_file(content: &str, ext: &str, config: &Config) -> Vec<ClassInfo> {
     let mut classes = Vec::new();
     let lines: Vec<&str> = content.lines().collect();
     
-    for line in lines.iter().take(500) {
+    for (idx, line) in lines.iter().enumerate().take(2000) {
         let trimmed = line.trim();
+        let mut class_name = None;
+        let mut class_type = "";
         
         match ext {
             "rs" => {
                 if trimmed.contains("struct ") && !trimmed.contains("//") {
-                    if let Some(name) = extract_class_name(trimmed, "struct ") {
-                        classes.push(format!("struct {}", name));
-                    }
+                    class_name = extract_class_name(trimmed, "struct ");
+                    class_type = "struct";
                 } else if trimmed.contains("enum ") && !trimmed.contains("//") {
-                    if let Some(name) = extract_class_name(trimmed, "enum ") {
-                        classes.push(format!("enum {}", name));
-                    }
+                    class_name = extract_class_name(trimmed, "enum ");
+                    class_type = "enum";
                 } else if trimmed.contains("trait ") && !trimmed.contains("//") {
-                    if let Some(name) = extract_class_name(trimmed, "trait ") {
-                        classes.push(format!("trait {}", name));
-                    }
+                    class_name = extract_class_name(trimmed, "trait ");
+                    class_type = "trait";
                 }
             }
             "py" => {
                 if trimmed.contains("class ") && !trimmed.starts_with('#') {
-                    if let Some(name) = extract_class_name(trimmed, "class ") {
-                        classes.push(name);
-                    }
+                    class_name = extract_class_name(trimmed, "class ");
+                    class_type = "class";
                 }
             }
             "js" | "ts" | "jsx" | "tsx" => {
                 if trimmed.contains("class ") && !trimmed.contains("//") {
-                    if let Some(name) = extract_class_name(trimmed, "class ") {
-                        classes.push(name);
-                    }
+                    class_name = extract_class_name(trimmed, "class ");
+                    class_type = "class";
                 }
             }
             "c" | "cc" | "cpp" | "h" | "hpp" => {
                 if trimmed.contains("struct ") && !trimmed.starts_with("//") {
-                    if let Some(name) = extract_class_name(trimmed, "struct ") {
-                        classes.push(format!("struct {}", name));
-                    }
+                    class_name = extract_class_name(trimmed, "struct ");
+                    class_type = "struct";
                 } else if trimmed.contains("class ") && !trimmed.starts_with("//") {
-                    if let Some(name) = extract_class_name(trimmed, "class ") {
-                        classes.push(format!("class {}", name));
-                    }
+                    class_name = extract_class_name(trimmed, "class ");
+                    class_type = "class";
                 } else if trimmed.contains("enum ") && !trimmed.starts_with("//") {
-                    if let Some(name) = extract_class_name(trimmed, "enum ") {
-                        classes.push(format!("enum {}", name));
-                    }
+                    class_name = extract_class_name(trimmed, "enum ");
+                    class_type = "enum";
                 }
             }
             "go" => {
                 if trimmed.contains("type ") && trimmed.contains("struct") {
-                    if let Some(name) = extract_class_name(trimmed, "type ") {
-                        classes.push(format!("type {}", name));
-                    }
+                    class_name = extract_class_name(trimmed, "type ");
+                    class_type = "type";
                 }
             }
             _ => {}
         }
-
-        if classes.len() >= 50 {
-            break;
+        
+        if let Some(name) = class_name {
+            let end_idx = extract_function_body(&lines, idx, ext);
+            if end_idx > idx {
+                let class_content = lines[idx..=end_idx].join("\n");
+                let stats = calc_stats(&class_content);
+                
+                if stats.lines >= config.min_class_lines {
+                    let methods = if ext == "rs" || ext == "py" || ext == "js" || ext == "ts" {
+                        detect_functions_in_file(&class_content, ext, config)
+                    } else {
+                        Vec::new()
+                    };
+                    
+                    classes.push(ClassInfo {
+                        name: format!("{} {}", class_type, name),
+                        lines: stats.lines,
+                        words: stats.words,
+                        chars: stats.chars,
+                        start_line: idx + 1,
+                        end_line: end_idx + 1,
+                        methods,
+                    });
+                }
+            }
+            
+            if classes.len() >= config.max_classes_per_file {
+                break;
+            }
         }
     }
     
-    classes.sort();
-    classes.dedup();
     classes
+}
+
+fn detect_usage_in_file(content: &str, functions: &[FunctionInfo], classes: &[ClassInfo]) -> BTreeMap<String, usize> {
+    let mut usage = BTreeMap::new();
+    
+    for func in functions {
+        let count = content.matches(&func.name).count();
+        if count > 0 {
+            usage.insert(func.name.clone(), count);
+        }
+    }
+    
+    for class in classes {
+        let simple_name = class.name.split_whitespace().last().unwrap_or(&class.name);
+        let count = content.matches(simple_name).count();
+        if count > 0 {
+            usage.insert(class.name.clone(), count);
+        }
+    }
+    
+    usage
 }
 
 fn extract_function_name(line: &str, keyword: &str) -> Option<String> {
@@ -414,9 +515,15 @@ fn analyze_file(path: &Path, config: &Config) -> FileStats {
                 .to_ascii_lowercase();
 
             if config.show_function_details {
-                stats.functions = detect_functions_in_file(&content, &ext);
-                stats.classes = detect_classes_in_file(&content, &ext);
-                stats.structs = vec![]; // Combined with classes for now
+                stats.functions = detect_functions_in_file(&content, &ext, config);
+            }
+            
+            if config.show_class_details {
+                stats.classes = detect_classes_in_file(&content, &ext, config);
+            }
+            
+            if config.show_usage_stats && (config.show_function_details || config.show_class_details) {
+                stats.uses = detect_usage_in_file(&content, &stats.functions, &stats.classes);
             }
         }
         Err(e) => {
@@ -428,60 +535,86 @@ fn analyze_file(path: &Path, config: &Config) -> FileStats {
 }
 
 fn walk_directory(dir: &Path, config: &Config) -> Result<DirectoryStats> {
-    let mut stats = DirectoryStats::default();
-    let mut entries: Vec<PathBuf> = Vec::new();
-
+    let mut all_paths = Vec::new();
+    
     if !dir.exists() {
         bail!("Directory does not exist: {}", dir.display());
     }
 
     if dir.is_file() {
         let file_stats = analyze_file(dir, config);
+        let mut stats = DirectoryStats::default();
         stats.files = 1;
         stats.total_lines = file_stats.lines;
         stats.total_words = file_stats.words;
         stats.total_chars = file_stats.chars;
         stats.total_bytes = file_stats.bytes;
+        stats.total_functions = file_stats.functions.len();
+        stats.total_classes = file_stats.classes.len();
         stats.file_stats.push(file_stats);
         return Ok(stats);
     }
 
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.is_dir() {
-            if should_skip_dir(&path, config) {
-                eprintln!("  ⚠ Skipping directory: {}", path.display());
-                continue;
+    fn collect_paths(dir: &Path, paths: &mut Vec<PathBuf>, config: &Config) -> Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            
+            if path.is_dir() {
+                if should_skip_dir(&path, config) {
+                    continue;
+                }
+                collect_paths(&path, paths, config)?;
+            } else if path.is_file() {
+                paths.push(path);
             }
-            let sub_stats = walk_directory(&path, config)?;
-            stats.files += sub_stats.files;
-            stats.total_lines += sub_stats.total_lines;
-            stats.total_words += sub_stats.total_words;
-            stats.total_chars += sub_stats.total_chars;
-            stats.total_bytes += sub_stats.total_bytes;
-            stats.file_stats.extend(sub_stats.file_stats);
-        } else if path.is_file() {
-            entries.push(path);
         }
+        Ok(())
     }
-
-    // Sort entries for consistent output
-    entries.sort();
-
-    for path in entries {
-        let file_stats = analyze_file(&path, config);
+    
+    collect_paths(dir, &mut all_paths, config)?;
+    
+    let processed_files: Vec<FileStats> = if config.parallel_processing {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let total = all_paths.len();
+        
+        all_paths
+            .par_iter()
+            .map(|path| {
+                let count = counter.fetch_add(1, Ordering::Relaxed);
+                if count % 100 == 0 && count > 0 {
+                    eprintln!("  Progress: {}/{} files", count, total);
+                }
+                analyze_file(path, config)
+            })
+            .collect()
+    } else {
+        all_paths
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                if i % 100 == 0 && i > 0 {
+                    eprintln!("  Progress: {}/{} files", i, all_paths.len());
+                }
+                analyze_file(path, config)
+            })
+            .collect()
+    };
+    
+    let mut stats = DirectoryStats::default();
+    for file_stats in processed_files {
         if file_stats.lines > 0 || config.show_empty_files {
             stats.files += 1;
             stats.total_lines += file_stats.lines;
             stats.total_words += file_stats.words;
             stats.total_chars += file_stats.chars;
             stats.total_bytes += file_stats.bytes;
+            stats.total_functions += file_stats.functions.len();
+            stats.total_classes += file_stats.classes.len();
             stats.file_stats.push(file_stats);
         }
     }
-
+    
     Ok(stats)
 }
 
@@ -489,7 +622,7 @@ fn format_report(stats: &DirectoryStats, root: &Path, config: &Config) -> String
     let mut report = String::new();
     
     report.push_str(&format!("📊 Directory Analysis: {}\n", root.display()));
-    report.push_str(&format!("{}\n", "=".repeat(60)));
+    report.push_str(&format!("{}\n", "=".repeat(80)));
     
     report.push_str(&format!("\n📈 Summary:\n"));
     report.push_str(&format!("  Files analyzed: {}\n", stats.files));
@@ -498,11 +631,18 @@ fn format_report(stats: &DirectoryStats, root: &Path, config: &Config) -> String
     report.push_str(&format!("  Total chars: {}\n", stats.total_chars));
     report.push_str(&format!("  Total bytes: {}\n", stats.total_bytes));
     
+    if config.show_function_details {
+        report.push_str(&format!("  Total functions: {}\n", stats.total_functions));
+    }
+    if config.show_class_details {
+        report.push_str(&format!("  Total classes/structs: {}\n", stats.total_classes));
+    }
+    
     if config.show_stats_per_file && !stats.file_stats.is_empty() {
         report.push_str(&format!("\n📁 Per-file Statistics:\n"));
-        report.push_str(&format!("{}\n", "-".repeat(60)));
+        report.push_str(&format!("{}\n", "-".repeat(80)));
         
-        for (i, file_stat) in stats.file_stats.iter().enumerate().take(config.max_files_to_display) {
+        for file_stat in stats.file_stats.iter().take(config.max_files_to_display) {
             let rel_path = file_stat.path.strip_prefix(root).unwrap_or(&file_stat.path);
             report.push_str(&format!("\n  📄 {}\n", rel_path.display()));
             
@@ -512,31 +652,48 @@ fn format_report(stats: &DirectoryStats, root: &Path, config: &Config) -> String
             }
             
             report.push_str(&format!("     Lines: {} | Words: {} | Chars: {} | Bytes: {}\n",
-                file_stat.lines,
-                file_stat.words,
-                file_stat.chars,
-                file_stat.bytes
+                file_stat.lines, file_stat.words, file_stat.chars, file_stat.bytes
             ));
             
-            if config.show_function_details {
-                if !file_stat.functions.is_empty() {
-                    report.push_str(&format!("     🎯 Functions ({})\n", file_stat.functions.len()));
-                    for func in file_stat.functions.iter().take(10) {
-                        report.push_str(&format!("        • {}\n", func));
-                    }
-                    if file_stat.functions.len() > 10 {
-                        report.push_str(&format!("        ... and {} more\n", file_stat.functions.len() - 10));
+            if config.show_function_details && !file_stat.functions.is_empty() {
+                report.push_str(&format!("     🎯 Functions ({})\n", file_stat.functions.len()));
+                for func in file_stat.functions.iter().take(20) {
+                    report.push_str(&format!("        • {} ({} lines, {} words, {} chars) [L{}-L{}]\n",
+                        func.name, func.lines, func.words, func.chars, func.start_line, func.end_line));
+                }
+                if file_stat.functions.len() > 20 {
+                    report.push_str(&format!("        ... and {} more\n", file_stat.functions.len() - 20));
+                }
+            }
+            
+            if config.show_class_details && !file_stat.classes.is_empty() {
+                report.push_str(&format!("     📦 Classes/Structs ({})\n", file_stat.classes.len()));
+                for class in file_stat.classes.iter().take(10) {
+                    report.push_str(&format!("        • {} ({} lines, {} words, {} chars) [L{}-L{}]\n",
+                        class.name, class.lines, class.words, class.chars, class.start_line, class.end_line));
+                    
+                    if !class.methods.is_empty() {
+                        for method in class.methods.iter().take(10) {
+                            report.push_str(&format!("          └─ {} ({} lines) [L{}-L{}]\n",
+                                method.name, method.lines, method.start_line, method.end_line));
+                        }
+                        if class.methods.len() > 10 {
+                            report.push_str(&format!("          └─ ... and {} more methods\n", class.methods.len() - 10));
+                        }
                     }
                 }
-                
-                if !file_stat.classes.is_empty() {
-                    report.push_str(&format!("     📦 Classes/Structs ({})\n", file_stat.classes.len()));
-                    for class in file_stat.classes.iter().take(10) {
-                        report.push_str(&format!("        • {}\n", class));
-                    }
-                    if file_stat.classes.len() > 10 {
-                        report.push_str(&format!("        ... and {} more\n", file_stat.classes.len() - 10));
-                    }
+                if file_stat.classes.len() > 10 {
+                    report.push_str(&format!("        ... and {} more\n", file_stat.classes.len() - 10));
+                }
+            }
+            
+            if config.show_usage_stats && !file_stat.uses.is_empty() {
+                report.push_str(&format!("     📊 Usage statistics:\n"));
+                for (name, count) in file_stat.uses.iter().take(10) {
+                    report.push_str(&format!("        • {} used {} times\n", name, count));
+                }
+                if file_stat.uses.len() > 10 {
+                    report.push_str(&format!("        ... and {} more\n", file_stat.uses.len() - 10));
                 }
             }
         }
@@ -547,7 +704,7 @@ fn format_report(stats: &DirectoryStats, root: &Path, config: &Config) -> String
         }
     }
     
-    report.push_str(&format!("\n{}\n", "=".repeat(60)));
+    report.push_str(&format!("\n{}\n", "=".repeat(80)));
     
     report
 }
@@ -596,18 +753,26 @@ fn main() -> Result<()> {
     let config = load_config()?;
     
     eprintln!("🔍 Analyzing: {}", target_dir.display());
-    eprintln!("📋 Config: max_size={}KB, skip_patterns={}, skip_dirs={}", 
-        config.max_file_size_kb, config.skip_patterns.len(), config.skip_dirs.len());
+    eprintln!("📋 Config: max_size={}KB, threads={}, parallel={}", 
+        config.max_file_size_kb, config.max_threads, config.parallel_processing);
     
+    if config.parallel_processing {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(config.max_threads)
+            .build_global()
+            .context("Failed to build thread pool")?;
+    }
+    
+    let start = std::time::Instant::now();
     let stats = walk_directory(&target_dir, &config)?;
+    let duration = start.elapsed();
+    
     let report = format_report(&stats, &target_dir, &config);
     
-    // Print to stdout for user
     println!("{}", report);
     
-    // Copy to clipboard
     set_clipboard_content(&report)?;
-    eprintln!("\n✓ Report copied to clipboard!");
+    eprintln!("\n✓ Report copied to clipboard! (took {:.2?})", duration);
     
     Ok(())
 }
