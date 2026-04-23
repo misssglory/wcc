@@ -19,14 +19,16 @@ path = "src/main.rs"
 name = "wcu"
 path = "src/bin/wcu.rs"
 
+[[bin]]
+name = "wcl"
+path = "src/bin/wcl.rs"
+
 [dependencies]
 # Common dependencies
 anyhow = "1.0"
 arboard = "3.2"
 regex = "1.9"
 similar = "2.2"
-
-# Dependencies for wcc and wcu
 base64 = "0.21"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.4", features = ["derive"] }

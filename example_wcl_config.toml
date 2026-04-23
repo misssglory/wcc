@@ -1,0 +1,7 @@
+max_file_size_kb = 50
+skip_patterns = [".o", ".pyc", ".pyo", ".so", ".dll", ".dylib", ".exe", ".class", ".jar", ".war", ".ear", ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".mp3", ".mp4", ".avi", ".mov", ".pdf", ".doc", ".docx", ".bkp"]
+skip_dirs = ["target", "node_modules", ".git", ".svn", ".hg", "build", "dist", "__pycache__", ".cache", ".cargo", ".idea", ".vscode"]
+show_empty_files = false
+show_stats_per_file = true
+show_function_details = true
+max_files_to_display = 500
