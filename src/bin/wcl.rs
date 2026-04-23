@@ -98,7 +98,7 @@ impl Default for Config {
                 ".gif".to_string(), ".bmp".to_string(), ".ico".to_string(),
                 ".mp3".to_string(), ".mp4".to_string(), ".avi".to_string(),
                 ".mov".to_string(), ".pdf".to_string(), ".doc".to_string(),
-                ".docx".to_string(),
+                ".docx".to_string(), ".bkp".to_string(),
             ],
             skip_dirs: vec![
                 "target".to_string(), "node_modules".to_string(),
@@ -173,6 +173,7 @@ fn load_config() -> Result<Config> {
 }
 
 fn should_skip_file(path: &Path, config: &Config) -> bool {
+    // Check if file is too large
     if let Ok(metadata) = fs::metadata(path) {
         let size_kb = metadata.len() / 1024;
         if size_kb > config.max_file_size_kb as u64 {
@@ -180,15 +181,27 @@ fn should_skip_file(path: &Path, config: &Config) -> bool {
         }
     }
 
-    if let Some(ext) = path.extension() {
-        let ext_str = format!(".{}", ext.to_string_lossy().to_lowercase());
-        for pattern in &config.skip_patterns {
-            if ext_str == *pattern {
-                return true;
-            }
+    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let ext_with_dot = format!(".{}", ext.to_lowercase());
+    
+    // Check if file should be skipped
+    for pattern in &config.skip_patterns {
+        // Check extension
+        if ext_with_dot == *pattern {
+            return true;
+        }
+        // Check if filename ends with pattern (for .bkp files)
+        if filename.ends_with(pattern) {
+            return true;
+        }
+        // Check exact filename match
+        if filename == *pattern {
+            return true;
         }
     }
 
+    // Check if it's a binary file (by content)
     if let Ok(content) = fs::read(path) {
         if content.iter().take(1024).any(|&b| b == 0) {
             return true;
@@ -603,7 +616,7 @@ fn walk_directory(dir: &Path, config: &Config) -> Result<DirectoryStats> {
     
     let mut stats = DirectoryStats::default();
     for file_stats in processed_files {
-        if file_stats.lines > 0 || config.show_empty_files {
+        if (file_stats.lines > 0 || config.show_empty_files) && file_stats.error.is_none() {
             stats.files += 1;
             stats.total_lines += file_stats.lines;
             stats.total_words += file_stats.words;
@@ -656,19 +669,21 @@ fn format_report(stats: &DirectoryStats, root: &Path, config: &Config) -> String
             ));
             
             if config.show_function_details && !file_stat.functions.is_empty() {
+                let max_func_display = config.max_functions_per_file;
                 report.push_str(&format!("     🎯 Functions ({})\n", file_stat.functions.len()));
-                for func in file_stat.functions.iter().take(20) {
+                for func in file_stat.functions.iter().take(max_func_display) {
                     report.push_str(&format!("        • {} ({} lines, {} words, {} chars) [L{}-L{}]\n",
                         func.name, func.lines, func.words, func.chars, func.start_line, func.end_line));
                 }
-                if file_stat.functions.len() > 20 {
-                    report.push_str(&format!("        ... and {} more\n", file_stat.functions.len() - 20));
+                if file_stat.functions.len() > max_func_display {
+                    report.push_str(&format!("        ... and {} more\n", file_stat.functions.len() - max_func_display));
                 }
             }
             
             if config.show_class_details && !file_stat.classes.is_empty() {
+                let max_class_display = config.max_classes_per_file;
                 report.push_str(&format!("     📦 Classes/Structs ({})\n", file_stat.classes.len()));
-                for class in file_stat.classes.iter().take(10) {
+                for class in file_stat.classes.iter().take(max_class_display) {
                     report.push_str(&format!("        • {} ({} lines, {} words, {} chars) [L{}-L{}]\n",
                         class.name, class.lines, class.words, class.chars, class.start_line, class.end_line));
                     
@@ -682,8 +697,8 @@ fn format_report(stats: &DirectoryStats, root: &Path, config: &Config) -> String
                         }
                     }
                 }
-                if file_stat.classes.len() > 10 {
-                    report.push_str(&format!("        ... and {} more\n", file_stat.classes.len() - 10));
+                if file_stat.classes.len() > max_class_display {
+                    report.push_str(&format!("        ... and {} more\n", file_stat.classes.len() - max_class_display));
                 }
             }
             
@@ -755,6 +770,7 @@ fn main() -> Result<()> {
     eprintln!("🔍 Analyzing: {}", target_dir.display());
     eprintln!("📋 Config: max_size={}KB, threads={}, parallel={}", 
         config.max_file_size_kb, config.max_threads, config.parallel_processing);
+    eprintln!("📋 Skip patterns: {:?}", config.skip_patterns);
     
     if config.parallel_processing {
         rayon::ThreadPoolBuilder::new()
