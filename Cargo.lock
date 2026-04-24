@@ -1246,6 +1246,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "flate2",
+ "quote",
  "ratatui",
  "rayon",
  "regex",
@@ -1253,6 +1254,7 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "similar",
+ "syn",
  "thiserror",
  "toml",
 ]

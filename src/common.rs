@@ -1,4 +1,6 @@
-use std::path::Path;
+// src/common.rs
+use std::path::{Path, PathBuf};
+use std::fs;
 use anyhow::{Context, Result};
 use arboard::Clipboard;
 use std::process::Command;
@@ -241,4 +243,39 @@ pub fn print_summary(stats: &TextStats, filename: &str, operation: &str) {
     println!("\n\x1b[1;32m✓ {}\x1b[0m", operation);
     println!("  \x1b[36mfile:\x1b[0m {}", color_filename(filename));
     print_colored_stats(stats, "stats");
+}
+
+// Backup and restore utilities
+pub fn backup_file(path: &Path) -> Result<PathBuf> {
+    let backup_path = PathBuf::from(format!("{}.bkp", path.display()));
+    if path.exists() {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        fs::write(&backup_path, content)
+            .with_context(|| format!("failed to write backup {}", backup_path.display()))?;
+        eprintln!("  ✓ Created backup: {}", backup_path.display());
+    }
+    Ok(backup_path)
+}
+
+pub fn restore_from_backup(path: &Path) -> Result<()> {
+    let backup_path = PathBuf::from(format!("{}.bkp", path.display()));
+    if backup_path.exists() {
+        let content = fs::read_to_string(&backup_path)
+            .with_context(|| format!("failed to read backup {}", backup_path.display()))?;
+        fs::write(path, content)
+            .with_context(|| format!("failed to restore {}", path.display()))?;
+        fs::remove_file(&backup_path)
+            .with_context(|| format!("failed to remove backup {}", backup_path.display()))?;
+        eprintln!("  ✓ Restored from backup: {}", path.display());
+    }
+    Ok(())
+}
+
+pub fn backup_file_if_exists(path: &Path) -> Result<Option<PathBuf>> {
+    if path.exists() {
+        Ok(Some(backup_file(path)?))
+    } else {
+        Ok(None)
+    }
 }

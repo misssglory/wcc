@@ -12,6 +12,14 @@ name = "wcp"
 path = "src/bin/wcp.rs"
 
 [[bin]]
+name = "wcl"
+path = "src/bin/wcl.rs"
+
+[[bin]]
+name = "wcf"
+path = "src/bin/wcf.rs"
+
+[[bin]]
 name = "wcc"
 path = "src/main.rs"
 
@@ -19,29 +27,31 @@ path = "src/main.rs"
 name = "wcu"
 path = "src/bin/wcu.rs"
 
-[[bin]]
-name = "wcl"
-path = "src/bin/wcl.rs"
-
 [dependencies]
 # Common dependencies
 anyhow = "1.0"
 arboard = "3.2"
 regex = "1.9"
 similar = "2.2"
+toml = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+dirs = "5.0"
+rayon = "1.7"
+
+# Dependencies for wcc and wcu
 base64 = "0.21"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.4", features = ["derive"] }
 crossterm = "0.27"
-dirs = "5.0"
 flate2 = "1.0"
 ratatui = "0.24"
-serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 signal-hook = "0.3"
 thiserror = "1.0"
-toml = "0.8"
-rayon = "1.12.0"
+
+# Dependencies for wcf
+syn = { version = "2.0", features = ["full", "extra-traits", "visit", "printing"] }
+quote = "1.0"
 
 [lib]
 name = "wcc"
