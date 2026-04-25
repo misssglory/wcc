@@ -1,6 +1,7 @@
 // src/lib.rs
 pub mod common;
 
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -27,6 +28,29 @@ pub struct WccSection {
     pub default_cargo_mode: String,
 }
 
+impl Default for WccSection {
+    fn default() -> Self {
+        let mut dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        dir.push(".local/state/wcc/history");
+        Self {
+            history_dir: dir,
+            compress_above_bytes: 16384,
+            retain: RetainPolicy {
+                mode: "bytes".to_string(),
+                limit: 131072,
+            },
+            time_format: "%H:%M:%S %d.%m.%Y".to_string(),
+            default_cargo_mode: "debug".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetainPolicy {
+    pub mode: String,
+    pub limit: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WclSection {
     pub max_file_size_kb: usize,
@@ -44,60 +68,6 @@ pub struct WclSection {
     pub max_classes_per_file: usize,
     pub parallel_processing: bool,
     pub max_threads: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WcnSection {
-    pub default_head_lines: Option<usize>,
-    pub default_tail_lines: Option<usize>,
-    pub show_time_in_header: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WcpSection {
-    pub auto_backup: bool,
-    pub backup_suffix: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WcfSection {
-    pub auto_format: bool,
-    pub backup_before_replace: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetainPolicy {
-    pub mode: String,
-    pub limit: usize,
-}
-
-impl Default for WccConfig {
-    fn default() -> Self {
-        Self {
-            wcc: WccSection::default(),
-            wcl: WclSection::default(),
-            wcn: WcnSection::default(),
-            wcp: WcpSection::default(),
-            wcf: WcfSection::default(),
-        }
-    }
-}
-
-impl Default for WccSection {
-    fn default() -> Self {
-        let mut dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        dir.push(".local/state/wcc/history");
-        Self {
-            history_dir: dir,
-            compress_above_bytes: 16384,
-            retain: RetainPolicy {
-                mode: "bytes".to_string(),
-                limit: 131072,
-            },
-            time_format: "%H:%M:%S %d.%m.%Y".to_string(),
-            default_cargo_mode: "debug".to_string(),
-        }
-    }
 }
 
 impl Default for WclSection {
@@ -140,35 +110,38 @@ impl Default for WclSection {
     }
 }
 
-impl Default for WcnSection {
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WcnSection {
+    pub default_head_lines: Option<usize>,
+    pub default_tail_lines: Option<usize>,
+    pub show_time_in_header: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WcpSection {
+    pub auto_backup: bool,
+    pub backup_suffix: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WcfSection {
+    pub auto_format: bool,
+    pub backup_before_replace: bool,
+}
+
+impl Default for WccConfig {
     fn default() -> Self {
         Self {
-            default_head_lines: None,
-            default_tail_lines: None,
-            show_time_in_header: true,
+            wcc: WccSection::default(),
+            wcl: WclSection::default(),
+            wcn: WcnSection::default(),
+            wcp: WcpSection::default(),
+            wcf: WcfSection::default(),
         }
     }
 }
 
-impl Default for WcpSection {
-    fn default() -> Self {
-        Self {
-            auto_backup: true,
-            backup_suffix: ".bkp".to_string(),
-        }
-    }
-}
-
-impl Default for WcfSection {
-    fn default() -> Self {
-        Self {
-            auto_format: true,
-            backup_before_replace: true,
-        }
-    }
-}
-
-pub fn load_unified_config() -> Result<WccConfig, anyhow::Error> {
+pub fn load_unified_config() -> Result<WccConfig> {
     use anyhow::Context;
     
     let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -177,7 +150,8 @@ pub fn load_unified_config() -> Result<WccConfig, anyhow::Error> {
     if path.exists() {
         let data = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
-        Ok(toml::from_str(&data).context("parsing config")?)
+        let config: WccConfig = toml::from_str(&data).context("parsing config")?;
+        Ok(config)
     } else {
         let cfg = WccConfig::default();
         if let Some(parent) = path.parent() {

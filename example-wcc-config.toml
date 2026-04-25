@@ -1,0 +1,44 @@
+# Global settings for all wcc tools
+[wcc]
+history_dir = "/home/mg/.local/state/wcc/history"
+compress_above_bytes = 16384
+time_format = "%H:%M:%S %d.%m.%Y"
+default_cargo_mode = "debug"
+
+[wcc.retain]
+mode = "bytes"
+limit = 131072
+
+# wcl - directory analyzer settings
+[wcl]
+max_file_size_kb = 50
+skip_patterns = [".o", ".pyc", ".pyo", ".so", ".dll", ".dylib", ".exe", ".class", ".jar", ".war", ".ear", ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".mp3", ".mp4", ".avi", ".mov", ".pdf", ".doc", ".docx", ".bkp", ".bkp.d"]
+skip_dirs = ["target", "target.bkp.d", "node_modules", ".git", ".svn", ".hg", "build", "dist", "__pycache__", ".cache", ".cargo", ".idea", ".vscode"]
+show_empty_files = false
+show_stats_per_file = true
+show_function_details = true
+show_class_details = true
+show_usage_stats = false
+max_files_to_display = 500
+min_function_lines = 1
+min_class_lines = 1
+max_functions_per_file = 100
+max_classes_per_file = 50
+parallel_processing = true
+max_threads = 8
+
+# wcn - file to clipboard settings
+[wcn]
+default_head_lines = null
+default_tail_lines = null
+show_time_in_header = true
+
+# wcp - clipboard to file settings
+[wcp]
+auto_backup = true
+backup_suffix = ".bkp"
+
+# wcf - function replacement settings
+[wcf]
+auto_format = true
+backup_before_replace = true
