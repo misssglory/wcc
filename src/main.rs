@@ -1,8 +1,9 @@
+// src/main.rs
 use std::{
     fs,
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
@@ -17,24 +18,7 @@ use arboard::Clipboard;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
-use crossterm::{
-    cursor::MoveToColumn,
-    event::{self, Event, KeyCode},
-    execute,
-    style::{Color as TermColor, Print, ResetColor, SetForegroundColor},
-    terminal::{
-        disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
-        LeaveAlternateScreen,
-    },
-};
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
-use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    style::{Color, Style},
-    widgets::{Block, Borders, Cell, Clear as TuiClear, Paragraph, Row, Table, Wrap},
-    Frame, Terminal,
-};
 use serde::{Deserialize, Serialize};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::flag;
@@ -45,16 +29,68 @@ use thiserror::Error;
 struct Cli {
     #[command(subcommand)]
     command: Option<Mode>,
+    
     #[arg(trailing_var_arg = true)]
     cmd: Vec<String>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Mode {
-    Gui {
+    /// Build a package (wraps cargo build)
+    Build {
+        /// Build with release optimizations
+        #[arg(short, long)]
+        release: bool,
+        
+        /// Build with debug (default)
+        #[arg(long)]
+        debug: bool,
+        
+        /// Additional cargo build arguments
         #[arg(trailing_var_arg = true)]
-        cmd: Vec<String>,
+        args: Vec<String>,
     },
+    
+    /// Run a binary (wraps cargo run)
+    Run {
+        /// Run with release optimizations
+        #[arg(short, long)]
+        release: bool,
+        
+        /// Run with debug (default)
+        #[arg(long)]
+        debug: bool,
+        
+        /// Additional cargo run arguments
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum BuildMode {
+    Debug,
+    Release,
+}
+
+impl Default for BuildMode {
+    fn default() -> Self {
+        Self::Debug
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CargoConfig {
+    default_mode: BuildMode,
+}
+
+impl Default for CargoConfig {
+    fn default() -> Self {
+        Self {
+            default_mode: BuildMode::Debug,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,7 +154,7 @@ struct HistoryEntry {
     stderr_compressed_b64: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct StreamTail {
     content: String,
     stats: TextStats,
@@ -151,12 +187,6 @@ enum WccError {
     NoCommand,
 }
 
-#[derive(Debug)]
-struct TuiState {
-    history: Vec<HistoryEntry>,
-    selected: usize,
-}
-
 fn trim_tail(input: &str, retain: &RetainPolicy) -> String {
     match retain.mode {
         RetainMode::Bytes => {
@@ -181,6 +211,25 @@ fn trim_tail(input: &str, retain: &RetainPolicy) -> String {
             if words.len() <= retain.limit { return input.to_string(); }
             words[words.len() - retain.limit..].join(" ")
         }
+    }
+}
+
+fn load_cargo_config() -> Result<CargoConfig> {
+    let mut path = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    path.push(".cargo/wcc-config.toml");
+    
+    if path.exists() {
+        let data = fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        Ok(toml::from_str(&data).context("parsing cargo config")?)
+    } else {
+        let cfg = CargoConfig::default();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, toml::to_string_pretty(&cfg)?)?;
+        eprintln!("\x1b[36m✓ Created default cargo config at: {}\x1b[0m", path.display());
+        Ok(cfg)
     }
 }
 
@@ -305,42 +354,72 @@ fn spawn_stdin_forwarder(mut child_stdin: std::process::ChildStdin) {
     });
 }
 
-fn draw_cli_status(command: &[String], out: &StreamTail, err: &StreamTail, started: Instant) -> Result<()> {
-    let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        MoveToColumn(0),
-        Clear(ClearType::CurrentLine),
-        SetForegroundColor(TermColor::Cyan),
-        Print("time "),
-        ResetColor,
-        Print(format!("{:.1?} ", started.elapsed())),
-        SetForegroundColor(TermColor::Green),
-        Print("stdout "),
-        ResetColor,
-        Print(format!("L:{} W:{} C:{} B:{} ", out.stats.lines, out.stats.words, out.stats.chars, out.stats.bytes)),
-        SetForegroundColor(TermColor::Red),
-        Print("stderr "),
-        ResetColor,
-        Print(format!("L:{} W:{} C:{} B:{} ", err.stats.lines, err.stats.words, err.stats.chars, err.stats.bytes)),
-        SetForegroundColor(TermColor::DarkGrey),
-        Print(format!("| {}", command.join(" "))),
-        ResetColor,
-        Print("\r")
-    )?;
-    stdout.flush()?;
+fn run_cargo_build(release: bool, debug: bool, args: Vec<String>) -> Result<()> {
+    let cargo_config = load_cargo_config()?;
+    
+    // Determine build mode
+    let is_release = if release {
+        true
+    } else if debug {
+        false
+    } else {
+        cargo_config.default_mode == BuildMode::Release
+    };
+    
+    let mut cargo_args = vec!["build".to_string()];
+    if is_release {
+        cargo_args.push("--release".to_string());
+    }
+    cargo_args.extend(args);
+    
+    eprintln!("\x1b[36m📦 Running cargo {}\x1b[0m", cargo_args.join(" "));
+    
+    let status = Command::new("cargo")
+        .args(&cargo_args)
+        .status()
+        .context("Failed to run cargo build")?;
+    
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    
     Ok(())
 }
 
-fn clear_cli_status_line() -> Result<()> {
-    let mut stdout = io::stdout();
-    execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-    stdout.flush()?;
+fn run_cargo_run(release: bool, debug: bool, args: Vec<String>) -> Result<()> {
+    let cargo_config = load_cargo_config()?;
+    
+    // Determine build mode
+    let is_release = if release {
+        true
+    } else if debug {
+        false
+    } else {
+        cargo_config.default_mode == BuildMode::Release
+    };
+    
+    let mut cargo_args = vec!["run".to_string()];
+    if is_release {
+        cargo_args.push("--release".to_string());
+    }
+    cargo_args.extend(args);
+    
+    eprintln!("\x1b[36m🏃 Running cargo {}\x1b[0m", cargo_args.join(" "));
+    
+    let status = Command::new("cargo")
+        .args(&cargo_args)
+        .status()
+        .context("Failed to run cargo run")?;
+    
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    
     Ok(())
 }
 
-fn run_command(command: Vec<String>, cfg: &Config, tui: bool) -> Result<HistoryEntry> {
-    anyhow::ensure!(!command.is_empty(), "usage: wcc -- cmd args   or   wcc gui -- cmd args");
+fn run_watch_command(command: Vec<String>, cfg: &Config) -> Result<HistoryEntry> {
+    anyhow::ensure!(!command.is_empty(), "usage: wcc -- cmd args");
     let term = Arc::new(AtomicBool::new(false));
     flag::register(SIGINT, Arc::clone(&term))?;
     flag::register(SIGTERM, Arc::clone(&term))?;
@@ -368,17 +447,31 @@ fn run_command(command: Vec<String>, cfg: &Config, tui: bool) -> Result<HistoryE
     let mut out = StreamTail::new();
     let mut err = StreamTail::new();
 
-    if tui {
-        run_tui_loop(&command, &mut child, rx, &mut out, &mut err, started, &term, cfg)?;
-    } else {
-        run_cli_loop(&command, &mut child, rx, &mut out, &mut err, started, &term, &cfg.retain)?;
+    // Simple CLI loop without TUI
+    loop {
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                Msg::Stdout(s) => { out.push(&s, &cfg.retain); print!("{s}"); io::stdout().flush()?; }
+                Msg::Stderr(s) => { err.push(&s, &cfg.retain); eprint!("{s}"); io::stderr().flush()?; }
+            }
+        }
+        if term.load(Ordering::Relaxed) { let _ = child.kill(); break; }
+        if child.try_wait()?.is_some() {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    Msg::Stdout(s) => { out.push(&s, &cfg.retain); print!("{s}"); io::stdout().flush()?; }
+                    Msg::Stderr(s) => { err.push(&s, &cfg.retain); eprint!("{s}"); io::stderr().flush()?; }
+                }
+            }
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
     }
 
     let status = child.wait().ok();
     let killed = term.load(Ordering::Relaxed) && status.as_ref().and_then(|s| s.code()).is_none();
     let duration_ms = started.elapsed().as_millis();
 
-    clear_cli_status_line().ok();
     let _ = set_clipboard(&command, &out.content, &err.content);
 
     let entry = HistoryEntry {
@@ -396,155 +489,32 @@ fn run_command(command: Vec<String>, cfg: &Config, tui: bool) -> Result<HistoryE
         stderr_compressed_b64: compress_if_needed(&err.content, cfg.compress_above_bytes)?,
     };
     save_history(cfg, &entry)?;
+    
+    // Print final stats
+    eprintln!("\n\x1b[1;32m✓ Command completed\x1b[0m");
+    eprintln!("  Exit code: {:?}", entry.exit_code);
+    eprintln!("  Duration: {:.2?}", Duration::from_millis(duration_ms as u64));
+    eprintln!("  Copied to clipboard!");
+    
     Ok(entry)
-}
-
-fn run_cli_loop(command: &[String], child: &mut Child, rx: Receiver<Msg>, out: &mut StreamTail, err: &mut StreamTail, started: Instant, term: &Arc<AtomicBool>, retain: &RetainPolicy) -> Result<()> {
-    let mut last_status = Instant::now();
-    println!();
-    loop {
-        while let Ok(msg) = rx.try_recv() {
-            clear_cli_status_line()?;
-            match msg {
-                Msg::Stdout(s) => { out.push(&s, retain); print!("{s}"); io::stdout().flush()?; }
-                Msg::Stderr(s) => { err.push(&s, retain); eprint!("{s}"); io::stderr().flush()?; }
-            }
-            draw_cli_status(command, out, err, started)?;
-        }
-        if last_status.elapsed() >= Duration::from_millis(120) {
-            draw_cli_status(command, out, err, started)?;
-            last_status = Instant::now();
-        }
-        if term.load(Ordering::Relaxed) { let _ = child.kill(); break; }
-        if child.try_wait()?.is_some() {
-            while let Ok(msg) = rx.try_recv() {
-                clear_cli_status_line()?;
-                match msg {
-                    Msg::Stdout(s) => { out.push(&s, retain); print!("{s}"); io::stdout().flush()?; }
-                    Msg::Stderr(s) => { err.push(&s, retain); eprint!("{s}"); io::stderr().flush()?; }
-                }
-                draw_cli_status(command, out, err, started)?;
-            }
-            break;
-        }
-        thread::sleep(Duration::from_millis(30));
-    }
-    Ok(())
-}
-
-fn run_tui_loop(command: &[String], child: &mut Child, rx: Receiver<Msg>, out: &mut StreamTail, err: &mut StreamTail, started: Instant, term: &Arc<AtomicBool>, cfg: &Config) -> Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    let mut state = TuiState { history: load_history(&cfg.history_dir)?, selected: 0 };
-
-    let result = loop {
-        while let Ok(msg) = rx.try_recv() {
-            match msg {
-                Msg::Stdout(s) => out.push(&s, &cfg.retain),
-                Msg::Stderr(s) => err.push(&s, &cfg.retain),
-            }
-        }
-        terminal.draw(|f| draw_ui(f, &state, command, out, err, started))?;
-        if term.load(Ordering::Relaxed) { let _ = child.kill(); break Ok(()); }
-        if child.try_wait()?.is_some() { break Ok(()); }
-        if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(k) = event::read()? {
-                match k.code {
-                    KeyCode::Char('q') => { let _ = child.kill(); break Ok(()); }
-                    KeyCode::Down => if state.selected + 1 < state.history.len() { state.selected += 1; },
-                    KeyCode::Up => if state.selected > 0 { state.selected -= 1; },
-                    KeyCode::Char('d') => {
-                        if let Some(entry) = state.history.get(state.selected) {
-                            let path = history_path_for(&cfg.history_dir, entry);
-                            let _ = fs::remove_file(path);
-                            state.history = load_history(&cfg.history_dir)?;
-                            state.selected = state.selected.min(state.history.len().saturating_sub(1));
-                        }
-                    }
-                    KeyCode::Char('c') => {
-                        if let Some(entry) = state.history.get(state.selected) {
-                            let stdout = entry.stdout_compressed_b64.as_ref().and_then(|s| decompress_b64(s).ok()).unwrap_or_else(|| entry.stdout_tail.clone());
-                            let stderr = entry.stderr_compressed_b64.as_ref().and_then(|s| decompress_b64(s).ok()).unwrap_or_else(|| entry.stderr_tail.clone());
-                            let _ = set_clipboard(&entry.command, &stdout, &stderr);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    };
-
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    result
-}
-
-fn draw_ui(f: &mut Frame, state: &TuiState, command: &[String], out: &StreamTail, err: &StreamTail, started: Instant) {
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Length(8), Constraint::Min(10), Constraint::Length(10)])
-        .split(f.size());
-
-    let header = Paragraph::new(format!("running: {} | q quit | d delete | c copy | elapsed: {:.1?}", command.join(" "), started.elapsed()))
-        .block(Block::default().borders(Borders::ALL).title("wcc --gui"));
-    f.render_widget(header, layout[0]);
-
-    let rows = vec![
-        Row::new(vec![Cell::from("stdout"), Cell::from(out.stats.lines.to_string()), Cell::from(out.stats.words.to_string()), Cell::from(out.stats.chars.to_string()), Cell::from(out.stats.bytes.to_string())]),
-        Row::new(vec![Cell::from("stderr"), Cell::from(err.stats.lines.to_string()), Cell::from(err.stats.words.to_string()), Cell::from(err.stats.chars.to_string()), Cell::from(err.stats.bytes.to_string())]),
-    ];
-    let table = Table::new(rows)
-        .widths(&[Constraint::Length(10), Constraint::Length(10), Constraint::Length(10), Constraint::Length(10), Constraint::Length(12)])
-        .header(Row::new(vec![Cell::from("stream"), Cell::from("lines"), Cell::from("words"), Cell::from("chars"), Cell::from("bytes")]))
-        .block(Block::default().borders(Borders::ALL).title("live stats"));
-    f.render_widget(table, layout[1]);
-
-    let mid = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(45), Constraint::Percentage(55)]).split(layout[2]);
-    let hist_rows: Vec<Row> = state.history.iter().enumerate().take(200).map(|(i, h)| {
-        let style = if i == state.selected { Style::default().fg(Color::Yellow) } else { Style::default() };
-        Row::new(vec![Cell::from(h.timestamp.format("%m-%d %H:%M:%S").to_string()), Cell::from(h.command.join(" ")), Cell::from(format!("{} ms", h.duration_ms))]).style(style)
-    }).collect();
-    let hist = Table::new(hist_rows)
-        .widths(&[Constraint::Length(15), Constraint::Percentage(60), Constraint::Length(12)])
-        .block(Block::default().borders(Borders::ALL).title("history"));
-    f.render_widget(hist, mid[0]);
-
-    let current = Paragraph::new(format!("[stdout]\n{}\n[stderr]\n{}", out.content, err.content)).wrap(Wrap { trim: false }).block(Block::default().borders(Borders::ALL).title("current tail"));
-    f.render_widget(current, mid[1]);
-
-    let selected_text = state.history.get(state.selected).map(|h| {
-        format!(
-            "command: {}\nexit: {:?} killed: {}\nstdout lines:{} words:{} chars:{} bytes:{}\nstderr lines:{} words:{} chars:{} bytes:{}\n\nstdout tail:\n{}\n\nstderr tail:\n{}",
-            h.command.join(" "), h.exit_code, h.killed,
-            h.stdout_stats.lines, h.stdout_stats.words, h.stdout_stats.chars, h.stdout_stats.bytes,
-            h.stderr_stats.lines, h.stderr_stats.words, h.stderr_stats.chars, h.stderr_stats.bytes,
-            h.stdout_tail, h.stderr_tail
-        )
-    }).unwrap_or_else(|| "no history".to_string());
-
-    let details = Paragraph::new(selected_text).wrap(Wrap { trim: false }).block(Block::default().borders(Borders::ALL).title("selected history"));
-    f.render_widget(TuiClear, layout[3]);
-    f.render_widget(details, layout[3]);
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = load_config()?;
+    
     match cli.command {
-        Some(Mode::Gui { cmd }) => {
-            let cmd = if cmd.is_empty() { cli.cmd } else { cmd };
-            if cmd.is_empty() { return Err(WccError::NoCommand.into()); }
-            let entry = run_command(cmd, &cfg, true)?;
-            eprintln!("copied to clipboard after completion, exit={:?}", entry.exit_code);
+        Some(Mode::Build { release, debug, args }) => {
+            run_cargo_build(release, debug, args)?;
+        }
+        Some(Mode::Run { release, debug, args }) => {
+            run_cargo_run(release, debug, args)?;
         }
         None => {
-            if cli.cmd.is_empty() { return Err(WccError::NoCommand.into()); }
-            let entry = run_command(cli.cmd, &cfg, false)?;
-            eprintln!("copied to clipboard after completion, exit={:?}", entry.exit_code);
+            if cli.cmd.is_empty() { 
+                return Err(WccError::NoCommand.into()); 
+            }
+            run_watch_command(cli.cmd, &cfg)?;
         }
     }
     Ok(())
