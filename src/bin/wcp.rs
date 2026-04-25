@@ -25,49 +25,17 @@ fn main() -> Result<()> {
     let path = if args.len() == 1 {
         PathBuf::from(args[0].clone())
     } else {
-        // Try to deduce filename from clipboard content first
-        let clipboard_content = get_clipboard_text()?;
-        match deduce_filename_from_content(&clipboard_content) {
-            Some(filename) => {
-                println!("\x1b[36minfo\x1b[0m deduced filename from content: {}", color_filename(&filename));
-                
-                // Ask for confirmation
-                print!("\n❓ Use this filename? (y/n/fzf): ");
-                io::stdout().flush()?;
-                let mut input = String::new();
-                io::stdin().read_line(&mut input)?;
-                
-                match input.trim().to_lowercase().as_str() {
-                    "y" | "yes" => PathBuf::from(filename),
-                    "fzf" => {
-                        let selected = select_file_with_fzf()?;
-                        selected
-                    }
-                    _ => {
-                        println!("\x1b[33mwarning\x1b[0m please enter a filename:");
-                        let filename = get_user_filename()?;
-                        PathBuf::from(filename)
-                    }
-                }
-            }
-            None => {
-                // No filename deduced, ask user with fzf option
-                println!("\x1b[33mwarning\x1b[0m could not deduce filename");
-                print!("❓ Use fzf to select file? (y/n): ");
-                io::stdout().flush()?;
-                let mut input = String::new();
-                io::stdin().read_line(&mut input)?;
-                
-                if input.trim().to_lowercase() == "y" {
-                    select_file_with_fzf()?
-                } else {
-                    println!("please enter a filename:");
-                    let filename = get_user_filename()?;
-                    PathBuf::from(filename)
-                }
-            }
-        }
+        // Use fzf by default with fallback options
+        select_path_with_fzf()?
     };
+    
+    // Create parent directories if they don't exist
+    if let Some(parent) = path.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent)?;
+            println!("\x1b[36minfo\x1b[0m created directory: {}", color_filename(&parent.display().to_string()));
+        }
+    }
     
     let new_content = get_clipboard_text()?;
     
@@ -80,10 +48,6 @@ fn main() -> Result<()> {
         println!("\x1b[36minfo\x1b[0m backup written to {}", color_filename(&backup.display().to_string()));
         Some(old)
     } else {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-            println!("\x1b[36minfo\x1b[0m created directory: {}", color_filename(&parent.display().to_string()));
-        }
         None
     };
     
@@ -159,86 +123,134 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn select_file_with_fzf() -> Result<PathBuf> {
+fn select_path_with_fzf() -> Result<PathBuf> {
+    // Try to deduce filename from clipboard content first
+    let clipboard_content = get_clipboard_text()?;
+    let deduced = deduce_filename_from_content(&clipboard_content);
+    
     // Check if fzf is available
-    let fzf_check = Command::new("fzf")
-        .arg("--version")
-        .output();
+    let has_fzf = Command::new("fzf").arg("--version").output().is_ok();
     
-    if fzf_check.is_err() {
-        bail!("fzf not found. Please install fzf or provide a file argument");
-    }
-    
-    // Use fd if available for better file listing, otherwise use find
-    let files_output = if Command::new("fd").arg("--version").output().is_ok() {
-        // Use fd for faster, gitignore-aware file listing
-        let output = Command::new("fd")
-            .arg("--type")
-            .arg("f")
-            .arg("--hidden")
-            .arg("--exclude")
-            .arg(".git")
-            .arg("--exclude")
-            .arg("target")
-            .arg("--exclude")
-            .arg("node_modules")
-            .output()
-            .context("Failed to run fd")?;
+    if has_fzf {
+        // Use fd if available for better file listing, otherwise use find
+        let files_output = if Command::new("fd").arg("--version").output().is_ok() {
+            let output = Command::new("fd")
+                .arg("--type")
+                .arg("f")
+                .arg("--hidden")
+                .arg("--exclude")
+                .arg(".git")
+                .arg("--exclude")
+                .arg("target")
+                .arg("--exclude")
+                .arg("node_modules")
+                .output()
+                .context("Failed to run fd")?;
+            String::from_utf8_lossy(&output.stdout).to_string()
+        } else {
+            let output = Command::new("find")
+                .arg(".")
+                .arg("-type")
+                .arg("f")
+                .arg("-not")
+                .arg("-path")
+                .arg("*/.*")
+                .arg("-not")
+                .arg("-path")
+                .arg("*/target/*")
+                .arg("-not")
+                .arg("-path")
+                .arg("*/node_modules/*")
+                .output()
+                .context("Failed to run find")?;
+            String::from_utf8_lossy(&output.stdout).to_string()
+        };
         
-        String::from_utf8_lossy(&output.stdout).to_string()
-    } else {
-        // Fallback to find
-        let output = Command::new("find")
-            .arg(".")
-            .arg("-type")
-            .arg("f")
-            .arg("-not")
-            .arg("-path")
-            .arg("*/.*")
-            .arg("-not")
-            .arg("-path")
-            .arg("*/target/*")
-            .arg("-not")
-            .arg("-path")
-            .arg("*/node_modules/*")
-            .output()
-            .context("Failed to run find")?;
+        // Build fzf command with preview
+        let mut fzf_cmd = Command::new("fzf");
+        fzf_cmd
+            .arg("--height")
+            .arg("40%")
+            .arg("--border")
+            .arg("--preview")
+            .arg("bat --style=numbers --color=always --line-range=:500 {} 2>/dev/null || head -500 {}")
+            .arg("--preview-window=right:60%")
+            .arg("--ansi")
+            .arg("--print-query");
+            
+        // Add option to create new file if deduced filename exists
+        if let Some(ref filename) = deduced {
+            fzf_cmd
+                .arg("--header")
+                .arg(format!("Enter to select, or type new path (suggested: {})", filename));
+        } else {
+            fzf_cmd
+                .arg("--header")
+                .arg("Enter to select existing file, or type new file path");
+        }
         
-        String::from_utf8_lossy(&output.stdout).to_string()
-    };
-    
-    // Pipe files to fzf
-    let mut fzf_child = Command::new("fzf")
-        .arg("--height")
-        .arg("40%")
-        .arg("--border")
-        .arg("--preview")
-        .arg("bat --style=numbers --color=always --line-range=:500 {} 2>/dev/null || head -500 {}")
-        .arg("--preview-window=right:60%")
-        .arg("--ansi")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("Failed to spawn fzf")?;
-    
-    {
-        let mut stdin = fzf_child.stdin.take().context("Failed to open fzf stdin")?;
-        use std::io::Write;
-        stdin.write_all(files_output.as_bytes())?;
+        let mut fzf_child = fzf_cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .context("Failed to spawn fzf")?;
+        
+        {
+            let mut stdin = fzf_child.stdin.take().context("Failed to open fzf stdin")?;
+            stdin.write_all(files_output.as_bytes())?;
+        }
+        
+        let output = fzf_child.wait_with_output().context("Failed to read fzf output")?;
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        let lines: Vec<&str> = output_str.lines().collect();
+        
+        // fzf with --print-query outputs query first, then selection
+        let query = lines.first().unwrap_or(&"").trim();
+        let selection = lines.get(1).unwrap_or(&"").trim();
+        
+        if !selection.is_empty() {
+            // User selected an existing file
+            return Ok(PathBuf::from(selection));
+        } else if !query.is_empty() {
+            // User typed a new path
+            let new_path = PathBuf::from(query);
+            
+            // Ask for confirmation if this is a new file
+            if !new_path.exists() {
+                print!("\x1b[33mwarning\x1b[0m '{}' does not exist. Create it? (y/n): ", new_path.display());
+                io::stdout().flush()?;
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                
+                if input.trim().to_lowercase() == "y" {
+                    return Ok(new_path);
+                } else {
+                    // User declined, fall back to manual entry
+                    return get_user_filename().map(PathBuf::from);
+                }
+            } else {
+                return Ok(new_path);
+            }
+        }
     }
     
-    let output = fzf_child.wait_with_output().context("Failed to read fzf output")?;
-    
-    if !output.status.success() {
-        bail!("No file selected");
+    // Fallback: if fzf is not available or no selection made
+    if let Some(filename) = deduced {
+        print!("\x1b[36minfo\x1b[0m deduced filename from content: {}", color_filename(&filename));
+        print!("\n❓ Use this filename? (y/n): ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        
+        if input.trim().to_lowercase() == "y" {
+            return Ok(PathBuf::from(filename));
+        }
     }
     
-    let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if selected.is_empty() {
-        bail!("No file selected");
-    }
-    
-    Ok(PathBuf::from(selected))
+    // Manual entry as last resort
+    println!("\x1b[33mwarning\x1b[0m please enter a filename:");
+    let filename = get_user_filename()?;
+    Ok(PathBuf::from(filename))
 }
 
 fn backup_path(path: &Path) -> PathBuf {
@@ -306,7 +318,6 @@ fn map_lines_to_function(src: &str) -> BTreeMap<usize, String> {
     let mut current = "<global>".to_string();
     for (idx, line) in src.lines().enumerate() {
         if let Some(name) = detect_function_name(line) {
-            // Clean up the name - remove 'pub' if present at the start
             let clean_name = name
                 .trim_start()
                 .strip_prefix("pub ")
@@ -322,9 +333,7 @@ fn map_lines_to_function(src: &str) -> BTreeMap<usize, String> {
 fn detect_function_name(line: &str) -> Option<String> {
     let trimmed = line.trim();
     
-    // Handle Rust-style function definitions
     if trimmed.contains("fn ") {
-        // Extract just the function name after 'fn' and before any parentheses or generics
         let after_fn = trimmed.split("fn ").nth(1)?;
         let name = after_fn
             .split(|c: char| c == '(' || c == '<' || c == ' ' || c == '{')
@@ -334,7 +343,6 @@ fn detect_function_name(line: &str) -> Option<String> {
         }
     }
     
-    // Handle Python function definitions
     if trimmed.contains("def ") {
         let after_def = trimmed.split("def ").nth(1)?;
         let name = after_def
@@ -345,7 +353,6 @@ fn detect_function_name(line: &str) -> Option<String> {
         }
     }
     
-    // Handle JavaScript/TypeScript function definitions
     if trimmed.contains("function ") {
         let after_fn = trimmed.split("function ").nth(1)?;
         let name = after_fn
@@ -356,7 +363,6 @@ fn detect_function_name(line: &str) -> Option<String> {
         }
     }
     
-    // Handle class definitions
     if trimmed.contains("class ") {
         let after_class = trimmed.split("class ").nth(1)?;
         let name = after_class
@@ -367,7 +373,6 @@ fn detect_function_name(line: &str) -> Option<String> {
         }
     }
     
-    // Handle impl blocks (Rust)
     if trimmed.contains("impl ") {
         let after_impl = trimmed.split("impl ").nth(1)?;
         let name = after_impl
@@ -378,7 +383,6 @@ fn detect_function_name(line: &str) -> Option<String> {
         }
     }
     
-    // Handle C-style function definitions (return type function_name())
     if trimmed.contains('(') && trimmed.ends_with('{') && !trimmed.starts_with("//") {
         let before_paren = trimmed.split('(').next()?;
         let name = before_paren.split_whitespace().last()?;
