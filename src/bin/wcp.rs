@@ -1,14 +1,13 @@
 // src/bin/wcp.rs
+use anyhow::{bail, Context, Result};
+use similar::{ChangeTag, TextDiff};
 use std::{
     collections::BTreeMap,
-    env,
-    fs,
+    env, fs,
     io::{self, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
-use anyhow::{bail, Context, Result};
-use similar::{ChangeTag, TextDiff};
 use wcc::common::*;
 
 #[derive(Debug, Clone, Default)]
@@ -20,42 +19,64 @@ struct DiffStats {
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
-    
-    // Determine target path
+
+    let new_content = get_clipboard_text()?;
+
     let path = if args.len() == 1 {
         PathBuf::from(args[0].clone())
+    } else if let Some(filename) = deduce_filename_from_content(&new_content) {
+        print!(
+            "\x1b[36minfo\x1b[0m deduced filename from content: {}",
+            color_filename(&filename)
+        );
+        print!("\n❓ Use this filename? (y/n): ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+
+        if input.trim().eq_ignore_ascii_case("y") {
+            PathBuf::from(filename)
+        } else {
+            select_path_with_fzf()?
+        }
     } else {
-        // Use fzf by default with fallback options
         select_path_with_fzf()?
     };
-    
-    // Create parent directories if they don't exist
+
     if let Some(parent) = path.parent() {
         if !parent.exists() {
             fs::create_dir_all(parent)?;
-            println!("\x1b[36minfo\x1b[0m created directory: {}", color_filename(&parent.display().to_string()));
+            println!(
+                "\x1b[36minfo\x1b[0m created directory: {}",
+                color_filename(&parent.display().to_string())
+            );
         }
     }
-    
-    let new_content = get_clipboard_text()?;
-    
+
     let old_content = if path.exists() {
         let old = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         let backup = backup_path(&path);
         fs::write(&backup, &old)
             .with_context(|| format!("failed to write backup {}", backup.display()))?;
-        println!("\x1b[36minfo\x1b[0m backup written to {}", color_filename(&backup.display().to_string()));
+        println!(
+            "\x1b[36minfo\x1b[0m backup written to {}",
+            color_filename(&backup.display().to_string())
+        );
         Some(old)
     } else {
         None
     };
-    
+
     fs::write(&path, &new_content)
         .with_context(|| format!("failed to write {}", path.display()))?;
-    
-    println!("\x1b[36minfo\x1b[0m output written to: {}", color_filename(&path.display().to_string()));
-    
+
+    println!(
+        "\x1b[36minfo\x1b[0m output written to: {}",
+        color_filename(&path.display().to_string())
+    );
+
     let new_stats = calc_stats(&new_content);
     println!(
         "\x1b[36mfile\x1b[0m {}  \x1b[33mlines\x1b[0m {}  \x1b[33mwords\x1b[0m {}  \x1b[33mchars\x1b[0m {}  \x1b[33mbytes\x1b[0m {}",
@@ -65,13 +86,16 @@ fn main() -> Result<()> {
         heatmap_color_chars(new_stats.chars),
         heatmap_color_bytes(new_stats.bytes)
     );
-    
+
     if let Some(old) = old_content {
         let diff_stats_result = diff_stats(&old, &new_content);
         println!(
             "\x1b[35mdiff\x1b[0m changed={}  \x1b[32m+{}\x1b[0m  \x1b[31m-{}\x1b[0m",
-            diff_stats_result.changed, diff_stats_result.added_lines, diff_stats_result.removed_lines
+            diff_stats_result.changed,
+            diff_stats_result.added_lines,
+            diff_stats_result.removed_lines
         );
+
         let per_fn = function_diff_stats(&old, &new_content);
         if !per_fn.is_empty() {
             println!("\x1b[34mper-function diff\x1b[0m");
@@ -85,54 +109,76 @@ fn main() -> Result<()> {
                 );
             }
         }
-        
-        // Print final summary
+
         let old_stats = calc_stats(&old);
-        print_summary(&new_stats, &path.display().to_string(), "File written successfully");
-        
+        print_summary(
+            &new_stats,
+            &path.display().to_string(),
+            "File written successfully",
+        );
+
         println!("\n  \x1b[36mchange summary:\x1b[0m");
-        println!("    \x1b[32m+{}\x1b[0m lines added", diff_stats_result.added_lines);
-        println!("    \x1b[31m-{}\x1b[0m lines removed", diff_stats_result.removed_lines);
-        
+        println!(
+            "    \x1b[32m+{}\x1b[0m lines added",
+            diff_stats_result.added_lines
+        );
+        println!(
+            "    \x1b[31m-{}\x1b[0m lines removed",
+            diff_stats_result.removed_lines
+        );
+
         let line_diff = new_stats.lines as i64 - old_stats.lines as i64;
         let word_diff = new_stats.words as i64 - old_stats.words as i64;
         let char_diff = new_stats.chars as i64 - old_stats.chars as i64;
         let byte_diff = new_stats.bytes as i64 - old_stats.bytes as i64;
-        
+
         if line_diff != 0 {
-            let color = if line_diff > 0 { "\x1b[32m" } else { "\x1b[31m" };
+            let color = if line_diff > 0 {
+                "\x1b[32m"
+            } else {
+                "\x1b[31m"
+            };
             println!("    {}lines: {}{:+}\x1b[0m", color, color, line_diff);
         }
         if word_diff != 0 {
-            let color = if word_diff > 0 { "\x1b[32m" } else { "\x1b[31m" };
+            let color = if word_diff > 0 {
+                "\x1b[32m"
+            } else {
+                "\x1b[31m"
+            };
             println!("    {}words: {}{:+}\x1b[0m", color, color, word_diff);
         }
         if char_diff != 0 {
-            let color = if char_diff > 0 { "\x1b[32m" } else { "\x1b[31m" };
+            let color = if char_diff > 0 {
+                "\x1b[32m"
+            } else {
+                "\x1b[31m"
+            };
             println!("    {}chars: {}{:+}\x1b[0m", color, color, char_diff);
         }
         if byte_diff != 0 {
-            let color = if byte_diff > 0 { "\x1b[32m" } else { "\x1b[31m" };
+            let color = if byte_diff > 0 {
+                "\x1b[32m"
+            } else {
+                "\x1b[31m"
+            };
             println!("    {}bytes: {}{:+}\x1b[0m", color, color, byte_diff);
         }
     } else {
-        // If no old content, just print summary
-        print_summary(&new_stats, &path.display().to_string(), "File created successfully");
+        print_summary(
+            &new_stats,
+            &path.display().to_string(),
+            "File created successfully",
+        );
     }
-    
+
     Ok(())
 }
 
 fn select_path_with_fzf() -> Result<PathBuf> {
-    // Try to deduce filename from clipboard content first
-    let clipboard_content = get_clipboard_text()?;
-    let deduced = deduce_filename_from_content(&clipboard_content);
-    
-    // Check if fzf is available
     let has_fzf = Command::new("fzf").arg("--version").output().is_ok();
-    
+
     if has_fzf {
-        // Use fd if available for better file listing, otherwise use find
         let files_output = if Command::new("fd").arg("--version").output().is_ok() {
             let output = Command::new("fd")
                 .arg("--type")
@@ -165,8 +211,7 @@ fn select_path_with_fzf() -> Result<PathBuf> {
                 .context("Failed to run find")?;
             String::from_utf8_lossy(&output.stdout).to_string()
         };
-        
-        // Build fzf command with preview
+
         let mut fzf_cmd = Command::new("fzf");
         fzf_cmd
             .arg("--height")
@@ -176,56 +221,47 @@ fn select_path_with_fzf() -> Result<PathBuf> {
             .arg("bat --style=numbers --color=always --line-range=:500 {} 2>/dev/null || head -500 {}")
             .arg("--preview-window=right:60%")
             .arg("--ansi")
-            .arg("--print-query");
-            
-        // Add option to create new file if deduced filename exists
-        if let Some(ref filename) = deduced {
-            fzf_cmd
-                .arg("--header")
-                .arg(format!("Enter to select, or type new path (suggested: {})", filename));
-        } else {
-            fzf_cmd
-                .arg("--header")
-                .arg("Enter to select existing file, or type new file path");
-        }
-        
+            .arg("--print-query")
+            .arg("--header")
+            .arg("Enter to select existing file, or type new file path");
+
         let mut fzf_child = fzf_cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .context("Failed to spawn fzf")?;
-        
+
         {
             let mut stdin = fzf_child.stdin.take().context("Failed to open fzf stdin")?;
             stdin.write_all(files_output.as_bytes())?;
         }
-        
-        let output = fzf_child.wait_with_output().context("Failed to read fzf output")?;
+
+        let output = fzf_child
+            .wait_with_output()
+            .context("Failed to read fzf output")?;
         let output_str = String::from_utf8_lossy(&output.stdout);
         let lines: Vec<&str> = output_str.lines().collect();
-        
-        // fzf with --print-query outputs query first, then selection
+
         let query = lines.first().unwrap_or(&"").trim();
         let selection = lines.get(1).unwrap_or(&"").trim();
-        
+
         if !selection.is_empty() {
-            // User selected an existing file
             return Ok(PathBuf::from(selection));
         } else if !query.is_empty() {
-            // User typed a new path
             let new_path = PathBuf::from(query);
-            
-            // Ask for confirmation if this is a new file
+
             if !new_path.exists() {
-                print!("\x1b[33mwarning\x1b[0m '{}' does not exist. Create it? (y/n): ", new_path.display());
+                print!(
+                    "\x1b[33mwarning\x1b[0m '{}' does not exist. Create it? (y/n): ",
+                    new_path.display()
+                );
                 io::stdout().flush()?;
                 let mut input = String::new();
                 io::stdin().read_line(&mut input)?;
-                
-                if input.trim().to_lowercase() == "y" {
+
+                if input.trim().eq_ignore_ascii_case("y") {
                     return Ok(new_path);
                 } else {
-                    // User declined, fall back to manual entry
                     return get_user_filename().map(PathBuf::from);
                 }
             } else {
@@ -233,21 +269,7 @@ fn select_path_with_fzf() -> Result<PathBuf> {
             }
         }
     }
-    
-    // Fallback: if fzf is not available or no selection made
-    if let Some(filename) = deduced {
-        print!("\x1b[36minfo\x1b[0m deduced filename from content: {}", color_filename(&filename));
-        print!("\n❓ Use this filename? (y/n): ");
-        io::stdout().flush()?;
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        
-        if input.trim().to_lowercase() == "y" {
-            return Ok(PathBuf::from(filename));
-        }
-    }
-    
-    // Manual entry as last resort
+
     println!("\x1b[33mwarning\x1b[0m please enter a filename:");
     let filename = get_user_filename()?;
     Ok(PathBuf::from(filename))
@@ -285,7 +307,7 @@ fn function_diff_stats(old: &str, new: &str) -> BTreeMap<String, DiffStats> {
     let mut old_line = 0usize;
     let mut new_line = 0usize;
     let mut stats: BTreeMap<String, DiffStats> = BTreeMap::new();
-    
+
     for change in diff.iter_all_changes() {
         match change.tag() {
             ChangeTag::Equal => {
@@ -293,14 +315,20 @@ fn function_diff_stats(old: &str, new: &str) -> BTreeMap<String, DiffStats> {
                 new_line += 1;
             }
             ChangeTag::Delete => {
-                let name = old_map.get(&old_line).cloned().unwrap_or_else(|| "<global>".to_string());
+                let name = old_map
+                    .get(&old_line)
+                    .cloned()
+                    .unwrap_or_else(|| "<global>".to_string());
                 let entry = stats.entry(name).or_default();
                 entry.removed_lines += 1;
                 entry.changed = true;
                 old_line += 1;
             }
             ChangeTag::Insert => {
-                let name = new_map.get(&new_line).cloned().unwrap_or_else(|| "<global>".to_string());
+                let name = new_map
+                    .get(&new_line)
+                    .cloned()
+                    .unwrap_or_else(|| "<global>".to_string());
                 let entry = stats.entry(name).or_default();
                 entry.added_lines += 1;
                 entry.changed = true;
@@ -308,7 +336,7 @@ fn function_diff_stats(old: &str, new: &str) -> BTreeMap<String, DiffStats> {
             }
         }
     }
-    
+
     stats.retain(|_, v| v.changed);
     stats
 }
@@ -332,7 +360,7 @@ fn map_lines_to_function(src: &str) -> BTreeMap<usize, String> {
 
 fn detect_function_name(line: &str) -> Option<String> {
     let trimmed = line.trim();
-    
+
     if trimmed.contains("fn ") {
         let after_fn = trimmed.split("fn ").nth(1)?;
         let name = after_fn
@@ -342,7 +370,7 @@ fn detect_function_name(line: &str) -> Option<String> {
             return Some(name.to_string());
         }
     }
-    
+
     if trimmed.contains("def ") {
         let after_def = trimmed.split("def ").nth(1)?;
         let name = after_def
@@ -352,7 +380,7 @@ fn detect_function_name(line: &str) -> Option<String> {
             return Some(name.to_string());
         }
     }
-    
+
     if trimmed.contains("function ") {
         let after_fn = trimmed.split("function ").nth(1)?;
         let name = after_fn
@@ -362,7 +390,7 @@ fn detect_function_name(line: &str) -> Option<String> {
             return Some(name.to_string());
         }
     }
-    
+
     if trimmed.contains("class ") {
         let after_class = trimmed.split("class ").nth(1)?;
         let name = after_class
@@ -372,7 +400,7 @@ fn detect_function_name(line: &str) -> Option<String> {
             return Some(name.to_string());
         }
     }
-    
+
     if trimmed.contains("impl ") {
         let after_impl = trimmed.split("impl ").nth(1)?;
         let name = after_impl
@@ -382,7 +410,7 @@ fn detect_function_name(line: &str) -> Option<String> {
             return Some(format!("impl {}", name));
         }
     }
-    
+
     if trimmed.contains('(') && trimmed.ends_with('{') && !trimmed.starts_with("//") {
         let before_paren = trimmed.split('(').next()?;
         let name = before_paren.split_whitespace().last()?;
@@ -390,14 +418,14 @@ fn detect_function_name(line: &str) -> Option<String> {
             return Some(name.to_string());
         }
     }
-    
+
     None
 }
 
 fn deduce_filename_from_content(content: &str) -> Option<String> {
     for line in content.lines().take(2) {
         let line = line.trim();
-        
+
         let patterns = [
             ("//", "// "),
             ("#", "# "),
@@ -406,16 +434,18 @@ fn deduce_filename_from_content(content: &str) -> Option<String> {
             (";", "; "),
             ("--", "-- "),
         ];
-        
+
         for (comment_start, comment_prefix) in patterns {
             if line.starts_with(comment_start) {
                 let after_comment = line.strip_prefix(comment_start).unwrap_or(line).trim();
-                let after_prefix = after_comment.strip_prefix(comment_prefix.trim()).unwrap_or(after_comment);
-                
+                let after_prefix = after_comment
+                    .strip_prefix(comment_prefix.trim())
+                    .unwrap_or(after_comment);
+
                 if after_prefix.contains('.') && !after_prefix.contains(char::is_whitespace) {
                     return Some(after_prefix.to_string());
                 }
-                
+
                 let words: Vec<&str> = after_prefix.split_whitespace().collect();
                 for word in words {
                     if word.contains('.') && !word.contains('/') && word.len() > 2 {
@@ -425,22 +455,22 @@ fn deduce_filename_from_content(content: &str) -> Option<String> {
             }
         }
     }
-    
+
     None
 }
 
 fn get_user_filename() -> Result<String> {
     print!("\x1b[36mfilename:\x1b[0m ");
     io::stdout().flush()?;
-    
+
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
-    
+
     let filename = input.trim();
     if filename.is_empty() {
         bail!("no filename provided");
     }
-    
+
     if !filename.contains('.') {
         print!("\x1b[33mno extension detected. add .rs? (y/n):\x1b[0m ");
         io::stdout().flush()?;
@@ -450,6 +480,6 @@ fn get_user_filename() -> Result<String> {
             return Ok(format!("{}.rs", filename));
         }
     }
-    
+
     Ok(filename.to_string())
 }
