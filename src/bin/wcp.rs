@@ -3,7 +3,9 @@ use std::{
     collections::BTreeMap,
     env,
     fs,
+    io::{self, Write},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
 };
 use anyhow::{bail, Context, Result};
 use similar::{ChangeTag, TextDiff};
@@ -23,16 +25,46 @@ fn main() -> Result<()> {
     let path = if args.len() == 1 {
         PathBuf::from(args[0].clone())
     } else {
+        // Try to deduce filename from clipboard content first
         let clipboard_content = get_clipboard_text()?;
         match deduce_filename_from_content(&clipboard_content) {
             Some(filename) => {
                 println!("\x1b[36minfo\x1b[0m deduced filename from content: {}", color_filename(&filename));
-                PathBuf::from(filename)
+                
+                // Ask for confirmation
+                print!("\n❓ Use this filename? (y/n/fzf): ");
+                io::stdout().flush()?;
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                
+                match input.trim().to_lowercase().as_str() {
+                    "y" | "yes" => PathBuf::from(filename),
+                    "fzf" => {
+                        let selected = select_file_with_fzf()?;
+                        selected
+                    }
+                    _ => {
+                        println!("\x1b[33mwarning\x1b[0m please enter a filename:");
+                        let filename = get_user_filename()?;
+                        PathBuf::from(filename)
+                    }
+                }
             }
             None => {
-                println!("\x1b[33mwarning\x1b[0m could not deduce filename, please enter a filename:");
-                let filename = get_user_filename()?;
-                PathBuf::from(filename)
+                // No filename deduced, ask user with fzf option
+                println!("\x1b[33mwarning\x1b[0m could not deduce filename");
+                print!("❓ Use fzf to select file? (y/n): ");
+                io::stdout().flush()?;
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                
+                if input.trim().to_lowercase() == "y" {
+                    select_file_with_fzf()?
+                } else {
+                    println!("please enter a filename:");
+                    let filename = get_user_filename()?;
+                    PathBuf::from(filename)
+                }
             }
         }
     };
@@ -125,6 +157,88 @@ fn main() -> Result<()> {
     }
     
     Ok(())
+}
+
+fn select_file_with_fzf() -> Result<PathBuf> {
+    // Check if fzf is available
+    let fzf_check = Command::new("fzf")
+        .arg("--version")
+        .output();
+    
+    if fzf_check.is_err() {
+        bail!("fzf not found. Please install fzf or provide a file argument");
+    }
+    
+    // Use fd if available for better file listing, otherwise use find
+    let files_output = if Command::new("fd").arg("--version").output().is_ok() {
+        // Use fd for faster, gitignore-aware file listing
+        let output = Command::new("fd")
+            .arg("--type")
+            .arg("f")
+            .arg("--hidden")
+            .arg("--exclude")
+            .arg(".git")
+            .arg("--exclude")
+            .arg("target")
+            .arg("--exclude")
+            .arg("node_modules")
+            .output()
+            .context("Failed to run fd")?;
+        
+        String::from_utf8_lossy(&output.stdout).to_string()
+    } else {
+        // Fallback to find
+        let output = Command::new("find")
+            .arg(".")
+            .arg("-type")
+            .arg("f")
+            .arg("-not")
+            .arg("-path")
+            .arg("*/.*")
+            .arg("-not")
+            .arg("-path")
+            .arg("*/target/*")
+            .arg("-not")
+            .arg("-path")
+            .arg("*/node_modules/*")
+            .output()
+            .context("Failed to run find")?;
+        
+        String::from_utf8_lossy(&output.stdout).to_string()
+    };
+    
+    // Pipe files to fzf
+    let mut fzf_child = Command::new("fzf")
+        .arg("--height")
+        .arg("40%")
+        .arg("--border")
+        .arg("--preview")
+        .arg("bat --style=numbers --color=always --line-range=:500 {} 2>/dev/null || head -500 {}")
+        .arg("--preview-window=right:60%")
+        .arg("--ansi")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("Failed to spawn fzf")?;
+    
+    {
+        let mut stdin = fzf_child.stdin.take().context("Failed to open fzf stdin")?;
+        use std::io::Write;
+        stdin.write_all(files_output.as_bytes())?;
+    }
+    
+    let output = fzf_child.wait_with_output().context("Failed to read fzf output")?;
+    
+    if !output.status.success() {
+        bail!("No file selected");
+    }
+    
+    let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if selected.is_empty() {
+        bail!("No file selected");
+    }
+    
+    Ok(PathBuf::from(selected))
 }
 
 fn backup_path(path: &Path) -> PathBuf {
@@ -312,8 +426,6 @@ fn deduce_filename_from_content(content: &str) -> Option<String> {
 }
 
 fn get_user_filename() -> Result<String> {
-    use std::io::{self, Write};
-    
     print!("\x1b[36mfilename:\x1b[0m ");
     io::stdout().flush()?;
     
