@@ -30,52 +30,63 @@ struct FileChange {
     diff: String,
 }
 
-fn parse_clipboard_function(content: &str) -> Result<(String, String)> {
+fn parse_clipboard_functions(content: &str) -> Result<Vec<(String, String)>> {
     let content = content.trim();
+    let mut functions = Vec::new();
+    let mut pos = 0;
     
-    let start_pos = content.find("fn ").context("No 'fn ' found in clipboard")?;
-    
-    let before_fn = &content[..start_pos];
-    let has_pub = before_fn.trim_end().ends_with("pub");
-    
-    let mut brace_count = 0;
-    let mut end_pos = start_pos;
-    let mut in_brace = false;
-    
-    for (i, ch) in content[start_pos..].char_indices() {
-        let abs_pos = start_pos + i;
-        match ch {
-            '{' => {
-                brace_count += 1;
-                in_brace = true;
-            }
-            '}' => {
-                brace_count -= 1;
-                if in_brace && brace_count == 0 {
-                    end_pos = abs_pos + 1;
-                    break;
+    while let Some(start_pos) = content[pos..].find("fn ") {
+        let abs_start = pos + start_pos;
+        
+        let before_fn = &content[..abs_start];
+        let has_pub = before_fn.trim_end().ends_with("pub");
+        
+        let mut brace_count = 0;
+        let mut end_pos = abs_start;
+        let mut in_brace = false;
+        
+        for (i, ch) in content[abs_start..].char_indices() {
+            let abs_pos = abs_start + i;
+            match ch {
+                '{' => {
+                    brace_count += 1;
+                    in_brace = true;
                 }
+                '}' => {
+                    brace_count -= 1;
+                    if in_brace && brace_count == 0 {
+                        end_pos = abs_pos + 1;
+                        break;
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
+        
+        let mut full_function = content[abs_start..end_pos].to_string();
+        
+        if has_pub && !full_function.trim_start().starts_with("pub") {
+            full_function = format!("pub {}", full_function);
+        }
+        
+        if !full_function.trim_end().ends_with('}') {
+            full_function.push_str("\n}");
+        }
+        
+        let name_re = Regex::new(r"fn\s+(\w+)")?;
+        if let Some(func_name) = name_re.captures(&full_function)
+            .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string())) {
+            functions.push((func_name, full_function));
+        }
+        
+        pos = end_pos;
     }
     
-    let mut full_function = content[start_pos..end_pos].to_string();
-    
-    if has_pub && !full_function.trim_start().starts_with("pub") {
-        full_function = format!("pub {}", full_function);
+    if functions.is_empty() {
+        bail!("No valid functions found in clipboard");
     }
     
-    if !full_function.trim_end().ends_with('}') {
-        full_function.push_str("\n}");
-    }
-    
-    let name_re = Regex::new(r"fn\s+(\w+)")?;
-    let func_name = name_re.captures(&full_function)
-        .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
-        .context("Could not find function name")?;
-    
-    Ok((func_name, full_function))
+    Ok(functions)
 }
 
 fn find_function_in_file(file_path: &Path, func_name: &str) -> Result<Option<FunctionMatch>> {
@@ -309,144 +320,179 @@ fn main() -> Result<()> {
     eprintln!("📋 Reading clipboard content...");
     let clipboard_content = get_clipboard_text()?;
     
-    // Parse function from clipboard
-    eprintln!("🔍 Parsing function from clipboard...");
-    let (func_name, new_function) = match parse_clipboard_function(&clipboard_content) {
-        Ok(result) => result,
+    // Parse functions from clipboard
+    eprintln!("🔍 Parsing functions from clipboard...");
+    let mut functions = match parse_clipboard_functions(&clipboard_content) {
+        Ok(funcs) => funcs,
         Err(e) => {
-            eprintln!("⚠ Failed to parse clipboard as Rust function: {}", e);
-            eprintln!("Make sure the clipboard contains a valid Rust function definition");
+            eprintln!("⚠ Failed to parse clipboard as Rust functions: {}", e);
+            eprintln!("Make sure the clipboard contains valid Rust function definitions");
             return Ok(());
         }
     };
     
-    eprintln!("✓ Found function: {}", func_name);
-    eprintln!("  Function preview: {}", new_function.lines().next().unwrap_or(""));
+    eprintln!("✓ Found {} function(s):", functions.len());
+    for (name, _) in &functions {
+        eprintln!("  • {}", name);
+    }
     
-    // Show current buffer content if configured
-    if config.wcf.show_buffer_preview {
-        eprintln!("\n\x1b[36m📋 Current buffer content:\x1b[0m");
-        eprintln!("\x1b[90m{}\x1b[0m", "-".repeat(60));
-        for (i, line) in new_function.lines().enumerate().take(30) {
-            eprintln!("{:4} {}", i + 1, line);
-        }
-        if new_function.lines().count() > 30 {
-            eprintln!("     ... {} more lines", new_function.lines().count() - 30);
-        }
-        eprintln!("\x1b[90m{}\x1b[0m", "-".repeat(60));
+    let mut all_diffs = String::new();
+    let mut processed_count = 0;
+    let mut skipped_count = 0;
+    
+    // Process each function one by one
+    while !functions.is_empty() {
+        let (func_name, new_function) = functions.remove(0);
         
-        print!("\n❓ Continue with this function? (y/n): ");
+        eprintln!("\n\x1b[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
+        eprintln!("📝 Processing function: \x1b[1;33m{}\x1b[0m", func_name);
+        eprintln!("\x1b[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
+        
+        // Show current buffer content if configured
+        if config.wcf.show_buffer_preview {
+            eprintln!("\n\x1b[36m📋 Function preview:\x1b[0m");
+            eprintln!("\x1b[90m{}\x1b[0m", "-".repeat(60));
+            for (i, line) in new_function.lines().enumerate().take(20) {
+                eprintln!("{:4} {}", i + 1, line);
+            }
+            if new_function.lines().count() > 20 {
+                eprintln!("     ... {} more lines", new_function.lines().count() - 20);
+            }
+            eprintln!("\x1b[90m{}\x1b[0m", "-".repeat(60));
+            
+            print!("\n❓ Continue with this function? (y/n/skip all): ");
+            io::stdout().flush()?;
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            
+            match input.trim().to_lowercase().as_str() {
+                "skip all" => {
+                    eprintln!("⚠ Skipping all remaining functions");
+                    break;
+                }
+                "n" | "no" => {
+                    eprintln!("⚠ Skipping function: {}", func_name);
+                    skipped_count += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        
+        // Scan directory for matching functions
+        eprintln!("\n🔎 Scanning for function '{}'...", func_name);
+        let matches = scan_directory_for_function(&target_dir, &func_name)?;
+        
+        if matches.is_empty() {
+            eprintln!("⚠ No matches found for '{}', skipping", func_name);
+            skipped_count += 1;
+            continue;
+        }
+        
+        eprintln!("✓ Found {} matching function(s):", matches.len());
+        for m in &matches {
+            eprintln!("  • {} (lines {}-{})", m.file_path.display(), m.start_line, m.end_line);
+        }
+        
+        // If multiple files, let user select which one to modify
+        let selected_matches = if matches.len() > 1 {
+            let files: Vec<PathBuf> = matches.iter().map(|m| m.file_path.clone()).collect();
+            eprintln!("\n📁 Multiple files found. Select one to modify:");
+            
+            match select_file_with_fzf(&files)? {
+                Some(selected_file) => {
+                    matches.into_iter().filter(|m| m.file_path == selected_file).collect()
+                }
+                None => {
+                    eprintln!("⚠ No file selected for '{}', skipping", func_name);
+                    skipped_count += 1;
+                    continue;
+                }
+            }
+        } else {
+            matches
+        };
+        
+        // Preview changes with colored diff
+        eprintln!("\n📝 Preview of changes:");
+        for m in &selected_matches {
+            eprintln!("\n  File: {}", m.file_path.display());
+            eprintln!("  Old function (lines {}-{}):", m.start_line, m.end_line);
+            print_colored_diff(&m.old_full_function, &new_function);
+        }
+        
+        // Ask for confirmation
+        print!("\n❓ Apply these changes? (y/n): ");
         io::stdout().flush()?;
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
+        
         if input.trim().to_lowercase() != "y" {
-            eprintln!("❌ Aborted.");
-            return Ok(());
+            eprintln!("⚠ Skipping function: {}", func_name);
+            skipped_count += 1;
+            continue;
         }
-    }
-    
-    // Scan directory for matching functions
-    eprintln!("\n🔎 Scanning for function '{}'...", func_name);
-    let matches = scan_directory_for_function(&target_dir, &func_name)?;
-    
-    if matches.is_empty() {
-        eprintln!("⚠ No matching functions found");
-        return Ok(());
-    }
-    
-    eprintln!("✓ Found {} matching function(s):", matches.len());
-    for m in &matches {
-        eprintln!("  • {} (lines {}-{})", m.file_path.display(), m.start_line, m.end_line);
-    }
-    
-    // If multiple files, let user select which one to modify
-    let selected_matches = if matches.len() > 1 {
-        let files: Vec<PathBuf> = matches.iter().map(|m| m.file_path.clone()).collect();
-        eprintln!("\n📁 Multiple files found. Select one to modify:");
         
-        match select_file_with_fzf(&files)? {
-            Some(selected_file) => {
-                matches.into_iter().filter(|m| m.file_path == selected_file).collect()
+        // Apply changes
+        eprintln!("\n🔄 Applying changes...");
+        
+        for func_match in &selected_matches {
+            let file_path = &func_match.file_path;
+            let old_content = fs::read_to_string(file_path)?;
+            
+            // Create backup only once per file
+            let backup_path = PathBuf::from(format!("{}.bkp", file_path.display()));
+            if !backup_path.exists() {
+                fs::write(&backup_path, &old_content)?;
+                eprintln!("  ✓ Created backup: {}", backup_path.display());
             }
-            None => {
-                eprintln!("⚠ No file selected");
-                return Ok(());
+            
+            // Replace function
+            let new_content = replace_function_in_file(&old_content, func_match, &new_function)?;
+            fs::write(file_path, &new_content)?;
+            
+            // Run rustfmt on the file
+            if let Err(e) = run_rustfmt_in_dir(file_path) {
+                eprintln!("  Warning: rustfmt failed: {}", e);
             }
-        }
-    } else {
-        matches
-    };
-    
-    // Preview changes with colored diff
-    eprintln!("\n📝 Preview of changes:");
-    for m in &selected_matches {
-        eprintln!("\n  File: {}", m.file_path.display());
-        eprintln!("  Old function (lines {}-{}):", m.start_line, m.end_line);
-        print_colored_diff(&m.old_full_function, &new_function);
-    }
-    
-    // Ask for confirmation
-    print!("\n❓ Apply these changes? (y/n): ");
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    
-    if input.trim().to_lowercase() != "y" {
-        eprintln!("❌ Aborted.");
-        return Ok(());
-    }
-    
-    // Apply changes and collect diffs
-    eprintln!("\n🔄 Applying changes...");
-    let mut changes = Vec::new();
-    let mut all_diffs = String::new();
-    
-    for func_match in &selected_matches {
-        let file_path = &func_match.file_path;
-        let old_content = fs::read_to_string(file_path)?;
-        
-        // Create backup
-        let backup_path = PathBuf::from(format!("{}.bkp", file_path.display()));
-        fs::write(&backup_path, &old_content)?;
-        eprintln!("  ✓ Created backup: {}", backup_path.display());
-        
-        // Replace function
-        let new_content = replace_function_in_file(&old_content, func_match, &new_function)?;
-        fs::write(file_path, &new_content)?;
-        
-        // Run rustfmt on the file
-        if let Err(e) = run_rustfmt_in_dir(file_path) {
-            eprintln!("  Warning: rustfmt failed: {}", e);
+            
+            // Generate diff for this file
+            let file_diff = generate_clean_diff(&func_match.old_full_function, &new_function);
+            let rel_path = file_path.strip_prefix(&target_dir).unwrap_or(file_path);
+            
+            all_diffs.push_str(&format!("// {} - Function: {}\n", rel_path.display(), func_name));
+            all_diffs.push_str(&file_diff);
+            all_diffs.push_str("\n");
+            
+            eprintln!("  ✓ Updated: {}", file_path.display());
+            processed_count += 1;
         }
         
-        // Generate diff for this file
-        let file_diff = generate_clean_diff(&func_match.old_full_function, &new_function);
-        let rel_path = file_path.strip_prefix(&target_dir).unwrap_or(file_path);
-        
-        all_diffs.push_str(&format!("// {}\n", rel_path.display()));
-        all_diffs.push_str(&file_diff);
-        all_diffs.push_str("\n");
-        
-        changes.push(FileChange {
-            file_path: file_path.clone(),
-            old_content,
-            new_content: fs::read_to_string(file_path)?,
-            diff: file_diff,
-        });
-        
-        eprintln!("  ✓ Updated: {}", file_path.display());
+        eprintln!("\n✅ Function '{}' processed successfully!", func_name);
     }
     
-    // Copy diff to clipboard
+    // Print final summary
+    eprintln!("\n\x1b[1;32m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
+    eprintln!("\x1b[1;32m✅ All functions processed!\x1b[0m");
+    eprintln!("  Functions processed: {}", processed_count);
+    eprintln!("  Functions skipped: {}", skipped_count);
+    
+    // Copy final diff to clipboard
     if !all_diffs.is_empty() {
-        set_clipboard(&all_diffs)?;
-        eprintln!("\n✓ Diff copied to clipboard!");
+        let final_output = format!(
+            "// wcf Function Replacement Summary\n\
+             // ============================================================\n\
+             // Total functions processed: {}\n\
+             // Total functions skipped: {}\n\
+             // ============================================================\n\n\
+             {}",
+            processed_count,
+            skipped_count,
+            all_diffs
+        );
+        set_clipboard(&final_output)?;
+        eprintln!("\n✓ Final diff copied to clipboard!");
     }
-    
-    // Print summary
-    eprintln!("\n✅ Changes applied successfully!");
-    eprintln!("  Files changed: {}", changes.len());
-    eprintln!("  Functions replaced: {}", selected_matches.len());
     
     Ok(())
 }
