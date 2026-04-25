@@ -4,13 +4,14 @@ use std::{
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 
 use anyhow::{bail, Context, Result};
 use regex::Regex;
 use similar::{ChangeTag, TextDiff};
 use wcc::common::*;
+use wcc::load_unified_config;
 
 #[derive(Debug, Clone)]
 struct FunctionMatch {
@@ -32,10 +33,8 @@ struct FileChange {
 fn parse_clipboard_function(content: &str) -> Result<(String, String)> {
     let content = content.trim();
     
-    // Find the complete function by brace counting, preserving everything including pub
     let start_pos = content.find("fn ").context("No 'fn ' found in clipboard")?;
     
-    // Look backwards for pub keyword
     let before_fn = &content[..start_pos];
     let has_pub = before_fn.trim_end().ends_with("pub");
     
@@ -63,17 +62,14 @@ fn parse_clipboard_function(content: &str) -> Result<(String, String)> {
     
     let mut full_function = content[start_pos..end_pos].to_string();
     
-    // Add pub keyword back if it was present
     if has_pub && !full_function.trim_start().starts_with("pub") {
         full_function = format!("pub {}", full_function);
     }
     
-    // Ensure proper formatting
     if !full_function.trim_end().ends_with('}') {
         full_function.push_str("\n}");
     }
     
-    // Extract function name
     let name_re = Regex::new(r"fn\s+(\w+)")?;
     let func_name = name_re.captures(&full_function)
         .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
@@ -139,27 +135,22 @@ fn replace_function_in_file(content: &str, func_match: &FunctionMatch, new_funct
     let lines: Vec<&str> = content.lines().collect();
     let mut result: Vec<String> = Vec::new();
     
-    // Get indentation from the original function
     let original_line = lines[func_match.start_line - 1];
     let indent_len = original_line.len() - original_line.trim_start().len();
     let indent = original_line[..indent_len].to_string();
     
-    // Add lines before the function
     for i in 0..func_match.start_line - 1 {
         result.push(lines[i].to_string());
     }
     
-    // Add the new function with proper indentation
     for line in new_function.lines() {
         if line.trim().is_empty() {
             result.push(String::new());
         } else {
-            // Preserve the exact line from the new function
             result.push(format!("{}{}", indent, line));
         }
     }
     
-    // Add lines after the function
     for i in func_match.end_line..lines.len() {
         result.push(lines[i].to_string());
     }
@@ -235,6 +226,46 @@ fn print_colored_diff(old: &str, new: &str) {
     }
 }
 
+fn select_file_with_fzf(files: &[PathBuf]) -> Result<Option<PathBuf>> {
+    let fzf_check = Command::new("fzf").arg("--version").output();
+    if fzf_check.is_err() {
+        bail!("fzf not found");
+    }
+    
+    let file_list: String = files.iter()
+        .map(|f| f.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    
+    let mut fzf_child = Command::new("fzf")
+        .arg("--height")
+        .arg("40%")
+        .arg("--border")
+        .arg("--ansi")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("Failed to spawn fzf")?;
+    
+    {
+        let mut stdin = fzf_child.stdin.take().context("Failed to open fzf stdin")?;
+        stdin.write_all(file_list.as_bytes())?;
+    }
+    
+    let output = fzf_child.wait_with_output().context("Failed to read fzf output")?;
+    
+    if !output.status.success() {
+        return Ok(None);
+    }
+    
+    let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if selected.is_empty() {
+        return Ok(None);
+    }
+    
+    Ok(Some(PathBuf::from(selected)))
+}
+
 fn scan_directory_for_function(dir: &Path, func_name: &str) -> Result<Vec<FunctionMatch>> {
     let mut matches = Vec::new();
     
@@ -266,6 +297,7 @@ fn scan_directory_for_function(dir: &Path, func_name: &str) -> Result<Vec<Functi
 }
 
 fn main() -> Result<()> {
+    let config = load_unified_config()?;
     let args: Vec<String> = env::args().skip(1).collect();
     let target_dir = if args.is_empty() {
         env::current_dir()?
@@ -291,6 +323,28 @@ fn main() -> Result<()> {
     eprintln!("✓ Found function: {}", func_name);
     eprintln!("  Function preview: {}", new_function.lines().next().unwrap_or(""));
     
+    // Show current buffer content if configured
+    if config.wcf.show_buffer_preview {
+        eprintln!("\n\x1b[36m📋 Current buffer content:\x1b[0m");
+        eprintln!("\x1b[90m{}\x1b[0m", "-".repeat(60));
+        for (i, line) in new_function.lines().enumerate().take(30) {
+            eprintln!("{:4} {}", i + 1, line);
+        }
+        if new_function.lines().count() > 30 {
+            eprintln!("     ... {} more lines", new_function.lines().count() - 30);
+        }
+        eprintln!("\x1b[90m{}\x1b[0m", "-".repeat(60));
+        
+        print!("\n❓ Continue with this function? (y/n): ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        if input.trim().to_lowercase() != "y" {
+            eprintln!("❌ Aborted.");
+            return Ok(());
+        }
+    }
+    
     // Scan directory for matching functions
     eprintln!("\n🔎 Scanning for function '{}'...", func_name);
     let matches = scan_directory_for_function(&target_dir, &func_name)?;
@@ -305,9 +359,27 @@ fn main() -> Result<()> {
         eprintln!("  • {} (lines {}-{})", m.file_path.display(), m.start_line, m.end_line);
     }
     
+    // If multiple files, let user select which one to modify
+    let selected_matches = if matches.len() > 1 {
+        let files: Vec<PathBuf> = matches.iter().map(|m| m.file_path.clone()).collect();
+        eprintln!("\n📁 Multiple files found. Select one to modify:");
+        
+        match select_file_with_fzf(&files)? {
+            Some(selected_file) => {
+                matches.into_iter().filter(|m| m.file_path == selected_file).collect()
+            }
+            None => {
+                eprintln!("⚠ No file selected");
+                return Ok(());
+            }
+        }
+    } else {
+        matches
+    };
+    
     // Preview changes with colored diff
     eprintln!("\n📝 Preview of changes:");
-    for m in &matches {
+    for m in &selected_matches {
         eprintln!("\n  File: {}", m.file_path.display());
         eprintln!("  Old function (lines {}-{}):", m.start_line, m.end_line);
         print_colored_diff(&m.old_full_function, &new_function);
@@ -329,7 +401,7 @@ fn main() -> Result<()> {
     let mut changes = Vec::new();
     let mut all_diffs = String::new();
     
-    for func_match in &matches {
+    for func_match in &selected_matches {
         let file_path = &func_match.file_path;
         let old_content = fs::read_to_string(file_path)?;
         
@@ -374,7 +446,7 @@ fn main() -> Result<()> {
     // Print summary
     eprintln!("\n✅ Changes applied successfully!");
     eprintln!("  Files changed: {}", changes.len());
-    eprintln!("  Functions replaced: {}", matches.len());
+    eprintln!("  Functions replaced: {}", selected_matches.len());
     
     Ok(())
 }

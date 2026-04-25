@@ -123,10 +123,21 @@ pub struct WcpSection {
     pub backup_suffix: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WcfSection {
     pub auto_format: bool,
     pub backup_before_replace: bool,
+    pub show_buffer_preview: bool,  // Add this line
+}
+
+impl Default for WcfSection {
+    fn default() -> Self {
+        Self {
+            auto_format: true,
+            backup_before_replace: true,
+            show_buffer_preview: true, 
+        }
+    }
 }
 
 impl Default for WccConfig {
