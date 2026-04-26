@@ -1,8 +1,8 @@
-// src/main.rs - Fixed version
+// src/main.rs
 use std::{
     fs,
     io::{self, BufRead, BufReader, Read, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -15,21 +15,14 @@ use std::{
 
 use anyhow::{Context, Result};
 use arboard::Clipboard;
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use chrono::{DateTime, Local, Utc};
 use clap::{Parser, Subcommand};
-use flate2::{read::GzDecoder, write::GzEncoder, Compression};
-use serde::{Deserialize, Serialize};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::flag;
 use thiserror::Error;
+use wcc::load_unified_config;
 
 #[derive(Parser, Debug)]
-#[command(
-    author,
-    version,
-    about = "Watch command output, keep history, and copy command/stdout/stderr to clipboard"
-)]
+#[command(author, version, about = "Run commands and copy output to clipboard")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Mode>,
@@ -42,143 +35,55 @@ struct Cli {
 enum Mode {
     /// Build a package (wraps cargo build)
     Build {
-        /// Build with release optimizations
         #[arg(short, long)]
         release: bool,
-
-        /// Build with debug (default)
         #[arg(long)]
         debug: bool,
-
-        /// Additional cargo build arguments
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
 
     /// Run a binary (wraps cargo run)
     Run {
-        /// Run with release optimizations
         #[arg(short, long)]
         release: bool,
-
-        /// Run with debug (default)
         #[arg(long)]
         debug: bool,
-
-        /// Additional cargo run arguments
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
+
+    /// Configure wcc settings
+    Config {
+        #[arg(long)]
+        set_cargo_mode: Option<String>,
+        #[arg(long)]
+        show: bool,
+        #[arg(long)]
+        init: bool,
+    },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-enum BuildMode {
-    Debug,
-    Release,
-}
-
-impl Default for BuildMode {
-    fn default() -> Self {
-        Self::Debug
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CargoConfig {
-    default_mode: BuildMode,
-}
-
-impl Default for CargoConfig {
-    fn default() -> Self {
-        Self {
-            default_mode: BuildMode::Debug,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Config {
-    history_dir: PathBuf,
-    compress_above_bytes: usize,
-    retain: RetainPolicy,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RetainPolicy {
-    mode: RetainMode,
-    limit: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum RetainMode {
-    Lines,
-    Words,
-    Chars,
-    Bytes,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        let mut dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        dir.push(".local/state/wcc/history");
-        Self {
-            history_dir: dir,
-            compress_above_bytes: 16 * 1024,
-            retain: RetainPolicy {
-                mode: RetainMode::Bytes,
-                limit: 128 * 1024,
-            },
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct TextStats {
-    lines: usize,
-    words: usize,
-    chars: usize,
-    bytes: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct HistoryEntry {
-    id: String,
-    timestamp: DateTime<Utc>,
-    command: Vec<String>,
-    exit_code: Option<i32>,
-    duration_ms: u128,
-    killed: bool,
-    stdout_stats: TextStats,
-    stderr_stats: TextStats,
-    stdout_tail: String,
-    stderr_tail: String,
-    stdout_compressed_b64: Option<String>,
-    stderr_compressed_b64: Option<String>,
+#[derive(Error, Debug)]
+enum WccError {
+    #[error("no command specified")]
+    NoCommand,
 }
 
 #[derive(Debug)]
 struct StreamTail {
     content: String,
-    stats: TextStats,
 }
 
 impl StreamTail {
     fn new() -> Self {
         Self {
             content: String::new(),
-            stats: TextStats::default(),
         }
     }
 
-    fn push(&mut self, chunk: &str, retain: &RetainPolicy) {
-        self.stats.bytes += chunk.as_bytes().len();
-        self.stats.chars += chunk.chars().count();
-        self.stats.words += chunk.split_whitespace().count();
-        self.stats.lines += chunk.bytes().filter(|b| *b == b'\n').count();
+    fn push(&mut self, chunk: &str) {
         self.content.push_str(chunk);
-        self.content = trim_tail(&self.content, retain);
     }
 }
 
@@ -188,145 +93,8 @@ enum Msg {
     Stderr(String),
 }
 
-#[derive(Error, Debug)]
-enum WccError {
-    #[error("no command specified")]
-    NoCommand,
-}
-
-fn trim_tail(input: &str, retain: &RetainPolicy) -> String {
-    match retain.mode {
-        RetainMode::Bytes => {
-            let bytes = input.as_bytes();
-            if bytes.len() <= retain.limit {
-                return input.to_string();
-            }
-            String::from_utf8_lossy(&bytes[bytes.len() - retain.limit..]).to_string()
-        }
-        RetainMode::Chars => {
-            let chars: Vec<char> = input.chars().collect();
-            if chars.len() <= retain.limit {
-                return input.to_string();
-            }
-            chars[chars.len() - retain.limit..].iter().collect()
-        }
-        RetainMode::Lines => {
-            let lines: Vec<&str> = input.lines().collect();
-            if lines.len() <= retain.limit {
-                return input.to_string();
-            }
-            let mut s = lines[lines.len() - retain.limit..].join("\n");
-            if input.ends_with('\n') {
-                s.push('\n');
-            }
-            s
-        }
-        RetainMode::Words => {
-            let words: Vec<&str> = input.split_whitespace().collect();
-            if words.len() <= retain.limit {
-                return input.to_string();
-            }
-            words[words.len() - retain.limit..].join(" ")
-        }
-    }
-}
-
-fn load_cargo_config() -> Result<CargoConfig> {
-    let mut path = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    path.push(".cargo/wcc-config.toml");
-
-    if path.exists() {
-        let data =
-            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-        Ok(toml::from_str(&data).context("parsing cargo config")?)
-    } else {
-        let cfg = CargoConfig::default();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&path, toml::to_string_pretty(&cfg)?)?;
-        eprintln!(
-            "\x1b[36m✓ Created default cargo config at: {}\x1b[0m",
-            path.display()
-        );
-        Ok(cfg)
-    }
-}
-
-fn load_config() -> Result<Config> {
-    let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-    path.push("wcc/config.toml");
-    if path.exists() {
-        let data =
-            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-        Ok(toml::from_str(&data).context("parsing config")?)
-    } else {
-        let cfg = Config::default();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&path, toml::to_string_pretty(&cfg)?)?;
-        Ok(cfg)
-    }
-}
-
-fn compress_if_needed(s: &str, threshold: usize) -> Result<Option<String>> {
-    if s.as_bytes().len() < threshold {
-        return Ok(None);
-    }
-    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
-    enc.write_all(s.as_bytes())?;
-    Ok(Some(B64.encode(enc.finish()?)))
-}
-
-fn decompress_b64(s: &str) -> Result<String> {
-    let bytes = B64.decode(s)?;
-    let mut d = GzDecoder::new(&bytes[..]);
-    let mut out = String::new();
-    d.read_to_string(&mut out)?;
-    Ok(out)
-}
-
-fn history_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    if !dir.exists() {
-        return Ok(vec![]);
-    }
-    let mut files: Vec<_> = fs::read_dir(dir)?
-        .filter_map(|e| e.ok().map(|x| x.path()))
-        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
-        .collect();
-    files.sort();
-    files.reverse();
-    Ok(files)
-}
-
-fn load_history(dir: &Path) -> Result<Vec<HistoryEntry>> {
-    let mut entries = Vec::new();
-    for p in history_files(dir)? {
-        let txt = fs::read_to_string(&p)?;
-        if let Ok(entry) = serde_json::from_str::<HistoryEntry>(&txt) {
-            entries.push(entry);
-        }
-    }
-    Ok(entries)
-}
-
-fn history_path_for(dir: &Path, entry: &HistoryEntry) -> PathBuf {
-    dir.join(format!(
-        "{}-{}.json",
-        entry.timestamp.format("%Y%m%dT%H%M%SZ"),
-        entry.id
-    ))
-}
-
-fn save_history(cfg: &Config, entry: &HistoryEntry) -> Result<()> {
-    fs::create_dir_all(&cfg.history_dir)?;
-    let path = history_path_for(&cfg.history_dir, entry);
-    fs::write(path, serde_json::to_vec_pretty(entry)?)?;
-    Ok(())
-}
-
 fn set_clipboard(command: &[String], stdout: &str, stderr: &str) -> Result<()> {
+    use chrono::Local;
     let timestamp = Local::now().format("%H:%M:%S %d.%m.%Y");
     let payload = format!(
         "$ {} # {}\n\n[stdout]\n{}\n\n[stderr]\n{}",
@@ -402,15 +170,20 @@ fn spawn_stdin_forwarder(mut child_stdin: std::process::ChildStdin) {
     });
 }
 
+fn strip_ansi_codes(s: &str) -> String {
+    let re = regex::Regex::new(r"\x1b\[[0-9;]*[mK]").unwrap();
+    re.replace_all(s, "").to_string()
+}
+
 fn run_cargo_build(release: bool, debug: bool, args: Vec<String>) -> Result<()> {
-    let cargo_config = load_cargo_config()?;
+    let config = load_unified_config()?;
 
     let is_release = if release {
         true
     } else if debug {
         false
     } else {
-        cargo_config.default_mode == BuildMode::Release
+        config.wcc.default_cargo_mode == "release"
     };
 
     let mut cargo_args = vec!["build".to_string()];
@@ -419,12 +192,11 @@ fn run_cargo_build(release: bool, debug: bool, args: Vec<String>) -> Result<()> 
     }
     cargo_args.extend(args);
 
-    let timestamp = Local::now().format("%H:%M:%S %d.%m.%Y");
+    let timestamp = chrono::Local::now().format("%H:%M:%S %d.%m.%Y");
     let command_str = format!("cargo {}", cargo_args.join(" "));
 
     eprintln!("\x1b[36m📦 Running {}\x1b[0m # {}", command_str, timestamp);
 
-    // Force color output by setting CARGO_TERM_COLOR=always
     let mut child = Command::new("cargo")
         .args(&cargo_args)
         .env("CARGO_TERM_COLOR", "always")
@@ -442,20 +214,16 @@ fn run_cargo_build(release: bool, debug: bool, args: Vec<String>) -> Result<()> 
 
     let mut out = StreamTail::new();
     let mut err = StreamTail::new();
-    let retain = RetainPolicy {
-        mode: RetainMode::Lines,
-        limit: 10000,
-    };
 
     while let Ok(msg) = rx.recv() {
         match msg {
             Msg::Stdout(s) => {
-                out.push(&s, &retain);
+                out.push(&s);
                 print!("{s}");
                 io::stdout().flush()?;
             }
             Msg::Stderr(s) => {
-                err.push(&s, &retain);
+                err.push(&s);
                 eprint!("{s}");
                 io::stderr().flush()?;
             }
@@ -464,17 +232,14 @@ fn run_cargo_build(release: bool, debug: bool, args: Vec<String>) -> Result<()> 
 
     let status = child.wait()?;
 
-    // Strip ANSI codes for clipboard - simple manual strip for common codes
     let clean_stdout_str = strip_ansi_codes(&out.content);
     let clean_stderr_str = strip_ansi_codes(&err.content);
 
-    if let Err(e) = set_clipboard(
+    let _ = set_clipboard(
         &vec![command_str.clone()],
         &clean_stdout_str,
         &clean_stderr_str,
-    ) {
-        eprintln!("  Warning: Failed to copy to clipboard: {}", e);
-    }
+    );
 
     if status.success() {
         eprintln!("\n\x1b[1;32m✓ Build successful\x1b[0m");
@@ -486,21 +251,15 @@ fn run_cargo_build(release: bool, debug: bool, args: Vec<String>) -> Result<()> 
     Ok(())
 }
 
-// Helper function to strip ANSI escape codes
-fn strip_ansi_codes(s: &str) -> String {
-    let re = regex::Regex::new(r"\x1b\[[0-9;]*[mK]").unwrap();
-    re.replace_all(s, "").to_string()
-}
-
 fn run_cargo_run(release: bool, debug: bool, args: Vec<String>) -> Result<()> {
-    let cargo_config = load_cargo_config()?;
+    let config = load_unified_config()?;
 
     let is_release = if release {
         true
     } else if debug {
         false
     } else {
-        cargo_config.default_mode == BuildMode::Release
+        config.wcc.default_cargo_mode == "release"
     };
 
     let mut cargo_args = vec!["run".to_string()];
@@ -509,7 +268,7 @@ fn run_cargo_run(release: bool, debug: bool, args: Vec<String>) -> Result<()> {
     }
     cargo_args.extend(args);
 
-    let timestamp = Local::now().format("%H:%M:%S %d.%m.%Y");
+    let timestamp = chrono::Local::now().format("%H:%M:%S %d.%m.%Y");
     let command_str = format!("cargo {}", cargo_args.join(" "));
 
     eprintln!("\x1b[36m🏃 Running {}\x1b[0m # {}", command_str, timestamp);
@@ -531,20 +290,16 @@ fn run_cargo_run(release: bool, debug: bool, args: Vec<String>) -> Result<()> {
 
     let mut out = StreamTail::new();
     let mut err = StreamTail::new();
-    let retain = RetainPolicy {
-        mode: RetainMode::Lines,
-        limit: 10000,
-    };
 
     while let Ok(msg) = rx.recv() {
         match msg {
             Msg::Stdout(s) => {
-                out.push(&s, &retain);
+                out.push(&s);
                 print!("{s}");
                 io::stdout().flush()?;
             }
             Msg::Stderr(s) => {
-                err.push(&s, &retain);
+                err.push(&s);
                 eprint!("{s}");
                 io::stderr().flush()?;
             }
@@ -553,17 +308,14 @@ fn run_cargo_run(release: bool, debug: bool, args: Vec<String>) -> Result<()> {
 
     let status = child.wait()?;
 
-    // Strip ANSI codes for clipboard - simple manual strip for common codes
     let clean_stdout_str = strip_ansi_codes(&out.content);
     let clean_stderr_str = strip_ansi_codes(&err.content);
 
-    if let Err(e) = set_clipboard(
+    let _ = set_clipboard(
         &vec![command_str.clone()],
         &clean_stdout_str,
         &clean_stderr_str,
-    ) {
-        eprintln!("  Warning: Failed to copy to clipboard: {}", e);
-    }
+    );
 
     if status.success() {
         eprintln!("\n\x1b[1;32m✓ Run completed\x1b[0m");
@@ -578,15 +330,222 @@ fn run_cargo_run(release: bool, debug: bool, args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-fn run_watch_command(command: Vec<String>, cfg: &Config) -> Result<HistoryEntry> {
+fn update_cargo_mode(mode: &str) -> Result<()> {
+    let config_path = dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("wcc/config.toml");
+
+    let mut config: wcc::UnifiedConfig = if config_path.exists() {
+        let data = fs::read_to_string(&config_path)?;
+        toml::from_str(&data)?
+    } else {
+        wcc::UnifiedConfig::default()
+    };
+
+    config.wcc.default_cargo_mode = mode.to_string();
+
+    let toml_str = toml::to_string_pretty(&config)?;
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&config_path, toml_str)?;
+
+    println!("\x1b[32m✓ Updated default cargo mode to: {}\x1b[0m", mode);
+    Ok(())
+}
+
+fn init_config() -> Result<()> {
+    use wcc::UnifiedConfig;
+
+    let config_path = dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("wcc/config.toml");
+
+    if config_path.exists() {
+        println!(
+            "\x1b[33m⚠ Config already exists at: {}\x1b[0m",
+            config_path.display()
+        );
+        print!("❓ Overwrite? (y/n): ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        if input.trim().to_lowercase() != "y" {
+            println!("❌ Aborted.");
+            return Ok(());
+        }
+    }
+
+    let config = UnifiedConfig::default();
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    // Create a pretty-printed TOML string with all defaults
+    let toml_content = format!(
+        r#"[wcc]
+default_cargo_mode = "debug"
+time_format = "%H:%M:%S %d.%m.%Y"
+
+[wcn]
+show_time_in_header = true
+use_file_modification_time = true
+
+[wcp]
+auto_backup = true
+
+[wcl]
+max_file_size_kb = 50
+max_file_words_to_copy = 10000
+skip_patterns = [
+    ".o", ".pyc", ".pyo", ".so", ".dll", ".dylib", ".exe",
+    ".class", ".jar", ".war", ".ear", ".zip", ".tar", ".gz",
+    ".bz2", ".xz", ".7z", ".rar", ".png", ".jpg", ".jpeg",
+    ".gif", ".bmp", ".ico", ".mp3", ".mp4", ".avi", ".mov",
+    ".pdf", ".doc", ".docx", ".bkp",
+]
+skip_dirs = [
+    "target", "node_modules", ".git", ".svn", ".hg",
+    "build", "dist", "__pycache__", ".cache", ".cargo",
+    ".idea", ".vscode",
+]
+show_empty_files = false
+show_stats_per_file = true
+show_function_details = true
+show_class_details = true
+show_usage_stats = false
+max_files_to_display = 500
+min_function_lines = 1
+min_class_lines = 1
+max_functions_per_file = 100
+max_classes_per_file = 50
+parallel_processing = true
+max_threads = 8
+copy_file_contents = true
+
+[wcf]
+auto_format = true
+show_buffer_preview = true
+"#
+    );
+
+    fs::write(&config_path, toml_content)?;
+
+    println!(
+        "\x1b[32m✓ Created default config at: {}\x1b[0m",
+        config_path.display()
+    );
+    println!("\nDefault configuration includes:");
+    println!("  [wcc] - cargo wrapper settings");
+    println!("  [wcn] - file copy settings");
+    println!("  [wcp] - paste settings");
+    println!("  [wcl] - analyzer settings with skip patterns");
+    println!("  [wcf] - function replacement settings");
+
+    Ok(())
+}
+
+fn show_config() -> Result<()> {
+    let config = load_unified_config()?;
+
+    println!("\x1b[36m📋 Current wcc configuration:\x1b[0m");
+    println!("  [wcc]");
+    println!(
+        "    default_cargo_mode: \x1b[33m{}\x1b[0m",
+        config.wcc.default_cargo_mode
+    );
+    println!("  [wcn]");
+    println!(
+        "    show_time_in_header: {}",
+        config.wcn.show_time_in_header
+    );
+    println!("  [wcp]");
+    println!("    auto_backup: {}", config.wcp.auto_backup);
+    println!("  [wcl]");
+    println!(
+        "    max_file_words_to_copy: {}",
+        config.wcl.max_file_words_to_copy
+    );
+    println!("  [wcf]");
+    println!("    auto_format: {}", config.wcf.auto_format);
+    println!();
+    println!("  Config file: \x1b[90m~/.config/wcc/config.toml\x1b[0m");
+
+    Ok(())
+}
+
+fn run_shell_command(command: &str) -> Result<()> {
+    use chrono::Local;
+    let timestamp = Local::now().format("%H:%M:%S %d.%m.%Y");
+    eprintln!("\x1b[36m🔧 Running: {}\x1b[0m # {}", command, timestamp);
+
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .env("CARGO_TERM_COLOR", "always")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("Failed to run shell command: {}", command))?;
+
+    let stdout = child.stdout.take().context("missing stdout")?;
+    let stderr = child.stderr.take().context("missing stderr")?;
+
+    let (tx, rx) = mpsc::channel();
+    spawn_reader(stdout, tx.clone(), false);
+    spawn_reader(stderr, tx, true);
+
+    let mut out = StreamTail::new();
+    let mut err = StreamTail::new();
+
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            Msg::Stdout(s) => {
+                out.push(&s);
+                print!("{s}");
+                io::stdout().flush()?;
+            }
+            Msg::Stderr(s) => {
+                err.push(&s);
+                eprint!("{s}");
+                io::stderr().flush()?;
+            }
+        }
+    }
+
+    let status = child.wait()?;
+    let timestamp_local = Local::now().format("%H:%M:%S %d.%m.%Y");
+    let clean_stdout = strip_ansi_codes(&out.content);
+    let clean_stderr = strip_ansi_codes(&err.content);
+
+    let _ = set_clipboard(&vec![command.to_string()], &clean_stdout, &clean_stderr);
+
+    if status.success() {
+        eprintln!(
+            "\n\x1b[1;32m✓ Command completed\x1b[0m # {}",
+            timestamp_local
+        );
+    } else {
+        eprintln!(
+            "\n\x1b[1;31m✗ Command failed with exit code: {:?}\x1b[0m # {}",
+            status.code(),
+            timestamp_local
+        );
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
+    eprintln!("  Copied to clipboard!");
+
+    Ok(())
+}
+
+fn run_watch_command(command: Vec<String>) -> Result<()> {
     anyhow::ensure!(!command.is_empty(), "usage: wcc -- cmd args");
     let term = Arc::new(AtomicBool::new(false));
     flag::register(SIGINT, Arc::clone(&term))?;
     flag::register(SIGTERM, Arc::clone(&term))?;
 
     let started = Instant::now();
-    let timestamp = Utc::now();
-    let id = timestamp.timestamp_millis().to_string();
 
     let mut child = Command::new(&command[0])
         .args(&command[1..])
@@ -613,12 +572,12 @@ fn run_watch_command(command: Vec<String>, cfg: &Config) -> Result<HistoryEntry>
         while let Ok(msg) = rx.try_recv() {
             match msg {
                 Msg::Stdout(s) => {
-                    out.push(&s, &cfg.retain);
+                    out.push(&s);
                     print!("{s}");
                     io::stdout().flush()?;
                 }
                 Msg::Stderr(s) => {
-                    err.push(&s, &cfg.retain);
+                    err.push(&s);
                     eprint!("{s}");
                     io::stderr().flush()?;
                 }
@@ -632,12 +591,12 @@ fn run_watch_command(command: Vec<String>, cfg: &Config) -> Result<HistoryEntry>
             while let Ok(msg) = rx.try_recv() {
                 match msg {
                     Msg::Stdout(s) => {
-                        out.push(&s, &cfg.retain);
+                        out.push(&s);
                         print!("{s}");
                         io::stdout().flush()?;
                     }
                     Msg::Stderr(s) => {
-                        err.push(&s, &cfg.retain);
+                        err.push(&s);
                         eprint!("{s}");
                         io::stderr().flush()?;
                     }
@@ -649,45 +608,40 @@ fn run_watch_command(command: Vec<String>, cfg: &Config) -> Result<HistoryEntry>
     }
 
     let status = child.wait().ok();
-    let killed = term.load(Ordering::Relaxed) && status.as_ref().and_then(|s| s.code()).is_none();
     let duration_ms = started.elapsed().as_millis();
 
     let _ = set_clipboard(&command, &out.content, &err.content);
 
-    let entry = HistoryEntry {
-        id,
-        timestamp,
-        command,
-        exit_code: status.and_then(|s| s.code()),
-        duration_ms,
-        killed,
-        stdout_stats: out.stats.clone(),
-        stderr_stats: err.stats.clone(),
-        stdout_tail: out.content.clone(),
-        stderr_tail: err.content.clone(),
-        stdout_compressed_b64: compress_if_needed(&out.content, cfg.compress_above_bytes)?,
-        stderr_compressed_b64: compress_if_needed(&err.content, cfg.compress_above_bytes)?,
-    };
-    save_history(cfg, &entry)?;
-
+    use chrono::Local;
     let timestamp_local = Local::now().format("%H:%M:%S %d.%m.%Y");
     eprintln!(
         "\n\x1b[1;32m✓ Command completed\x1b[0m # {}",
         timestamp_local
     );
-    eprintln!("  Exit code: {:?}", entry.exit_code);
+    eprintln!("  Exit code: {:?}", status.and_then(|s| s.code()));
     eprintln!(
         "  Duration: {:.2?}",
         Duration::from_millis(duration_ms as u64)
     );
     eprintln!("  Copied to clipboard!");
 
-    Ok(entry)
+    Ok(())
+}
+
+fn is_shell_builtin_or_alias(command: &str) -> bool {
+    let shell_constructs = [
+        "&&", "||", "|", ">", ">>", "<", ";", "&", "$", "`", "(", ")",
+    ];
+    for construct in shell_constructs {
+        if command.contains(construct) {
+            return true;
+        }
+    }
+    false
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let cfg = load_config()?;
 
     match cli.command {
         Some(Mode::Build {
@@ -704,11 +658,50 @@ fn main() -> Result<()> {
         }) => {
             run_cargo_run(release, debug, args)?;
         }
+        Some(Mode::Config {
+            set_cargo_mode,
+            show,
+            init,
+        }) => {
+            if init {
+                init_config()?;
+            }
+            if let Some(ref mode) = set_cargo_mode {
+                let mode_lower = mode.to_lowercase();
+                if mode_lower == "debug" || mode_lower == "release" {
+                    update_cargo_mode(&mode_lower)?;
+                } else {
+                    eprintln!(
+                        "\x1b[31mError: Invalid mode '{}'. Use 'debug' or 'release'.\x1b[0m",
+                        mode
+                    );
+                    std::process::exit(1);
+                }
+            }
+            if show {
+                show_config()?;
+            }
+            if set_cargo_mode.is_none() && !show && !init {
+                println!("\x1b[36m🔧 wcc config commands:\x1b[0m");
+                println!("  wcc config --init                     Create default config file");
+                println!("  wcc config --show                    Show current configuration");
+                println!("  wcc config --set-cargo-mode debug    Set default cargo mode to debug");
+                println!(
+                    "  wcc config --set-cargo-mode release  Set default cargo mode to release"
+                );
+            }
+        }
         None => {
             if cli.cmd.is_empty() {
                 return Err(WccError::NoCommand.into());
             }
-            run_watch_command(cli.cmd, &cfg)?;
+            let command_str = cli.cmd.join(" ");
+
+            if is_shell_builtin_or_alias(&command_str) {
+                run_shell_command(&command_str)?;
+            } else {
+                run_watch_command(cli.cmd)?;
+            }
         }
     }
     Ok(())

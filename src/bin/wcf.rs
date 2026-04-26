@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use regex::Regex;
 use similar::{ChangeTag, TextDiff};
 use wcc::common::*;
-use wcc::load_unified_config;
+use wcc::config::load_unified_config;
 
 #[derive(Debug, Clone)]
 struct FunctionMatch {

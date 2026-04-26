@@ -1,10 +1,10 @@
 // src/common.rs
-use std::path::{Path, PathBuf};
-use std::fs;
 use anyhow::{Context, Result};
 use arboard::Clipboard;
-use std::process::Command;
+use std::fs;
 use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
@@ -81,7 +81,7 @@ pub fn get_clipboard_text() -> Result<String> {
                 return Ok(String::from_utf8_lossy(&out.stdout).to_string());
             }
         }
-        
+
         let out = Command::new("xclip")
             .arg("-selection")
             .arg("clipboard")
@@ -92,7 +92,7 @@ pub fn get_clipboard_text() -> Result<String> {
             return Ok(String::from_utf8_lossy(&out.stdout).to_string());
         }
     }
-    
+
     let mut cb = Clipboard::new().context("clipboard init failed")?;
     cb.get_text().context("failed to read clipboard text")
 }
@@ -106,14 +106,43 @@ pub fn comment_prefix(path: &Path, ext: &str) -> &'static str {
 
     if matches!(
         ext,
-        "rs" | "c" | "cc" | "cpp" | "cxx" | "h" | "hpp" | "js" | "jsx" | "ts" | "tsx"
-            | "java" | "kt" | "kts" | "go" | "swift" | "scala" | "cs" | "dart"
+        "rs" | "c"
+            | "cc"
+            | "cpp"
+            | "cxx"
+            | "h"
+            | "hpp"
+            | "js"
+            | "jsx"
+            | "ts"
+            | "tsx"
+            | "java"
+            | "kt"
+            | "kts"
+            | "go"
+            | "swift"
+            | "scala"
+            | "cs"
+            | "dart"
     ) {
         "//"
     } else if matches!(
         ext,
-        "py" | "sh" | "bash" | "zsh" | "fish" | "nix" | "yaml" | "yml" | "toml" | "ini"
-            | "conf" | "rb" | "pl" | "mk" | "make" | "env"
+        "py" | "sh"
+            | "bash"
+            | "zsh"
+            | "fish"
+            | "nix"
+            | "yaml"
+            | "yml"
+            | "toml"
+            | "ini"
+            | "conf"
+            | "rb"
+            | "pl"
+            | "mk"
+            | "make"
+            | "env"
     ) || filename == "dockerfile"
         || filename == "makefile"
     {
@@ -159,9 +188,9 @@ fn get_bright_color(value: usize, max: usize) -> (u8, u8, u8) {
     if value == 0 {
         return (0, 200, 200);
     }
-    
+
     let ratio = (value as f64 / max as f64).min(1.0);
-    
+
     if ratio < 0.2 {
         let t = ratio / 0.2;
         (0, 150 + (t * 105.0) as u8, 200)
@@ -181,27 +210,27 @@ fn get_bright_color(value: usize, max: usize) -> (u8, u8, u8) {
 }
 
 pub fn color_filename(filename: &str) -> String {
-    let hash = filename.chars().fold(0u64, |acc, c| {
-        acc.wrapping_add(c as u64).wrapping_mul(31)
-    });
-    
+    let hash = filename
+        .chars()
+        .fold(0u64, |acc, c| acc.wrapping_add(c as u64).wrapping_mul(31));
+
     let hue = (hash % 360) as f64;
     let saturation = 0.8;
     let lightness = 0.7;
-    
+
     let (r, g, b) = hsl_to_rgb(hue, saturation, lightness);
     format!("\x1b[38;2;{};{};{}m{}\x1b[0m", r, g, b, filename)
 }
 
 pub fn color_function_name(name: &str) -> String {
-    let hash = name.chars().fold(0u64, |acc, c| {
-        acc.wrapping_add(c as u64).wrapping_mul(17)
-    });
-    
+    let hash = name
+        .chars()
+        .fold(0u64, |acc, c| acc.wrapping_add(c as u64).wrapping_mul(17));
+
     let hue = (hash % 360) as f64;
     let saturation = 0.6;
     let lightness = 0.75;
-    
+
     let (r, g, b) = hsl_to_rgb(hue, saturation, lightness);
     format!("\x1b[38;2;{};{};{}m{}\x1b[0m", r, g, b, name)
 }
@@ -210,7 +239,7 @@ fn hsl_to_rgb(h: f64, s: f64, l: f64) -> (u8, u8, u8) {
     let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
     let h_prime = h / 60.0;
     let x = c * (1.0 - (h_prime % 2.0 - 1.0).abs());
-    
+
     let (r1, g1, b1) = match h_prime as u32 {
         0 => (c, x, 0.0),
         1 => (x, c, 0.0),
@@ -219,12 +248,12 @@ fn hsl_to_rgb(h: f64, s: f64, l: f64) -> (u8, u8, u8) {
         4 => (x, 0.0, c),
         _ => (c, 0.0, x),
     };
-    
+
     let m = l - c / 2.0;
     let r = ((r1 + m) * 255.0) as u8;
     let g = ((g1 + m) * 255.0) as u8;
     let b = ((b1 + m) * 255.0) as u8;
-    
+
     (r, g, b)
 }
 

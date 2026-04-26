@@ -16,8 +16,8 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
 use wcc::common::*;
+use wcc::config::load_unified_config;
 
 #[derive(Debug, Clone, Default)]
 struct FunctionInfo {
@@ -66,119 +66,7 @@ struct DirectoryStats {
     file_stats: Vec<FileStats>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Config {
-    max_file_size_kb: usize,
-    max_file_words_to_copy: usize,
-    skip_patterns: Vec<String>,
-    skip_dirs: Vec<String>,
-    show_empty_files: bool,
-    show_stats_per_file: bool,
-    show_function_details: bool,
-    show_class_details: bool,
-    show_usage_stats: bool,
-    max_files_to_display: usize,
-    min_function_lines: usize,
-    min_class_lines: usize,
-    max_functions_per_file: usize,
-    max_classes_per_file: usize,
-    parallel_processing: bool,
-    max_threads: usize,
-    copy_file_contents: bool,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            max_file_size_kb: 50,
-            max_file_words_to_copy: 10000,
-            skip_patterns: vec![
-                ".o".to_string(), ".pyc".to_string(), ".pyo".to_string(),
-                ".so".to_string(), ".dll".to_string(), ".dylib".to_string(),
-                ".exe".to_string(), ".class".to_string(), ".jar".to_string(),
-                ".war".to_string(), ".ear".to_string(), ".zip".to_string(),
-                ".tar".to_string(), ".gz".to_string(), ".bz2".to_string(),
-                ".xz".to_string(), ".7z".to_string(), ".rar".to_string(),
-                ".png".to_string(), ".jpg".to_string(), ".jpeg".to_string(),
-                ".gif".to_string(), ".bmp".to_string(), ".ico".to_string(),
-                ".mp3".to_string(), ".mp4".to_string(), ".avi".to_string(),
-                ".mov".to_string(), ".pdf".to_string(), ".doc".to_string(),
-                ".docx".to_string(), ".bkp".to_string(),
-            ],
-            skip_dirs: vec![
-                "target".to_string(), "node_modules".to_string(),
-                ".git".to_string(), ".svn".to_string(), ".hg".to_string(),
-                "build".to_string(), "dist".to_string(), "__pycache__".to_string(),
-                ".cache".to_string(), ".cargo".to_string(), ".idea".to_string(),
-                ".vscode".to_string(),
-            ],
-            show_empty_files: false,
-            show_stats_per_file: true,
-            show_function_details: true,
-            show_class_details: true,
-            show_usage_stats: false,
-            max_files_to_display: 500,
-            min_function_lines: 1,
-            min_class_lines: 1,
-            max_functions_per_file: 100,
-            max_classes_per_file: 50,
-            parallel_processing: true,
-            max_threads: 8,
-            copy_file_contents: true,
-        }
-    }
-}
-
-fn load_config() -> Result<Config> {
-    let mut config_paths = vec![];
-
-    if let Some(mut path) = dirs::config_dir() {
-        path.push("wcl/config.toml");
-        config_paths.push(path);
-    }
-
-    if let Ok(current_dir) = env::current_dir() {
-        let mut path = current_dir.clone();
-        path.push(".wclrc");
-        config_paths.push(path);
-        
-        let mut path2 = current_dir;
-        path2.push("wcl.toml");
-        config_paths.push(path2);
-    }
-
-    if let Some(mut path) = dirs::home_dir() {
-        path.push(".wclrc");
-        config_paths.push(path);
-    }
-
-    for path in config_paths {
-        if path.exists() {
-            let data = fs::read_to_string(&path)
-                .with_context(|| format!("reading config file {}", path.display()))?;
-            if let Ok(config) = toml::from_str(&data) {
-                eprintln!("✓ Loaded config from: {}", path.display());
-                return Ok(config);
-            }
-        }
-    }
-
-    if let Some(mut path) = dirs::config_dir() {
-        path.push("wcl");
-        fs::create_dir_all(&path)?;
-        path.push("config.toml");
-        if !path.exists() {
-            let default_config = Config::default();
-            let toml_str = toml::to_string_pretty(&default_config)?;
-            fs::write(&path, toml_str)?;
-            eprintln!("✓ Created default config at: {}", path.display());
-        }
-    }
-
-    Ok(Config::default())
-}
-
-fn should_skip_file(path: &Path, config: &Config) -> bool {
+fn should_skip_file(path: &Path, config: &wcc::WclConfig) -> bool {
     if let Ok(metadata) = fs::metadata(path) {
         let size_kb = metadata.len() / 1024;
         if size_kb > config.max_file_size_kb as u64 {
@@ -211,7 +99,7 @@ fn should_skip_file(path: &Path, config: &Config) -> bool {
     false
 }
 
-fn should_skip_dir(path: &Path, config: &Config) -> bool {
+fn should_skip_dir(path: &Path, config: &wcc::WclConfig) -> bool {
     if let Some(name) = path.file_name() {
         let name_str = name.to_string_lossy();
         for pattern in &config.skip_dirs {
@@ -271,7 +159,7 @@ fn extract_function_body(lines: &[&str], start_idx: usize, ext: &str) -> usize {
     start_idx
 }
 
-fn detect_functions_in_file(content: &str, ext: &str, config: &Config) -> Vec<FunctionInfo> {
+fn detect_functions_in_file(content: &str, ext: &str, config: &wcc::WclConfig) -> Vec<FunctionInfo> {
     let mut functions = Vec::new();
     let lines: Vec<&str> = content.lines().collect();
     
@@ -337,7 +225,7 @@ fn detect_functions_in_file(content: &str, ext: &str, config: &Config) -> Vec<Fu
     functions
 }
 
-fn detect_classes_in_file(content: &str, ext: &str, config: &Config) -> Vec<ClassInfo> {
+fn detect_classes_in_file(content: &str, ext: &str, config: &wcc::WclConfig) -> Vec<ClassInfo> {
     let mut classes = Vec::new();
     let lines: Vec<&str> = content.lines().collect();
     
@@ -502,7 +390,7 @@ fn extract_class_name(line: &str, keyword: &str) -> Option<String> {
     }
 }
 
-fn analyze_file(path: &Path, config: &Config) -> FileStats {
+fn analyze_file(path: &Path, config: &wcc::WclConfig) -> FileStats {
     let mut stats = FileStats {
         path: path.to_path_buf(),
         ..Default::default()
@@ -548,7 +436,7 @@ fn analyze_file(path: &Path, config: &Config) -> FileStats {
     stats
 }
 
-fn walk_directory(dir: &Path, config: &Config) -> Result<DirectoryStats> {
+fn walk_directory(dir: &Path, config: &wcc::WclConfig) -> Result<DirectoryStats> {
     let mut all_paths = Vec::new();
     
     if !dir.exists() {
@@ -569,7 +457,7 @@ fn walk_directory(dir: &Path, config: &Config) -> Result<DirectoryStats> {
         return Ok(stats);
     }
 
-    fn collect_paths(dir: &Path, paths: &mut Vec<PathBuf>, config: &Config) -> Result<()> {
+    fn collect_paths(dir: &Path, paths: &mut Vec<PathBuf>, config: &wcc::WclConfig) -> Result<()> {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -632,7 +520,7 @@ fn walk_directory(dir: &Path, config: &Config) -> Result<DirectoryStats> {
     Ok(stats)
 }
 
-fn format_report(stats: &DirectoryStats, root: &Path, config: &Config) -> String {
+fn format_report(stats: &DirectoryStats, root: &Path, config: &wcc::WclConfig) -> String {
     let mut report = String::new();
     
     report.push_str(&format!("📊 Directory Analysis: {}\n", root.display()));
@@ -725,7 +613,7 @@ fn format_report(stats: &DirectoryStats, root: &Path, config: &Config) -> String
     report
 }
 
-fn format_file_contents_for_clipboard(stats: &DirectoryStats, root: &Path, config: &Config) -> String {
+fn format_file_contents_for_clipboard(stats: &DirectoryStats, root: &Path, config: &wcc::WclConfig) -> String {
     let mut clipboard_content = String::new();
     let mut files_copied = 0;
     
@@ -814,12 +702,14 @@ fn main() -> Result<()> {
         PathBuf::from(&args[0])
     };
     
-    let config = load_config()?;
+    let unified_config = load_unified_config()?;
+    let config = &unified_config.wcl;
     
     eprintln!("🔍 Analyzing: {}", target_dir.display());
     eprintln!("📋 Config: max_size={}KB, threads={}, parallel={}", 
         config.max_file_size_kb, config.max_threads, config.parallel_processing);
     eprintln!("📋 Skip patterns: {:?}", config.skip_patterns);
+    eprintln!("📋 Skip dirs: {:?}", config.skip_dirs);
     eprintln!("📋 Max words to copy: {}", config.max_file_words_to_copy);
     
     if config.parallel_processing {
@@ -830,14 +720,14 @@ fn main() -> Result<()> {
     }
     
     let start = std::time::Instant::now();
-    let stats = walk_directory(&target_dir, &config)?;
+    let stats = walk_directory(&target_dir, config)?;
     let duration = start.elapsed();
     
-    let report = format_report(&stats, &target_dir, &config);
+    let report = format_report(&stats, &target_dir, config);
     println!("{}", report);
     
     // Prepare file contents for clipboard
-    let clipboard_content = format_file_contents_for_clipboard(&stats, &target_dir, &config);
+    let clipboard_content = format_file_contents_for_clipboard(&stats, &target_dir, config);
     
     set_clipboard_content(&clipboard_content)?;
     eprintln!("\n✓ Report and file contents copied to clipboard! (took {:.2?})", duration);
