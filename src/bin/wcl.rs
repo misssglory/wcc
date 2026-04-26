@@ -605,11 +605,53 @@ fn format_report(stats: &DirectoryStats, root: &Path, config: &wcc::WclConfig) -
         report.push_str(&format!("\n📁 Per-file Statistics:\n"));
         report.push_str(&format!("{}\n", "-".repeat(80)));
 
+        // Determine which files will be copied to clipboard
+        let selected_file_paths: std::collections::HashSet<&PathBuf> = if config.max_clipboard_bytes > 0 {
+            let mut files: Vec<&FileStats> = stats.file_stats.iter()
+                .filter(|f| f.content.is_some() && f.error.is_none())
+                .collect();
+            files.sort_by_key(|f| f.bytes);
+            let mut selected = Vec::new();
+            let mut total_bytes = 0;
+            for file in files {
+                if total_bytes + file.bytes <= config.max_clipboard_bytes {
+                    selected.push(&file.path);
+                    total_bytes += file.bytes;
+                } else {
+                    break;
+                }
+            }
+            selected.into_iter().collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+
         for file_stat in stats.file_stats.iter().take(config.max_files_to_display) {
             let rel_path = file_stat.path.strip_prefix(root).unwrap_or(&file_stat.path);
             let color = get_consistent_color(&rel_path.display().to_string());
 
-            report.push_str(&format!("\n  📄 {}{}\x1b[0m\n", color, rel_path.display()));
+            let clipboard_status = if file_stat.error.is_some() {
+                " ⚠ ERROR"
+            } else if selected_file_paths.contains(&file_stat.path) {
+                " ✓ [COPIED]"
+            } else if file_stat.content.is_some() {
+                " ○ [NOT COPIED]"
+            } else {
+                ""
+            };
+            
+            let status_color = if clipboard_status == " ✓ [COPIED]" {
+                "\x1b[32m" // Green
+            } else if clipboard_status == " ○ [NOT COPIED]" {
+                "\x1b[33m" // Yellow
+            } else if clipboard_status == " ⚠ ERROR" {
+                "\x1b[31m" // Red
+            } else {
+                ""
+            };
+
+            report.push_str(&format!("\n  📄 {}{}{}\x1b[0m{}{}\x1b[0m\n", 
+                color, rel_path.display(), "\x1b[0m", status_color, clipboard_status));
 
             if let Some(ref err) = file_stat.error {
                 report.push_str(&format!("     ⚠ {}\n", err));
@@ -625,7 +667,7 @@ fn format_report(stats: &DirectoryStats, root: &Path, config: &wcc::WclConfig) -
             ));
 
             if config.show_function_details && !file_stat.functions.is_empty() {
-                let max_func_display = config.max_functions_per_file.min(20);
+                let max_func_display = config.max_functions_per_file.min(50); // Increased from 20 to 50
                 report.push_str(&format!(
                     "     🎯 Functions ({})\n",
                     file_stat.functions.len()
@@ -650,7 +692,7 @@ fn format_report(stats: &DirectoryStats, root: &Path, config: &wcc::WclConfig) -
             }
 
             if config.show_class_details && !file_stat.classes.is_empty() {
-                let max_class_display = config.max_classes_per_file.min(20);
+                let max_class_display = config.max_classes_per_file.min(50); // Increased from 20 to 50
                 report.push_str(&format!(
                     "     📦 Classes/Structs ({})\n",
                     file_stat.classes.len()
@@ -667,7 +709,7 @@ fn format_report(stats: &DirectoryStats, root: &Path, config: &wcc::WclConfig) -
                     ));
 
                     if !class.methods.is_empty() {
-                        for method in class.methods.iter().take(5) {
+                        for method in class.methods.iter().take(10) { // Increased from 5 to 10
                             report.push_str(&format!(
                                 "          └─ {} ({} lines) [L{}-L{}]\n",
                                 method.name,
@@ -676,10 +718,10 @@ fn format_report(stats: &DirectoryStats, root: &Path, config: &wcc::WclConfig) -
                                 method.end_line
                             ));
                         }
-                        if class.methods.len() > 5 {
+                        if class.methods.len() > 10 {
                             report.push_str(&format!(
                                 "          └─ ... and {} more methods\n",
-                                class.methods.len() - 5
+                                class.methods.len() - 10
                             ));
                         }
                     }
@@ -694,13 +736,13 @@ fn format_report(stats: &DirectoryStats, root: &Path, config: &wcc::WclConfig) -
 
             if config.show_usage_stats && !file_stat.uses.is_empty() {
                 report.push_str(&format!("     📊 Usage statistics:\n"));
-                for (name, count) in file_stat.uses.iter().take(10) {
+                for (name, count) in file_stat.uses.iter().take(20) { // Increased from 10 to 20
                     report.push_str(&format!("        • {} used {} times\n", name, count));
                 }
-                if file_stat.uses.len() > 10 {
+                if file_stat.uses.len() > 20 {
                     report.push_str(&format!(
                         "        ... and {} more\n",
-                        file_stat.uses.len() - 10
+                        file_stat.uses.len() - 20
                     ));
                 }
             }
@@ -827,7 +869,7 @@ fn format_file_contents_for_clipboard(
         ));
         clipboard_content.push_str(&format!("// {}\n", "-".repeat(60)));
 
-        for file in not_copied.iter().take(100) {
+        for file in not_copied.iter().take(200) { // Increased from 100 to 200
             let rel_path = file.path.strip_prefix(root).unwrap_or(&file.path);
             clipboard_content.push_str(&format!(
                 "//   {} ({} bytes, {} lines, {} words, {} functions, {} classes)\n",
@@ -844,15 +886,15 @@ fn format_file_contents_for_clipboard(
                 let func_names: Vec<String> = file
                     .functions
                     .iter()
-                    .take(5)
+                    .take(10) // Increased from 5 to 10
                     .map(|f| f.name.clone())
                     .collect();
                 clipboard_content
                     .push_str(&format!("//     Functions: {}\n", func_names.join(", ")));
-                if file.functions.len() > 5 {
+                if file.functions.len() > 10 {
                     clipboard_content.push_str(&format!(
                         "//       ... and {} more\n",
-                        file.functions.len() - 5
+                        file.functions.len() - 10
                     ));
                 }
             }
@@ -862,24 +904,24 @@ fn format_file_contents_for_clipboard(
                 let class_names: Vec<String> = file
                     .classes
                     .iter()
-                    .take(3)
+                    .take(6) // Increased from 3 to 6
                     .map(|c| c.name.clone())
                     .collect();
                 clipboard_content
                     .push_str(&format!("//     Classes: {}\n", class_names.join(", ")));
-                if file.classes.len() > 3 {
+                if file.classes.len() > 6 {
                     clipboard_content.push_str(&format!(
                         "//       ... and {} more\n",
-                        file.classes.len() - 3
+                        file.classes.len() - 6
                     ));
                 }
             }
         }
 
-        if not_copied.len() > 100 {
+        if not_copied.len() > 200 {
             clipboard_content.push_str(&format!(
                 "//   ... and {} more files (statistics only)\n",
-                not_copied.len() - 100
+                not_copied.len() - 200
             ));
         }
     }
