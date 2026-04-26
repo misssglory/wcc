@@ -1,3 +1,4 @@
+// src/bin/wcl.rs
 use std::{
     collections::BTreeMap,
     env,
@@ -42,6 +43,7 @@ struct ClassInfo {
 #[derive(Debug, Clone, Default)]
 struct FileStats {
     path: PathBuf,
+    content: Option<String>,
     lines: usize,
     words: usize,
     chars: usize,
@@ -67,6 +69,7 @@ struct DirectoryStats {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Config {
     max_file_size_kb: usize,
+    max_file_words_to_copy: usize,
     skip_patterns: Vec<String>,
     skip_dirs: Vec<String>,
     show_empty_files: bool,
@@ -81,12 +84,14 @@ struct Config {
     max_classes_per_file: usize,
     parallel_processing: bool,
     max_threads: usize,
+    copy_file_contents: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             max_file_size_kb: 50,
+            max_file_words_to_copy: 10000,
             skip_patterns: vec![
                 ".o".to_string(), ".pyc".to_string(), ".pyo".to_string(),
                 ".so".to_string(), ".dll".to_string(), ".dylib".to_string(),
@@ -119,6 +124,7 @@ impl Default for Config {
             max_classes_per_file: 50,
             parallel_processing: true,
             max_threads: 8,
+            copy_file_contents: true,
         }
     }
 }
@@ -173,7 +179,6 @@ fn load_config() -> Result<Config> {
 }
 
 fn should_skip_file(path: &Path, config: &Config) -> bool {
-    // Check if file is too large
     if let Ok(metadata) = fs::metadata(path) {
         let size_kb = metadata.len() / 1024;
         if size_kb > config.max_file_size_kb as u64 {
@@ -185,23 +190,18 @@ fn should_skip_file(path: &Path, config: &Config) -> bool {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let ext_with_dot = format!(".{}", ext.to_lowercase());
     
-    // Check if file should be skipped
     for pattern in &config.skip_patterns {
-        // Check extension
         if ext_with_dot == *pattern {
             return true;
         }
-        // Check if filename ends with pattern (for .bkp files)
         if filename.ends_with(pattern) {
             return true;
         }
-        // Check exact filename match
         if filename == *pattern {
             return true;
         }
     }
 
-    // Check if it's a binary file (by content)
     if let Ok(content) = fs::read(path) {
         if content.iter().take(1024).any(|&b| b == 0) {
             return true;
@@ -516,6 +516,7 @@ fn analyze_file(path: &Path, config: &Config) -> FileStats {
     match fs::read_to_string(path) {
         Ok(content) => {
             let calc = calc_stats(&content);
+            stats.content = Some(content.clone());
             stats.lines = calc.lines;
             stats.words = calc.words;
             stats.chars = calc.chars;
@@ -724,6 +725,54 @@ fn format_report(stats: &DirectoryStats, root: &Path, config: &Config) -> String
     report
 }
 
+fn format_file_contents_for_clipboard(stats: &DirectoryStats, root: &Path, config: &Config) -> String {
+    let mut clipboard_content = String::new();
+    let mut files_copied = 0;
+    
+    for file_stat in &stats.file_stats {
+        if let Some(content) = &file_stat.content {
+            // Check if file word count is within threshold
+            if config.copy_file_contents && file_stat.words <= config.max_file_words_to_copy {
+                let rel_path = file_stat.path.strip_prefix(root).unwrap_or(&file_stat.path);
+                
+                // Add file header with comment syntax
+                let ext = file_stat.path.extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
+                
+                let comment_prefix = match ext {
+                    "rs" | "c" | "cc" | "cpp" | "h" | "hpp" | "js" | "ts" | "jsx" | "tsx" | "java" | "go" => "//",
+                    "py" | "sh" | "bash" | "rb" | "pl" => "#",
+                    _ => "#",
+                };
+                
+                clipboard_content.push_str(&format!("{} {}\n", comment_prefix, rel_path.display()));
+                clipboard_content.push_str(&format!("{}\n", "-".repeat(80)));
+                clipboard_content.push_str(content);
+                clipboard_content.push_str("\n\n");
+                files_copied += 1;
+            }
+        }
+    }
+    
+    if files_copied == 0 {
+        clipboard_content.push_str("// No files copied (all exceed word limit threshold)\n");
+        clipboard_content.push_str(&format!("// Threshold: {} words\n", config.max_file_words_to_copy));
+        for file_stat in &stats.file_stats {
+            if let Some(content) = &file_stat.content {
+                if file_stat.words > config.max_file_words_to_copy {
+                    let rel_path = file_stat.path.strip_prefix(root).unwrap_or(&file_stat.path);
+                    clipboard_content.push_str(&format!("// Skipped: {} ({} words)\n", rel_path.display(), file_stat.words));
+                }
+            }
+        }
+    } else {
+        clipboard_content.push_str(&format!("\n// {} file(s) copied (word limit: {})\n", files_copied, config.max_file_words_to_copy));
+    }
+    
+    clipboard_content
+}
+
 fn set_clipboard_content(content: &str) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -771,6 +820,7 @@ fn main() -> Result<()> {
     eprintln!("📋 Config: max_size={}KB, threads={}, parallel={}", 
         config.max_file_size_kb, config.max_threads, config.parallel_processing);
     eprintln!("📋 Skip patterns: {:?}", config.skip_patterns);
+    eprintln!("📋 Max words to copy: {}", config.max_file_words_to_copy);
     
     if config.parallel_processing {
         rayon::ThreadPoolBuilder::new()
@@ -784,11 +834,14 @@ fn main() -> Result<()> {
     let duration = start.elapsed();
     
     let report = format_report(&stats, &target_dir, &config);
-    
     println!("{}", report);
     
-    set_clipboard_content(&report)?;
-    eprintln!("\n✓ Report copied to clipboard! (took {:.2?})", duration);
+    // Prepare file contents for clipboard
+    let clipboard_content = format_file_contents_for_clipboard(&stats, &target_dir, &config);
+    
+    set_clipboard_content(&clipboard_content)?;
+    eprintln!("\n✓ Report and file contents copied to clipboard! (took {:.2?})", duration);
+    eprintln!("  Files with word count <= {} were included", config.max_file_words_to_copy);
     
     Ok(())
 }
