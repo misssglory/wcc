@@ -20,6 +20,8 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::flag;
 use thiserror::Error;
 use wcc::load_unified_config;
+use wcc::config::init_config;
+
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Run commands and copy output to clipboard")]
@@ -354,96 +356,6 @@ fn update_cargo_mode(mode: &str) -> Result<()> {
     Ok(())
 }
 
-fn init_config() -> Result<()> {
-    use wcc::UnifiedConfig;
-
-    let config_path = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("wcc/config.toml");
-
-    if config_path.exists() {
-        println!(
-            "\x1b[33m⚠ Config already exists at: {}\x1b[0m",
-            config_path.display()
-        );
-        print!("❓ Overwrite? (y/n): ");
-        io::stdout().flush()?;
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        if input.trim().to_lowercase() != "y" {
-            println!("❌ Aborted.");
-            return Ok(());
-        }
-    }
-
-    let config = UnifiedConfig::default();
-    if let Some(parent) = config_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    // Create a pretty-printed TOML string with all defaults
-    let toml_content = format!(
-        r#"[wcc]
-default_cargo_mode = "debug"
-time_format = "%H:%M:%S %d.%m.%Y"
-
-[wcn]
-show_time_in_header = true
-use_file_modification_time = true
-
-[wcp]
-auto_backup = true
-
-[wcl]
-max_file_size_kb = 50
-max_file_words_to_copy = 10000
-skip_patterns = [
-    ".o", ".pyc", ".pyo", ".so", ".dll", ".dylib", ".exe",
-    ".class", ".jar", ".war", ".ear", ".zip", ".tar", ".gz",
-    ".bz2", ".xz", ".7z", ".rar", ".png", ".jpg", ".jpeg",
-    ".gif", ".bmp", ".ico", ".mp3", ".mp4", ".avi", ".mov",
-    ".pdf", ".doc", ".docx", ".bkp",
-]
-skip_dirs = [
-    "target", "node_modules", ".git", ".svn", ".hg",
-    "build", "dist", "__pycache__", ".cache", ".cargo",
-    ".idea", ".vscode",
-]
-show_empty_files = false
-show_stats_per_file = true
-show_function_details = true
-show_class_details = true
-show_usage_stats = false
-max_files_to_display = 500
-min_function_lines = 1
-min_class_lines = 1
-max_functions_per_file = 100
-max_classes_per_file = 50
-parallel_processing = true
-max_threads = 8
-copy_file_contents = true
-
-[wcf]
-auto_format = true
-show_buffer_preview = true
-"#
-    );
-
-    fs::write(&config_path, toml_content)?;
-
-    println!(
-        "\x1b[32m✓ Created default config at: {}\x1b[0m",
-        config_path.display()
-    );
-    println!("\nDefault configuration includes:");
-    println!("  [wcc] - cargo wrapper settings");
-    println!("  [wcn] - file copy settings");
-    println!("  [wcp] - paste settings");
-    println!("  [wcl] - analyzer settings with skip patterns");
-    println!("  [wcf] - function replacement settings");
-
-    Ok(())
-}
 
 fn show_config() -> Result<()> {
     let config = load_unified_config()?;

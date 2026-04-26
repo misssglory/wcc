@@ -1,8 +1,7 @@
 // src/bin/wcl.rs
 use std::{
     collections::BTreeMap,
-    env,
-    fs,
+    env, fs,
     io::Write,
     path::{Path, PathBuf},
     process::Command,
@@ -77,7 +76,7 @@ fn should_skip_file(path: &Path, config: &wcc::WclConfig) -> bool {
     let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let ext_with_dot = format!(".{}", ext.to_lowercase());
-    
+
     for pattern in &config.skip_patterns {
         if ext_with_dot == *pattern {
             return true;
@@ -115,10 +114,10 @@ fn extract_function_body(lines: &[&str], start_idx: usize, ext: &str) -> usize {
     let mut brace_count = 0;
     let mut paren_count = 0;
     let mut found_opening_brace = false;
-    
+
     for i in start_idx..lines.len().min(start_idx + 500) {
         let line = lines[i];
-        
+
         for ch in line.chars() {
             match ch {
                 '{' => {
@@ -139,7 +138,7 @@ fn extract_function_body(lines: &[&str], start_idx: usize, ext: &str) -> usize {
                 _ => {}
             }
         }
-        
+
         if ext == "py" {
             if i > start_idx {
                 let current_indent = line.len() - line.trim_start().len();
@@ -150,23 +149,27 @@ fn extract_function_body(lines: &[&str], start_idx: usize, ext: &str) -> usize {
             }
             continue;
         }
-        
+
         if found_opening_brace && brace_count == 0 && paren_count == 0 {
             return i;
         }
     }
-    
+
     start_idx
 }
 
-fn detect_functions_in_file(content: &str, ext: &str, config: &wcc::WclConfig) -> Vec<FunctionInfo> {
+fn detect_functions_in_file(
+    content: &str,
+    ext: &str,
+    config: &wcc::WclConfig,
+) -> Vec<FunctionInfo> {
     let mut functions = Vec::new();
     let lines: Vec<&str> = content.lines().collect();
-    
+
     for (idx, line) in lines.iter().enumerate().take(2000) {
         let trimmed = line.trim();
         let mut func_name = None;
-        
+
         match ext {
             "rs" => {
                 if trimmed.contains("fn ") && !trimmed.contains("//") {
@@ -186,7 +189,11 @@ fn detect_functions_in_file(content: &str, ext: &str, config: &wcc::WclConfig) -
                 }
             }
             "c" | "cc" | "cpp" | "h" | "hpp" => {
-                if trimmed.contains('(') && trimmed.contains(')') && !trimmed.starts_with("//") && !trimmed.starts_with("/*") {
+                if trimmed.contains('(')
+                    && trimmed.contains(')')
+                    && !trimmed.starts_with("//")
+                    && !trimmed.starts_with("/*")
+                {
                     func_name = extract_c_function_name(trimmed);
                 }
             }
@@ -197,13 +204,13 @@ fn detect_functions_in_file(content: &str, ext: &str, config: &wcc::WclConfig) -
             }
             _ => {}
         }
-        
+
         if let Some(name) = func_name {
             let end_idx = extract_function_body(&lines, idx, ext);
             if end_idx > idx {
                 let func_content = lines[idx..=end_idx].join("\n");
                 let stats = calc_stats(&func_content);
-                
+
                 if stats.lines >= config.min_function_lines {
                     functions.push(FunctionInfo {
                         name,
@@ -215,25 +222,25 @@ fn detect_functions_in_file(content: &str, ext: &str, config: &wcc::WclConfig) -
                     });
                 }
             }
-            
+
             if functions.len() >= config.max_functions_per_file {
                 break;
             }
         }
     }
-    
+
     functions
 }
 
 fn detect_classes_in_file(content: &str, ext: &str, config: &wcc::WclConfig) -> Vec<ClassInfo> {
     let mut classes = Vec::new();
     let lines: Vec<&str> = content.lines().collect();
-    
+
     for (idx, line) in lines.iter().enumerate().take(2000) {
         let trimmed = line.trim();
         let mut class_name = None;
         let mut class_type = "";
-        
+
         match ext {
             "rs" => {
                 if trimmed.contains("struct ") && !trimmed.contains("//") {
@@ -279,20 +286,20 @@ fn detect_classes_in_file(content: &str, ext: &str, config: &wcc::WclConfig) -> 
             }
             _ => {}
         }
-        
+
         if let Some(name) = class_name {
             let end_idx = extract_function_body(&lines, idx, ext);
             if end_idx > idx {
                 let class_content = lines[idx..=end_idx].join("\n");
                 let stats = calc_stats(&class_content);
-                
+
                 if stats.lines >= config.min_class_lines {
                     let methods = if ext == "rs" || ext == "py" || ext == "js" || ext == "ts" {
                         detect_functions_in_file(&class_content, ext, config)
                     } else {
                         Vec::new()
                     };
-                    
+
                     classes.push(ClassInfo {
                         name: format!("{} {}", class_type, name),
                         lines: stats.lines,
@@ -304,26 +311,30 @@ fn detect_classes_in_file(content: &str, ext: &str, config: &wcc::WclConfig) -> 
                     });
                 }
             }
-            
+
             if classes.len() >= config.max_classes_per_file {
                 break;
             }
         }
     }
-    
+
     classes
 }
 
-fn detect_usage_in_file(content: &str, functions: &[FunctionInfo], classes: &[ClassInfo]) -> BTreeMap<String, usize> {
+fn detect_usage_in_file(
+    content: &str,
+    functions: &[FunctionInfo],
+    classes: &[ClassInfo],
+) -> BTreeMap<String, usize> {
     let mut usage = BTreeMap::new();
-    
+
     for func in functions {
         let count = content.matches(&func.name).count();
         if count > 0 {
             usage.insert(func.name.clone(), count);
         }
     }
-    
+
     for class in classes {
         let simple_name = class.name.split_whitespace().last().unwrap_or(&class.name);
         let count = content.matches(simple_name).count();
@@ -331,7 +342,7 @@ fn detect_usage_in_file(content: &str, functions: &[FunctionInfo], classes: &[Cl
             usage.insert(class.name.clone(), count);
         }
     }
-    
+
     usage
 }
 
@@ -341,7 +352,7 @@ fn extract_function_name(line: &str, keyword: &str) -> Option<String> {
         .split(|c: char| c == '(' || c == ' ' || c == '<' || c == '{')
         .next()?
         .trim();
-    
+
     if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
         Some(name.to_string())
     } else {
@@ -368,7 +379,7 @@ fn extract_c_function_name(line: &str) -> Option<String> {
     let before_paren = line.split('(').next()?;
     let words: Vec<&str> = before_paren.split_whitespace().collect();
     let name = words.last()?;
-    
+
     if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
         Some(name.to_string())
     } else {
@@ -382,7 +393,7 @@ fn extract_class_name(line: &str, keyword: &str) -> Option<String> {
         .split(|c: char| c == ' ' || c == '{' || c == '(' || c == ':')
         .next()?
         .trim();
-    
+
     if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
         Some(name.to_string())
     } else {
@@ -404,6 +415,7 @@ fn analyze_file(path: &Path, config: &wcc::WclConfig) -> FileStats {
     match fs::read_to_string(path) {
         Ok(content) => {
             let calc = calc_stats(&content);
+            // Clone content for storage, keep original for analysis
             stats.content = Some(content.clone());
             stats.lines = calc.lines;
             stats.words = calc.words;
@@ -419,12 +431,14 @@ fn analyze_file(path: &Path, config: &wcc::WclConfig) -> FileStats {
             if config.show_function_details {
                 stats.functions = detect_functions_in_file(&content, &ext, config);
             }
-            
+
             if config.show_class_details {
                 stats.classes = detect_classes_in_file(&content, &ext, config);
             }
-            
-            if config.show_usage_stats && (config.show_function_details || config.show_class_details) {
+
+            if config.show_usage_stats
+                && (config.show_function_details || config.show_class_details)
+            {
                 stats.uses = detect_usage_in_file(&content, &stats.functions, &stats.classes);
             }
         }
@@ -438,7 +452,7 @@ fn analyze_file(path: &Path, config: &wcc::WclConfig) -> FileStats {
 
 fn walk_directory(dir: &Path, config: &wcc::WclConfig) -> Result<DirectoryStats> {
     let mut all_paths = Vec::new();
-    
+
     if !dir.exists() {
         bail!("Directory does not exist: {}", dir.display());
     }
@@ -461,7 +475,7 @@ fn walk_directory(dir: &Path, config: &wcc::WclConfig) -> Result<DirectoryStats>
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            
+
             if path.is_dir() {
                 if should_skip_dir(&path, config) {
                     continue;
@@ -473,13 +487,13 @@ fn walk_directory(dir: &Path, config: &wcc::WclConfig) -> Result<DirectoryStats>
         }
         Ok(())
     }
-    
+
     collect_paths(dir, &mut all_paths, config)?;
-    
+
     let processed_files: Vec<FileStats> = if config.parallel_processing {
         let counter = Arc::new(AtomicUsize::new(0));
         let total = all_paths.len();
-        
+
         all_paths
             .par_iter()
             .map(|path| {
@@ -502,7 +516,7 @@ fn walk_directory(dir: &Path, config: &wcc::WclConfig) -> Result<DirectoryStats>
             })
             .collect()
     };
-    
+
     let mut stats = DirectoryStats::default();
     for file_stats in processed_files {
         if (file_stats.lines > 0 || config.show_empty_files) && file_stats.error.is_none() {
@@ -516,148 +530,387 @@ fn walk_directory(dir: &Path, config: &wcc::WclConfig) -> Result<DirectoryStats>
             stats.file_stats.push(file_stats);
         }
     }
-    
+
     Ok(stats)
+}
+
+fn get_consistent_color(filename: &str) -> String {
+    let hash = filename
+        .chars()
+        .fold(0u64, |acc, c| acc.wrapping_add(c as u64).wrapping_mul(31));
+    let hue = (hash % 360) as f64;
+    let saturation = 0.7;
+    let lightness = 0.6;
+    let (r, g, b) = hsl_to_rgb(hue, saturation, lightness);
+    format!("\x1b[38;2;{};{};{}m", r, g, b)
+}
+
+fn hsl_to_rgb(h: f64, s: f64, l: f64) -> (u8, u8, u8) {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let h_prime = h / 60.0;
+    let x = c * (1.0 - (h_prime % 2.0 - 1.0).abs());
+
+    let (r1, g1, b1) = match h_prime as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+
+    let m = l - c / 2.0;
+    let r = ((r1 + m) * 255.0) as u8;
+    let g = ((g1 + m) * 255.0) as u8;
+    let b = ((b1 + m) * 255.0) as u8;
+    (r, g, b)
 }
 
 fn format_report(stats: &DirectoryStats, root: &Path, config: &wcc::WclConfig) -> String {
     let mut report = String::new();
-    
+
     report.push_str(&format!("📊 Directory Analysis: {}\n", root.display()));
     report.push_str(&format!("{}\n", "=".repeat(80)));
-    
+
     report.push_str(&format!("\n📈 Summary:\n"));
     report.push_str(&format!("  Files analyzed: {}\n", stats.files));
-    report.push_str(&format!("  Total lines: {}\n", stats.total_lines));
-    report.push_str(&format!("  Total words: {}\n", stats.total_words));
-    report.push_str(&format!("  Total chars: {}\n", stats.total_chars));
-    report.push_str(&format!("  Total bytes: {}\n", stats.total_bytes));
-    
+    report.push_str(&format!(
+        "  Total lines: {}\n",
+        heatmap_color_lines(stats.total_lines)
+    ));
+    report.push_str(&format!(
+        "  Total words: {}\n",
+        heatmap_color_words(stats.total_words)
+    ));
+    report.push_str(&format!(
+        "  Total chars: {}\n",
+        heatmap_color_chars(stats.total_chars)
+    ));
+    report.push_str(&format!(
+        "  Total bytes: {}\n",
+        heatmap_color_bytes(stats.total_bytes)
+    ));
+
     if config.show_function_details {
         report.push_str(&format!("  Total functions: {}\n", stats.total_functions));
     }
     if config.show_class_details {
-        report.push_str(&format!("  Total classes/structs: {}\n", stats.total_classes));
+        report.push_str(&format!(
+            "  Total classes/structs: {}\n",
+            stats.total_classes
+        ));
     }
-    
+
     if config.show_stats_per_file && !stats.file_stats.is_empty() {
         report.push_str(&format!("\n📁 Per-file Statistics:\n"));
         report.push_str(&format!("{}\n", "-".repeat(80)));
-        
+
         for file_stat in stats.file_stats.iter().take(config.max_files_to_display) {
             let rel_path = file_stat.path.strip_prefix(root).unwrap_or(&file_stat.path);
-            report.push_str(&format!("\n  📄 {}\n", rel_path.display()));
-            
+            let color = get_consistent_color(&rel_path.display().to_string());
+
+            report.push_str(&format!("\n  📄 {}{}\x1b[0m\n", color, rel_path.display()));
+
             if let Some(ref err) = file_stat.error {
                 report.push_str(&format!("     ⚠ {}\n", err));
                 continue;
             }
-            
-            report.push_str(&format!("     Lines: {} | Words: {} | Chars: {} | Bytes: {}\n",
-                file_stat.lines, file_stat.words, file_stat.chars, file_stat.bytes
+
+            report.push_str(&format!(
+                "     Lines: {} | Words: {} | Chars: {} | Bytes: {}\n",
+                heatmap_color_lines(file_stat.lines),
+                heatmap_color_words(file_stat.words),
+                heatmap_color_chars(file_stat.chars),
+                heatmap_color_bytes(file_stat.bytes)
             ));
-            
+
             if config.show_function_details && !file_stat.functions.is_empty() {
-                let max_func_display = config.max_functions_per_file;
-                report.push_str(&format!("     🎯 Functions ({})\n", file_stat.functions.len()));
+                let max_func_display = config.max_functions_per_file.min(20);
+                report.push_str(&format!(
+                    "     🎯 Functions ({})\n",
+                    file_stat.functions.len()
+                ));
                 for func in file_stat.functions.iter().take(max_func_display) {
-                    report.push_str(&format!("        • {} ({} lines, {} words, {} chars) [L{}-L{}]\n",
-                        func.name, func.lines, func.words, func.chars, func.start_line, func.end_line));
+                    report.push_str(&format!(
+                        "        • {} ({} lines, {} words, {} chars) [L{}-L{}]\n",
+                        func.name,
+                        heatmap_color_lines(func.lines),
+                        heatmap_color_words(func.words),
+                        heatmap_color_chars(func.chars),
+                        func.start_line,
+                        func.end_line
+                    ));
                 }
                 if file_stat.functions.len() > max_func_display {
-                    report.push_str(&format!("        ... and {} more\n", file_stat.functions.len() - max_func_display));
+                    report.push_str(&format!(
+                        "        ... and {} more\n",
+                        file_stat.functions.len() - max_func_display
+                    ));
                 }
             }
-            
+
             if config.show_class_details && !file_stat.classes.is_empty() {
-                let max_class_display = config.max_classes_per_file;
-                report.push_str(&format!("     📦 Classes/Structs ({})\n", file_stat.classes.len()));
+                let max_class_display = config.max_classes_per_file.min(20);
+                report.push_str(&format!(
+                    "     📦 Classes/Structs ({})\n",
+                    file_stat.classes.len()
+                ));
                 for class in file_stat.classes.iter().take(max_class_display) {
-                    report.push_str(&format!("        • {} ({} lines, {} words, {} chars) [L{}-L{}]\n",
-                        class.name, class.lines, class.words, class.chars, class.start_line, class.end_line));
-                    
+                    report.push_str(&format!(
+                        "        • {} ({} lines, {} words, {} chars) [L{}-L{}]\n",
+                        class.name,
+                        heatmap_color_lines(class.lines),
+                        heatmap_color_words(class.words),
+                        heatmap_color_chars(class.chars),
+                        class.start_line,
+                        class.end_line
+                    ));
+
                     if !class.methods.is_empty() {
-                        for method in class.methods.iter().take(10) {
-                            report.push_str(&format!("          └─ {} ({} lines) [L{}-L{}]\n",
-                                method.name, method.lines, method.start_line, method.end_line));
+                        for method in class.methods.iter().take(5) {
+                            report.push_str(&format!(
+                                "          └─ {} ({} lines) [L{}-L{}]\n",
+                                method.name,
+                                heatmap_color_lines(method.lines),
+                                method.start_line,
+                                method.end_line
+                            ));
                         }
-                        if class.methods.len() > 10 {
-                            report.push_str(&format!("          └─ ... and {} more methods\n", class.methods.len() - 10));
+                        if class.methods.len() > 5 {
+                            report.push_str(&format!(
+                                "          └─ ... and {} more methods\n",
+                                class.methods.len() - 5
+                            ));
                         }
                     }
                 }
                 if file_stat.classes.len() > max_class_display {
-                    report.push_str(&format!("        ... and {} more\n", file_stat.classes.len() - max_class_display));
+                    report.push_str(&format!(
+                        "        ... and {} more\n",
+                        file_stat.classes.len() - max_class_display
+                    ));
                 }
             }
-            
+
             if config.show_usage_stats && !file_stat.uses.is_empty() {
                 report.push_str(&format!("     📊 Usage statistics:\n"));
                 for (name, count) in file_stat.uses.iter().take(10) {
                     report.push_str(&format!("        • {} used {} times\n", name, count));
                 }
                 if file_stat.uses.len() > 10 {
-                    report.push_str(&format!("        ... and {} more\n", file_stat.uses.len() - 10));
+                    report.push_str(&format!(
+                        "        ... and {} more\n",
+                        file_stat.uses.len() - 10
+                    ));
                 }
             }
         }
-        
+
         if stats.file_stats.len() > config.max_files_to_display {
-            report.push_str(&format!("\n  ... and {} more files not shown\n", 
-                stats.file_stats.len() - config.max_files_to_display));
+            report.push_str(&format!(
+                "\n  ... and {} more files not shown\n",
+                stats.file_stats.len() - config.max_files_to_display
+            ));
         }
     }
-    
+
     report.push_str(&format!("\n{}\n", "=".repeat(80)));
-    
+
     report
 }
 
-fn format_file_contents_for_clipboard(stats: &DirectoryStats, root: &Path, config: &wcc::WclConfig) -> String {
+fn select_files_for_clipboard<'a>(
+    stats: &'a DirectoryStats,
+    _root: &Path,
+    max_bytes: usize,
+) -> Vec<&'a FileStats> {
+    let mut files: Vec<&'a FileStats> = stats
+        .file_stats
+        .iter()
+        .filter(|f| f.content.is_some() && f.error.is_none())
+        .collect();
+
+    files.sort_by_key(|f| f.bytes);
+
+    let mut selected = Vec::new();
+    let mut total_bytes = 0;
+
+    for file in files {
+        if total_bytes + file.bytes <= max_bytes {
+            selected.push(file);
+            total_bytes += file.bytes;
+        } else {
+            break;
+        }
+    }
+
+    selected
+}
+
+fn format_file_contents_for_clipboard(
+    stats: &DirectoryStats,
+    root: &Path,
+    config: &wcc::WclConfig,
+) -> String {
     let mut clipboard_content = String::new();
-    let mut files_copied = 0;
-    
-    for file_stat in &stats.file_stats {
-        if let Some(content) = &file_stat.content {
-            // Check if file word count is within threshold
-            if config.copy_file_contents && file_stat.words <= config.max_file_words_to_copy {
+    let max_clipboard_bytes = config.max_clipboard_bytes;
+    let selected_files = select_files_for_clipboard(stats, root, max_clipboard_bytes);
+    let mut total_copied_bytes = 0;
+
+    clipboard_content.push_str(&format!("// wcl Analysis Report\n"));
+    clipboard_content.push_str(&format!(
+        "// ============================================================\n"
+    ));
+    clipboard_content.push_str(&format!(
+        "// Total files: {} | Total size: {} bytes\n",
+        stats.files, stats.total_bytes
+    ));
+    clipboard_content.push_str(&format!(
+        "// Clipboard limit: {} bytes ({} KB)\n",
+        max_clipboard_bytes,
+        max_clipboard_bytes / 1024
+    ));
+    clipboard_content.push_str(&format!(
+        "// ============================================================\n\n"
+    ));
+
+    // Files that were copied (full content)
+    if !selected_files.is_empty() {
+        clipboard_content.push_str(&format!("// 📁 COPIED FILES (full content):\n"));
+        clipboard_content.push_str(&format!("// {}\n", "-".repeat(60)));
+
+        for file_stat in &selected_files {
+            if let Some(content) = &file_stat.content {
                 let rel_path = file_stat.path.strip_prefix(root).unwrap_or(&file_stat.path);
-                
-                // Add file header with comment syntax
-                let ext = file_stat.path.extension()
+                let ext = file_stat
+                    .path
+                    .extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("");
-                
+
                 let comment_prefix = match ext {
-                    "rs" | "c" | "cc" | "cpp" | "h" | "hpp" | "js" | "ts" | "jsx" | "tsx" | "java" | "go" => "//",
+                    "rs" | "c" | "cc" | "cpp" | "h" | "hpp" | "js" | "ts" | "jsx" | "tsx"
+                    | "java" | "go" => "//",
                     "py" | "sh" | "bash" | "rb" | "pl" => "#",
                     _ => "#",
                 };
-                
+
                 clipboard_content.push_str(&format!("{} {}\n", comment_prefix, rel_path.display()));
+                clipboard_content.push_str(&format!(
+                    "{} Size: {} bytes | Lines: {} | Words: {} | Functions: {} | Classes: {}\n",
+                    comment_prefix,
+                    file_stat.bytes,
+                    file_stat.lines,
+                    file_stat.words,
+                    file_stat.functions.len(),
+                    file_stat.classes.len()
+                ));
                 clipboard_content.push_str(&format!("{}\n", "-".repeat(80)));
                 clipboard_content.push_str(content);
                 clipboard_content.push_str("\n\n");
-                files_copied += 1;
+                total_copied_bytes += file_stat.bytes;
             }
         }
     }
-    
-    if files_copied == 0 {
-        clipboard_content.push_str("// No files copied (all exceed word limit threshold)\n");
-        clipboard_content.push_str(&format!("// Threshold: {} words\n", config.max_file_words_to_copy));
-        for file_stat in &stats.file_stats {
-            if let Some(content) = &file_stat.content {
-                if file_stat.words > config.max_file_words_to_copy {
-                    let rel_path = file_stat.path.strip_prefix(root).unwrap_or(&file_stat.path);
-                    clipboard_content.push_str(&format!("// Skipped: {} ({} words)\n", rel_path.display(), file_stat.words));
+
+    // Files that were NOT copied (only statistics)
+    let not_copied: Vec<&FileStats> = stats
+        .file_stats
+        .iter()
+        .filter(|f| f.content.is_some() && f.error.is_none())
+        .filter(|f| !selected_files.iter().any(|sf| std::ptr::eq(*sf, *f)))
+        .collect();
+
+    if !not_copied.is_empty() {
+        clipboard_content.push_str(&format!(
+            "// 📊 FILES NOT COPIED (exceeded byte limit) - Statistics Only:\n"
+        ));
+        clipboard_content.push_str(&format!("// {}\n", "-".repeat(60)));
+
+        for file in not_copied.iter().take(100) {
+            let rel_path = file.path.strip_prefix(root).unwrap_or(&file.path);
+            clipboard_content.push_str(&format!(
+                "//   {} ({} bytes, {} lines, {} words, {} functions, {} classes)\n",
+                rel_path.display(),
+                file.bytes,
+                file.lines,
+                file.words,
+                file.functions.len(),
+                file.classes.len()
+            ));
+
+            // Show function names for not-copied files (limited)
+            if config.show_function_details && !file.functions.is_empty() {
+                let func_names: Vec<String> = file
+                    .functions
+                    .iter()
+                    .take(5)
+                    .map(|f| f.name.clone())
+                    .collect();
+                clipboard_content
+                    .push_str(&format!("//     Functions: {}\n", func_names.join(", ")));
+                if file.functions.len() > 5 {
+                    clipboard_content.push_str(&format!(
+                        "//       ... and {} more\n",
+                        file.functions.len() - 5
+                    ));
+                }
+            }
+
+            // Show class names for not-copied files (limited)
+            if config.show_class_details && !file.classes.is_empty() {
+                let class_names: Vec<String> = file
+                    .classes
+                    .iter()
+                    .take(3)
+                    .map(|c| c.name.clone())
+                    .collect();
+                clipboard_content
+                    .push_str(&format!("//     Classes: {}\n", class_names.join(", ")));
+                if file.classes.len() > 3 {
+                    clipboard_content.push_str(&format!(
+                        "//       ... and {} more\n",
+                        file.classes.len() - 3
+                    ));
                 }
             }
         }
-    } else {
-        clipboard_content.push_str(&format!("\n// {} file(s) copied (word limit: {})\n", files_copied, config.max_file_words_to_copy));
+
+        if not_copied.len() > 100 {
+            clipboard_content.push_str(&format!(
+                "//   ... and {} more files (statistics only)\n",
+                not_copied.len() - 100
+            ));
+        }
     }
-    
+
+    // Summary
+    clipboard_content.push_str(&format!(
+        "\n// ============================================================\n"
+    ));
+    clipboard_content.push_str(&format!("// SUMMARY:\n"));
+    clipboard_content.push_str(&format!(
+        "//   Files copied: {} ({} bytes / {} bytes limit)\n",
+        selected_files.len(),
+        total_copied_bytes,
+        max_clipboard_bytes
+    ));
+    clipboard_content.push_str(&format!(
+        "//   Files with statistics only: {}\n",
+        not_copied.len()
+    ));
+    clipboard_content.push_str(&format!(
+        "//   Total functions found: {}\n",
+        stats.total_functions
+    ));
+    clipboard_content.push_str(&format!(
+        "//   Total classes found: {}\n",
+        stats.total_classes
+    ));
+    clipboard_content.push_str(&format!(
+        "// ============================================================\n"
+    ));
+
     clipboard_content
 }
 
@@ -682,15 +935,15 @@ fn set_clipboard_content(content: &str) -> Result<()> {
             return Ok(());
         }
     }
-    
+
     let mut cb = arboard::Clipboard::new().context("clipboard init failed")?;
     cb.set_text(content.to_string())?;
-    
+
     #[cfg(target_os = "linux")]
     {
         thread::sleep(Duration::from_millis(200));
     }
-    
+
     Ok(())
 }
 
@@ -701,37 +954,47 @@ fn main() -> Result<()> {
     } else {
         PathBuf::from(&args[0])
     };
-    
+
     let unified_config = load_unified_config()?;
     let config = &unified_config.wcl;
-    
+
     eprintln!("🔍 Analyzing: {}", target_dir.display());
-    eprintln!("📋 Config: max_size={}KB, threads={}, parallel={}", 
-        config.max_file_size_kb, config.max_threads, config.parallel_processing);
+    eprintln!(
+        "📋 Config: max_size={}KB, clipboard_limit={}KB, threads={}, parallel={}",
+        config.max_file_size_kb,
+        config.max_clipboard_bytes / 1024,
+        config.max_threads,
+        config.parallel_processing
+    );
     eprintln!("📋 Skip patterns: {:?}", config.skip_patterns);
     eprintln!("📋 Skip dirs: {:?}", config.skip_dirs);
-    eprintln!("📋 Max words to copy: {}", config.max_file_words_to_copy);
-    
+
     if config.parallel_processing {
         rayon::ThreadPoolBuilder::new()
             .num_threads(config.max_threads)
             .build_global()
             .context("Failed to build thread pool")?;
     }
-    
+
     let start = std::time::Instant::now();
     let stats = walk_directory(&target_dir, config)?;
     let duration = start.elapsed();
-    
+
     let report = format_report(&stats, &target_dir, config);
     println!("{}", report);
-    
+
     // Prepare file contents for clipboard
     let clipboard_content = format_file_contents_for_clipboard(&stats, &target_dir, config);
-    
+
     set_clipboard_content(&clipboard_content)?;
-    eprintln!("\n✓ Report and file contents copied to clipboard! (took {:.2?})", duration);
-    eprintln!("  Files with word count <= {} were included", config.max_file_words_to_copy);
-    
+    eprintln!(
+        "\n✓ Report and file contents copied to clipboard! (took {:.2?})",
+        duration
+    );
+    eprintln!(
+        "  Files with total size <= {} KB were included",
+        config.max_clipboard_bytes / 1024
+    );
+
     Ok(())
 }

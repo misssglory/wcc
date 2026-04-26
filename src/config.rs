@@ -39,6 +39,7 @@ pub struct WcpConfig {
 pub struct WclConfig {
     pub max_file_size_kb: usize,
     pub max_file_words_to_copy: usize,
+    pub max_clipboard_bytes: usize,
     pub skip_patterns: Vec<String>,
     pub skip_dirs: Vec<String>,
     pub show_empty_files: bool,
@@ -54,6 +55,7 @@ pub struct WclConfig {
     pub parallel_processing: bool,
     pub max_threads: usize,
     pub copy_file_contents: bool,
+
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -79,6 +81,7 @@ impl Default for UnifiedConfig {
             wcl: WclConfig {
                 max_file_size_kb: 50,
                 max_file_words_to_copy: 10000,
+                max_clipboard_bytes: 40 * 1024,  // 40KB default
                 skip_patterns: vec![
                     ".o".to_string(), ".pyc".to_string(), ".pyo".to_string(),
                     ".so".to_string(), ".dll".to_string(), ".dylib".to_string(),
