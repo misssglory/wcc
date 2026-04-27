@@ -27,6 +27,10 @@ path = "src/main.rs"
 name = "wcu"
 path = "src/bin/wcu.rs"
 
+[[bin]]
+name = "wff"
+path = "src/bin/wff.rs"
+
 [dependencies]
 # Common dependencies
 anyhow = "1.0"
