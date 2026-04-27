@@ -31,6 +31,10 @@ path = "src/bin/wcu.rs"
 name = "wff"
 path = "src/bin/wff.rs"
 
+[[bin]]
+name = "wce"
+path = "src/bin/wce.rs"
+
 [dependencies]
 # Common dependencies
 anyhow = "1.0"
@@ -58,7 +62,7 @@ syn = { version = "2.0", features = ["full", "extra-traits", "visit", "printing"
 quote = "1.0"
 strip-ansi-escapes = "0.2.1"
 prettyplease = "0.2.37"
-proc-macro2 = "1.0.106"
+proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
 tempfile = "3.27.0"
 
 [lib]
