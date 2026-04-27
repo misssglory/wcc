@@ -40,6 +40,7 @@ fn parse_clipboard_functions(content: &str) -> Result<Vec<(String, String)>> {
         
         let before_fn = &content[..abs_start];
         let has_pub = before_fn.trim_end().ends_with("pub");
+        let has_async = before_fn.trim_end().ends_with("async");
         
         let mut brace_count = 0;
         let mut end_pos = abs_start;
@@ -67,6 +68,13 @@ fn parse_clipboard_functions(content: &str) -> Result<Vec<(String, String)>> {
         
         if has_pub && !full_function.trim_start().starts_with("pub") {
             full_function = format!("pub {}", full_function);
+        }
+        if has_async && !full_function.trim_start().starts_with("async") && !full_function.trim_start().starts_with("pub async") {
+            if full_function.trim_start().starts_with("pub") {
+                full_function = full_function.replacen("pub", "pub async", 1);
+            } else {
+                full_function = format!("async {}", full_function);
+            }
         }
         
         if !full_function.trim_end().ends_with('}') {
