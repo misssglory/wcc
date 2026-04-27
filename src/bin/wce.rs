@@ -1,5 +1,6 @@
 // src/bin/wce.rs
 use std::{
+    collections::HashMap,
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -8,7 +9,7 @@ use std::{
 use anyhow::{Context, Result};
 use regex::Regex;
 use syn::{
-    parse_file, ImplItem, Item, Visibility,
+    parse_file, ImplItem, Item, ItemFn, Visibility,
 };
 use syn::spanned::Spanned;
 use wcc::common::*;
@@ -30,6 +31,18 @@ struct ErrorInfo {
     function_asyncness: bool,
 }
 
+#[derive(Debug, Clone)]
+struct FunctionErrorGroup {
+    function_name: String,
+    function_body: String,
+    function_start_line: usize,
+    function_end_line: usize,
+    function_visibility: Option<String>,
+    function_asyncness: bool,
+    file_path: PathBuf,
+    errors: Vec<ErrorInfo>,
+}
+
 fn main() -> Result<()> {
     let _config = load_unified_config()?;
     
@@ -46,34 +59,43 @@ fn main() -> Result<()> {
         return Ok(());
     }
     
-    eprintln!("⚠ Found {} error(s)", errors.len());
+    // Group errors by function
+    let grouped_errors = group_errors_by_function(&errors);
     
-    // Show errors and prompt for confirmation
-    for (idx, error) in errors.iter().enumerate() {
-        eprintln!("\n\x1b[1;31m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
-        eprintln!("\x1b[1;31mError {}: {}\x1b[0m", idx + 1, error.error_code);
-        eprintln!("\x1b[90m  {}:{}:{}\x1b[0m", error.file_path.display(), error.line, error.column);
-        eprintln!("\x1b[33m  {}\x1b[0m", error.message);
+    eprintln!("⚠ Found {} error(s) in {} function(s)", errors.len(), grouped_errors.len());
+    
+    // Show errors grouped by function
+    for (idx, group) in grouped_errors.iter().enumerate() {
+        eprintln!("\n\x1b[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
         
-        if let Some(ref func) = error.function_name {
-            let visibility = error.function_visibility.as_deref().unwrap_or("");
-            let asyncness = if error.function_asyncness { "async " } else { "" };
-            let modifier = if !visibility.is_empty() && !asyncness.is_empty() {
-                format!("{} {}", visibility, asyncness)
-            } else if !visibility.is_empty() {
-                visibility.to_string()
-            } else {
-                asyncness.to_string()
-            };
-            eprintln!("\x1b[36m  → Function: {}{} (lines {}-{})\x1b[0m", 
-                if modifier.is_empty() { "" } else { &format!("{} ", modifier) },
-                func, 
-                error.function_start_line, 
-                error.function_end_line);
+        let visibility = group.function_visibility.as_deref().unwrap_or("");
+        let asyncness = if group.function_asyncness { "async " } else { "" };
+        let modifier = format!("{}{}", visibility, if !visibility.is_empty() && !asyncness.is_empty() { " " } else { "" });
+        
+        eprintln!("\x1b[1;36mFunction {}: {}{}{}\x1b[0m", 
+            idx + 1,
+            modifier,
+            asyncness,
+            group.function_name
+        );
+        eprintln!("\x1b[90m  {}: lines {}-{}\x1b[0m", 
+            group.file_path.display(), 
+            group.function_start_line, 
+            group.function_end_line
+        );
+        eprintln!("\x1b[33m  {} error(s):\x1b[0m", group.errors.len());
+        
+        for error in &group.errors {
+            eprintln!("\x1b[31m    • [{}] at line {}: {}\x1b[0m", 
+                error.error_code, 
+                error.line, 
+                error.message
+            );
         }
     }
     
-    print!("\n❓ Process {} error(s) and copy to clipboard? (y/n): ", errors.len());
+    print!("\n❓ Process {} error(s) in {} function(s) and copy to clipboard? (y/n): ", 
+        errors.len(), grouped_errors.len());
     io::stdout().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
@@ -85,13 +107,13 @@ fn main() -> Result<()> {
     
     // Build output
     eprintln!("\n🔄 Building error report...");
-    let output = build_error_report(&errors)?;
+    let output = build_grouped_error_report(&grouped_errors)?;
     
     // Copy to clipboard
     set_clipboard(&output)?;
     
     // Print statistics
-    print_stats(&errors, &output)?;
+    print_stats(&errors, &grouped_errors, &output)?;
     
     eprintln!("\n\x1b[1;32m✓ Error report copied to clipboard!\x1b[0m");
     
@@ -103,6 +125,7 @@ fn parse_cargo_errors(content: &str) -> Result<Vec<ErrorInfo>> {
     
     // Regex for error patterns
     let error_re = Regex::new(r"error\[E(\d+)\]: (.+)")?;
+    let error_re_no_code = Regex::new(r"error: (.+)")?;
     let location_re = Regex::new(r" --> (.+):(\d+):(\d+)")?;
     
     let lines: Vec<&str> = content.lines().collect();
@@ -111,7 +134,7 @@ fn parse_cargo_errors(content: &str) -> Result<Vec<ErrorInfo>> {
     while i < lines.len() {
         let line = lines[i];
         
-        // Look for error pattern
+        // Look for error pattern with code
         if let Some(caps) = error_re.captures(line) {
             let error_code = format!("E{}", caps.get(1).unwrap().as_str());
             let error_msg = caps.get(2).unwrap().as_str().to_string();
@@ -145,7 +168,56 @@ fn parse_cargo_errors(content: &str) -> Result<Vec<ErrorInfo>> {
                 j += 1;
             }
             
-            // Extract code snippet and function using syn if file exists
+            // Extract code snippet and function using syn
+            if error.file_path.exists() && error.line > 0 {
+                error.code_snippet = extract_code_snippet(&error.file_path, error.line);
+                
+                if let Some((func_name, func_body, start, end, visibility, asyncness)) = find_function_with_syn(&error.file_path, error.line) {
+                    error.function_name = Some(func_name);
+                    error.function_body = Some(func_body);
+                    error.function_start_line = start;
+                    error.function_end_line = end;
+                    error.function_visibility = visibility;
+                    error.function_asyncness = asyncness;
+                }
+            }
+            
+            errors.push(error);
+        }
+        // Look for error pattern without code
+        else if let Some(caps) = error_re_no_code.captures(line) {
+            let error_msg = caps.get(1).unwrap().as_str().to_string();
+            
+            let mut error = ErrorInfo {
+                file_path: PathBuf::new(),
+                line: 0,
+                column: 0,
+                error_code: "UNKNOWN".to_string(),
+                message: error_msg,
+                code_snippet: None,
+                function_name: None,
+                function_body: None,
+                function_start_line: 0,
+                function_end_line: 0,
+                function_visibility: None,
+                function_asyncness: false,
+            };
+            
+            // Look for location in next few lines
+            let mut j = i + 1;
+            while j < lines.len() && j < i + 10 {
+                let next_line = lines[j];
+                if let Some(loc_caps) = location_re.captures(next_line) {
+                    let file = loc_caps.get(1).unwrap().as_str();
+                    error.file_path = PathBuf::from(file);
+                    error.line = loc_caps.get(2).unwrap().as_str().parse().unwrap_or(0);
+                    error.column = loc_caps.get(3).unwrap().as_str().parse().unwrap_or(0);
+                    break;
+                }
+                j += 1;
+            }
+            
+            // Extract code snippet and function using syn
             if error.file_path.exists() && error.line > 0 {
                 error.code_snippet = extract_code_snippet(&error.file_path, error.line);
                 
@@ -177,8 +249,9 @@ fn find_function_with_syn(file_path: &Path, line: usize) -> Option<(String, Stri
     for item in file.items {
         match item {
             Item::Fn(item_fn) => {
-                let start_line = item_fn.span().start().line;
-                let end_line = find_function_end(&lines, start_line);
+                let span = item_fn.span();
+                let start_line = span.start().line;
+                let end_line = find_function_end_syn(&lines, start_line);
                 
                 // Check if error line is within this function
                 if line >= start_line && line <= end_line {
@@ -196,8 +269,9 @@ fn find_function_with_syn(file_path: &Path, line: usize) -> Option<(String, Stri
             Item::Impl(item_impl) => {
                 for method in item_impl.items {
                     if let ImplItem::Fn(method_fn) = method {
-                        let start_line = method_fn.span().start().line;
-                        let end_line = find_function_end(&lines, start_line);
+                        let span = method_fn.span();
+                        let start_line = span.start().line;
+                        let end_line = find_function_end_syn(&lines, start_line);
                         
                         // Check if error line is within this method
                         if line >= start_line && line <= end_line {
@@ -221,7 +295,7 @@ fn find_function_with_syn(file_path: &Path, line: usize) -> Option<(String, Stri
     None
 }
 
-fn find_function_end(lines: &[&str], start_line: usize) -> usize {
+fn find_function_end_syn(lines: &[&str], start_line: usize) -> usize {
     let mut brace_count = 0;
     let mut found_brace = false;
     let mut end_line = start_line;
@@ -249,8 +323,8 @@ fn extract_code_snippet(file_path: &Path, line: usize) -> Option<String> {
     let content = fs::read_to_string(file_path).ok()?;
     let lines: Vec<&str> = content.lines().collect();
     
-    let start = line.saturating_sub(3);
-    let end = (line + 2).min(lines.len());
+    let start = line.saturating_sub(2);
+    let end = (line + 1).min(lines.len());
     
     let snippet: Vec<String> = (start..end)
         .map(|idx| {
@@ -263,70 +337,97 @@ fn extract_code_snippet(file_path: &Path, line: usize) -> Option<String> {
     Some(snippet.join("\n"))
 }
 
-fn build_error_report(errors: &[ErrorInfo]) -> Result<String> {
+fn group_errors_by_function(errors: &[ErrorInfo]) -> Vec<FunctionErrorGroup> {
+    let mut groups: HashMap<String, FunctionErrorGroup> = HashMap::new();
+    
+    for error in errors {
+        let key = if let Some(ref func_name) = error.function_name {
+            format!("{}:{}", error.file_path.display(), func_name)
+        } else {
+            format!("{}:no-function", error.file_path.display())
+        };
+        
+        if let Some(group) = groups.get_mut(&key) {
+            group.errors.push(error.clone());
+        } else {
+            groups.insert(key, FunctionErrorGroup {
+                function_name: error.function_name.clone().unwrap_or_else(|| "[NO FUNCTION]".to_string()),
+                function_body: error.function_body.clone().unwrap_or_default(),
+                function_start_line: error.function_start_line,
+                function_end_line: error.function_end_line,
+                function_visibility: error.function_visibility.clone(),
+                function_asyncness: error.function_asyncness,
+                file_path: error.file_path.clone(),
+                errors: vec![error.clone()],
+            });
+        }
+    }
+    
+    let mut grouped: Vec<FunctionErrorGroup> = groups.into_values().collect();
+    grouped.sort_by_key(|g| (g.file_path.clone(), g.function_start_line));
+    grouped
+}
+
+fn build_grouped_error_report(groups: &[FunctionErrorGroup]) -> Result<String> {
     let mut output = String::new();
+    let total_errors: usize = groups.iter().map(|g| g.errors.len()).sum();
     
     output.push_str(&format!(
         "// Cargo Build Error Report\n\
          // ============================================================\n\
-         // Total errors: {}\n\
+         // Total errors: {} in {} functions\n\
          // ============================================================\n\n",
-        errors.len()
+        total_errors,
+        groups.len()
     ));
     
-    for (idx, error) in errors.iter().enumerate() {
+    for (idx, group) in groups.iter().enumerate() {
+        let visibility = group.function_visibility.as_deref().unwrap_or("");
+        let asyncness = if group.function_asyncness { "async " } else { "" };
+        let modifier = if !visibility.is_empty() && !asyncness.is_empty() {
+            format!("{} ", visibility)
+        } else if !visibility.is_empty() {
+            visibility.to_string()
+        } else if !asyncness.is_empty() {
+            asyncness.to_string()
+        } else {
+            String::new()
+        };
+        
         output.push_str(&format!(
             "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         ));
         output.push_str(&format!(
-            "Error {}: {}\n",
+            "Function {}: {}{}\n",
             idx + 1,
-            error.error_code
+            if modifier.is_empty() { "" } else { &format!("{} ", modifier) },
+            group.function_name
         ));
         output.push_str(&format!(
-            "  {}:{}:{}\n",
-            error.file_path.display(),
-            error.line,
-            error.column
+            "  {}: lines {}-{}\n",
+            group.file_path.display(),
+            group.function_start_line,
+            group.function_end_line
         ));
-        output.push_str(&format!("  {}\n", error.message));
+        output.push_str(&format!("  {} error(s):\n", group.errors.len()));
         
-        if let Some(ref snippet) = error.code_snippet {
-            output.push_str(&format!("\nCode snippet:\n{}\n", snippet));
-        }
-        
-        if let Some(ref func_name) = error.function_name {
-            let visibility = error.function_visibility.as_deref().unwrap_or("");
-            let asyncness = if error.function_asyncness { "async " } else { "" };
-            let modifier = if !visibility.is_empty() && !asyncness.is_empty() {
-                format!("{} {}", visibility, asyncness)
-            } else if !visibility.is_empty() {
-                visibility.to_string()
-            } else {
-                asyncness.to_string()
-            };
+        for error in &group.errors {
             output.push_str(&format!(
-                "\nFunction: {}{}\n",
-                if modifier.is_empty() { "" } else { &format!("{} ", modifier) },
-                func_name
-            ));
-            output.push_str(&format!(
-                "  Lines: {}-{}\n",
-                error.function_start_line,
-                error.function_end_line
+                "    • [{}] at line {}: {}\n",
+                error.error_code,
+                error.line,
+                error.message
             ));
             
-            if let Some(ref body) = error.function_body {
-                output.push_str(&format!("\n{}\n", body));
+            if let Some(ref snippet) = error.code_snippet {
+                output.push_str(&format!("\n  Code snippet:\n{}\n", snippet));
             }
-        } else if error.file_path.exists() {
-            output.push_str(&format!(
-                "\n⚠ [FUNCTION WAS NOT FOUND]\n"
-            ));
-            output.push_str(&format!(
-                "  Error at line {}, but no enclosing function found\n",
-                error.line
-            ));
+        }
+        
+        if !group.function_body.is_empty() {
+            output.push_str(&format!("\n{}\n", group.function_body));
+        } else if group.function_name == "[NO FUNCTION]" {
+            output.push_str(&format!("\n⚠ [FUNCTION BODY NOT FOUND]\n"));
         }
         
         output.push_str("\n");
@@ -335,29 +436,23 @@ fn build_error_report(errors: &[ErrorInfo]) -> Result<String> {
     Ok(output)
 }
 
-fn print_stats(errors: &[ErrorInfo], output: &str) -> Result<()> {
+fn print_stats(errors: &[ErrorInfo], groups: &[FunctionErrorGroup], output: &str) -> Result<()> {
     let stats = calc_stats(output);
     
-    let mut functions_found = 0;
-    let mut functions_not_found = 0;
-    
-    for error in errors {
-        if error.function_name.is_some() {
-            functions_found += 1;
-        } else {
-            functions_not_found += 1;
-        }
-    }
+    let functions_with_errors = groups.len();
+    let functions_found = groups.iter().filter(|g| g.function_name != "[NO FUNCTION]").count();
+    let functions_not_found = functions_with_errors - functions_found;
     
     println!("\n\x1b[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
     println!("\x1b[1;32m✓ Error Report Statistics:\x1b[0m");
     println!("  \x1b[33mTotal errors:\x1b[0m {}", errors.len());
+    println!("  \x1b[33mFunctions with errors:\x1b[0m {}", functions_with_errors);
     println!("  \x1b[32mFunctions found:\x1b[0m {}", functions_found);
     println!("  \x1b[31mFunctions not found:\x1b[0m {}", functions_not_found);
-    println!("  \x1b[33mLines:\x1b[0m {}", stats.lines);
-    println!("  \x1b[33mWords:\x1b[0m {}", stats.words);
-    println!("  \x1b[33mChars:\x1b[0m {}", stats.chars);
-    println!("  \x1b[33mBytes:\x1b[0m {}", stats.bytes);
+    println!("  \x1b[33mTotal lines in report:\x1b[0m {}", stats.lines);
+    println!("  \x1b[33mTotal words:\x1b[0m {}", stats.words);
+    println!("  \x1b[33mTotal chars:\x1b[0m {}", stats.chars);
+    println!("  \x1b[33mTotal bytes:\x1b[0m {}", stats.bytes);
     
     Ok(())
 }

@@ -8,7 +8,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 use chrono::{Local, DateTime};
 use wcc::common::*;
-use wcc::{config::load_unified_config, WccConfig};
+use wcc::{config::load_unified_config, };
 
 #[derive(Debug, Default)]
 struct Args {
