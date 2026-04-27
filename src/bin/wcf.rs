@@ -8,8 +8,10 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use regex::Regex;
 use similar::{ChangeTag, TextDiff};
+use syn::{
+    parse_file, parse_str, File, ImplItem, Item, ItemFn, Visibility,
+};
 use wcc::common::*;
 use wcc::config::load_unified_config;
 
@@ -18,76 +20,60 @@ struct FunctionMatch {
     file_path: PathBuf,
     func_name: String,
     old_full_function: String,
-    start_line: usize,
-    end_line: usize,
+    original_vis: Visibility,
+    original_asyncness: Option<syn::token::Async>,
+    original_unsafety: Option<syn::token::Unsafe>,
+    original_attrs: Vec<syn::Attribute>,
 }
 
-#[derive(Debug, Clone)]
-struct FileChange {
-    file_path: PathBuf,
-    old_content: String,
-    new_content: String,
-    diff: String,
-}
-
-fn parse_clipboard_functions(content: &str) -> Result<Vec<(String, String)>> {
+fn parse_clipboard_functions(content: &str) -> Result<Vec<(String, ItemFn)>> {
     let content = content.trim();
     let mut functions = Vec::new();
-    let mut pos = 0;
     
-    while let Some(start_pos) = content[pos..].find("fn ") {
-        let abs_start = pos + start_pos;
-        
-        let before_fn = &content[..abs_start];
-        let has_pub = before_fn.trim_end().ends_with("pub");
-        let has_async = before_fn.trim_end().ends_with("async");
-        
-        let mut brace_count = 0;
-        let mut end_pos = abs_start;
-        let mut in_brace = false;
-        
-        for (i, ch) in content[abs_start..].char_indices() {
-            let abs_pos = abs_start + i;
-            match ch {
-                '{' => {
-                    brace_count += 1;
-                    in_brace = true;
+    // Try to parse as a full file first
+    match parse_file(content) {
+        Ok(file) => {
+            for item in file.items {
+                if let Item::Fn(item_fn) = item {
+                    let func_name = item_fn.sig.ident.to_string();
+                    functions.push((func_name, item_fn));
                 }
-                '}' => {
-                    brace_count -= 1;
-                    if in_brace && brace_count == 0 {
-                        end_pos = abs_pos + 1;
-                        break;
+            }
+        }
+        Err(_) => {
+            // Try to parse as individual function items
+            let mut pos = 0;
+            while let Some(start_pos) = content[pos..].find("fn ") {
+                let abs_start = pos + start_pos;
+                let mut brace_count = 0;
+                let mut end_pos = abs_start;
+                let mut in_brace = false;
+                
+                for (i, ch) in content[abs_start..].char_indices() {
+                    match ch {
+                        '{' => {
+                            brace_count += 1;
+                            in_brace = true;
+                        }
+                        '}' => {
+                            brace_count -= 1;
+                            if in_brace && brace_count == 0 {
+                                end_pos = abs_start + i + 1;
+                                break;
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                _ => {}
+                
+                let full_function = content[abs_start..end_pos].to_string();
+                if let Ok(item_fn) = parse_str::<ItemFn>(&full_function) {
+                    let func_name = item_fn.sig.ident.to_string();
+                    functions.push((func_name, item_fn));
+                }
+                pos = end_pos;
             }
         }
-        
-        let mut full_function = content[abs_start..end_pos].to_string();
-        
-        if has_pub && !full_function.trim_start().starts_with("pub") {
-            full_function = format!("pub {}", full_function);
-        }
-        if has_async && !full_function.trim_start().starts_with("async") && !full_function.trim_start().starts_with("pub async") {
-            if full_function.trim_start().starts_with("pub") {
-                full_function = full_function.replacen("pub", "pub async", 1);
-            } else {
-                full_function = format!("async {}", full_function);
-            }
-        }
-        
-        if !full_function.trim_end().ends_with('}') {
-            full_function.push_str("\n}");
-        }
-        
-        let name_re = Regex::new(r"fn\s+(\w+)")?;
-        if let Some(func_name) = name_re.captures(&full_function)
-            .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string())) {
-            functions.push((func_name, full_function));
-        }
-        
-        pos = end_pos;
     }
     
     if functions.is_empty() {
@@ -97,84 +83,100 @@ fn parse_clipboard_functions(content: &str) -> Result<Vec<(String, String)>> {
     Ok(functions)
 }
 
-fn find_function_in_file(file_path: &Path, func_name: &str) -> Result<Option<FunctionMatch>> {
+fn find_function_in_file(file_path: &Path, func_name: &str) -> Result<Vec<FunctionMatch>> {
     let content = fs::read_to_string(file_path)?;
-    let lines: Vec<&str> = content.lines().collect();
+    let file = parse_file(&content)?;
+    let mut matches = Vec::new();
     
-    let pattern = format!(r"^\s*(?:pub\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+{}\s*\(", func_name);
-    let re = Regex::new(&pattern)?;
-    
-    let mut start_line = 0;
-    let mut end_line = 0;
-    let mut found_start = false;
-    let mut brace_count = 0;
-    let mut in_function = false;
-    
-    for (idx, line) in lines.iter().enumerate() {
-        if !found_start && re.is_match(line) {
-            start_line = idx;
-            found_start = true;
-            in_function = true;
-        }
-        
-        if in_function {
-            for ch in line.chars() {
-                if ch == '{' {
-                    brace_count += 1;
-                } else if ch == '}' {
-                    brace_count -= 1;
-                    if brace_count == 0 {
-                        end_line = idx;
-                        in_function = false;
-                        break;
+    // Search through all items in the file
+    for item in file.items {
+        match item {
+            Item::Fn(item_fn) => {
+                if item_fn.sig.ident == func_name {
+                    let fn_str = quote::quote!(#item_fn).to_string();
+                    matches.push(FunctionMatch {
+                        file_path: file_path.to_path_buf(),
+                        func_name: func_name.to_string(),
+                        old_full_function: fn_str,
+                        original_vis: item_fn.vis,
+                        original_asyncness: item_fn.sig.asyncness,
+                        original_unsafety: item_fn.sig.unsafety,
+                        original_attrs: item_fn.attrs,
+                    });
+                }
+            }
+            Item::Impl(item_impl) => {
+                for method in item_impl.items {
+                    if let ImplItem::Fn(method_fn) = &method {
+                        if method_fn.sig.ident == func_name {
+                            let fn_str = quote::quote!(#method_fn).to_string();
+                            matches.push(FunctionMatch {
+                                file_path: file_path.to_path_buf(),
+                                func_name: func_name.to_string(),
+                                old_full_function: fn_str,
+                                original_vis: method_fn.vis.clone(),
+                                original_asyncness: method_fn.sig.asyncness,
+                                original_unsafety: method_fn.sig.unsafety,
+                                original_attrs: method_fn.attrs.clone(),
+                            });
+                        }
                     }
                 }
             }
-            if !in_function && brace_count == 0 {
-                break;
-            }
+            _ => {}
         }
     }
     
-    if found_start && end_line > start_line {
-        let full_function = lines[start_line..=end_line].join("\n");
-        return Ok(Some(FunctionMatch {
-            file_path: file_path.to_path_buf(),
-            func_name: func_name.to_string(),
-            old_full_function: full_function,
-            start_line: start_line + 1,
-            end_line: end_line + 1,
-        }));
-    }
-    
-    Ok(None)
+    Ok(matches)
 }
 
-fn replace_function_in_file(content: &str, func_match: &FunctionMatch, new_function: &str) -> Result<String> {
-    let lines: Vec<&str> = content.lines().collect();
-    let mut result: Vec<String> = Vec::new();
+fn replace_function_in_file(content: &str, func_match: &FunctionMatch, new_item_fn: &ItemFn) -> Result<String> {
+    let mut file: File = parse_file(content)?;
     
-    let original_line = lines[func_match.start_line - 1];
-    let indent_len = original_line.len() - original_line.trim_start().len();
-    let indent = original_line[..indent_len].to_string();
+    // Create preserved signature - keep original modifiers
+    let mut preserved_sig = new_item_fn.sig.clone();
+    preserved_sig.asyncness = func_match.original_asyncness;
+    preserved_sig.unsafety = func_match.original_unsafety;
     
-    for i in 0..func_match.start_line - 1 {
-        result.push(lines[i].to_string());
-    }
-    
-    for line in new_function.lines() {
-        if line.trim().is_empty() {
-            result.push(String::new());
-        } else {
-            result.push(format!("{}{}", indent, line));
+    // Find and replace the function in the file
+    for item in &mut file.items {
+        match item {
+            Item::Fn(item_fn) => {
+                if item_fn.sig.ident == func_match.func_name {
+                    // Replace free function
+                    *item_fn = ItemFn {
+                        attrs: func_match.original_attrs.clone(),
+                        vis: func_match.original_vis.clone(),
+                        sig: preserved_sig.clone(),
+                        block: new_item_fn.block.clone(),
+                    };
+                    break;
+                }
+            }
+            Item::Impl(item_impl) => {
+                for method in &mut item_impl.items {
+                    match method {
+                        ImplItem::Fn(method_fn) => {
+                            if method_fn.sig.ident == func_match.func_name {
+                                // Replace method in impl block - ImplItemFn has block: Block (not boxed)
+                                method_fn.attrs = func_match.original_attrs.clone();
+                                method_fn.vis = func_match.original_vis.clone();
+                                method_fn.sig = preserved_sig.clone();
+                                method_fn.block = (*new_item_fn.block).clone(); // Deref Box<Block> to Block
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
         }
     }
     
-    for i in func_match.end_line..lines.len() {
-        result.push(lines[i].to_string());
-    }
-    
-    Ok(result.join("\n"))
+    // Convert back to string
+    let new_content = prettyplease::unparse(&file);
+    Ok(new_content)
 }
 
 fn run_rustfmt_in_dir(file_path: &Path) -> Result<()> {
@@ -286,9 +288,9 @@ fn select_file_with_fzf(files: &[PathBuf]) -> Result<Option<PathBuf>> {
 }
 
 fn scan_directory_for_function(dir: &Path, func_name: &str) -> Result<Vec<FunctionMatch>> {
-    let mut matches = Vec::new();
+    let mut all_matches = Vec::new();
     
-    fn walk_dir(dir: &Path, func_name: &str, matches: &mut Vec<FunctionMatch>) -> Result<()> {
+    fn walk_dir(dir: &Path, func_name: &str, all_matches: &mut Vec<FunctionMatch>) -> Result<()> {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -301,18 +303,18 @@ fn scan_directory_for_function(dir: &Path, func_name: &str) -> Result<Vec<Functi
                         continue;
                     }
                 }
-                walk_dir(&path, func_name, matches)?;
+                walk_dir(&path, func_name, all_matches)?;
             } else if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                if let Ok(Some(func_match)) = find_function_in_file(&path, func_name) {
-                    matches.push(func_match);
+                if let Ok(matches) = find_function_in_file(&path, func_name) {
+                    all_matches.extend(matches);
                 }
             }
         }
         Ok(())
     }
     
-    walk_dir(dir, func_name, &mut matches)?;
-    Ok(matches)
+    walk_dir(dir, func_name, &mut all_matches)?;
+    Ok(all_matches)
 }
 
 fn main() -> Result<()> {
@@ -344,13 +346,12 @@ fn main() -> Result<()> {
         eprintln!("  • {}", name);
     }
     
-    let mut all_diffs = String::new();
     let mut processed_count = 0;
     let mut skipped_count = 0;
     
     // Process each function one by one
     while !functions.is_empty() {
-        let (func_name, new_function) = functions.remove(0);
+        let (func_name, new_item_fn) = functions.remove(0);
         
         eprintln!("\n\x1b[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
         eprintln!("📝 Processing function: \x1b[1;33m{}\x1b[0m", func_name);
@@ -358,13 +359,14 @@ fn main() -> Result<()> {
         
         // Show current buffer content if configured
         if config.wcf.show_buffer_preview {
-            eprintln!("\n\x1b[36m📋 Function preview:\x1b[0m");
+            let new_function_str = quote::quote!(#new_item_fn).to_string();
+            eprintln!("\n\x1b[36m📋 Function from clipboard:\x1b[0m");
             eprintln!("\x1b[90m{}\x1b[0m", "-".repeat(60));
-            for (i, line) in new_function.lines().enumerate().take(20) {
+            for (i, line) in new_function_str.lines().enumerate().take(20) {
                 eprintln!("{:4} {}", i + 1, line);
             }
-            if new_function.lines().count() > 20 {
-                eprintln!("     ... {} more lines", new_function.lines().count() - 20);
+            if new_function_str.lines().count() > 20 {
+                eprintln!("     ... {} more lines", new_function_str.lines().count() - 20);
             }
             eprintln!("\x1b[90m{}\x1b[0m", "-".repeat(60));
             
@@ -399,7 +401,15 @@ fn main() -> Result<()> {
         
         eprintln!("✓ Found {} matching function(s):", matches.len());
         for m in &matches {
-            eprintln!("  • {} (lines {}-{})", m.file_path.display(), m.start_line, m.end_line);
+            let visibility = match &m.original_vis {
+                Visibility::Public(_) => "pub",
+                _ => "",
+            };
+            let asyncness = if m.original_asyncness.is_some() { "async" } else { "" };
+            let unsafety = if m.original_unsafety.is_some() { "unsafe" } else { "" };
+            
+            eprintln!("  • {}", m.file_path.display());
+            eprintln!("    Modifiers: {} {} {}", visibility, asyncness, unsafety);
         }
         
         // If multiple files, let user select which one to modify
@@ -425,8 +435,11 @@ fn main() -> Result<()> {
         eprintln!("\n📝 Preview of changes:");
         for m in &selected_matches {
             eprintln!("\n  File: {}", m.file_path.display());
-            eprintln!("  Old function (lines {}-{}):", m.start_line, m.end_line);
-            print_colored_diff(&m.old_full_function, &new_function);
+            eprintln!("  Original function:");
+            
+            // Show the diff preview
+            let new_function_str = quote::quote!(#new_item_fn).to_string();
+            print_colored_diff(&m.old_full_function, &new_function_str);
         }
         
         // Ask for confirmation
@@ -456,21 +469,13 @@ fn main() -> Result<()> {
             }
             
             // Replace function
-            let new_content = replace_function_in_file(&old_content, func_match, &new_function)?;
+            let new_content = replace_function_in_file(&old_content, func_match, &new_item_fn)?;
             fs::write(file_path, &new_content)?;
             
             // Run rustfmt on the file
             if let Err(e) = run_rustfmt_in_dir(file_path) {
                 eprintln!("  Warning: rustfmt failed: {}", e);
             }
-            
-            // Generate diff for this file
-            let file_diff = generate_clean_diff(&func_match.old_full_function, &new_function);
-            let rel_path = file_path.strip_prefix(&target_dir).unwrap_or(file_path);
-            
-            all_diffs.push_str(&format!("// {} - Function: {}\n", rel_path.display(), func_name));
-            all_diffs.push_str(&file_diff);
-            all_diffs.push_str("\n");
             
             eprintln!("  ✓ Updated: {}", file_path.display());
             processed_count += 1;
@@ -484,23 +489,6 @@ fn main() -> Result<()> {
     eprintln!("\x1b[1;32m✅ All functions processed!\x1b[0m");
     eprintln!("  Functions processed: {}", processed_count);
     eprintln!("  Functions skipped: {}", skipped_count);
-    
-    // Copy final diff to clipboard
-    if !all_diffs.is_empty() {
-        let final_output = format!(
-            "// wcf Function Replacement Summary\n\
-             // ============================================================\n\
-             // Total functions processed: {}\n\
-             // Total functions skipped: {}\n\
-             // ============================================================\n\n\
-             {}",
-            processed_count,
-            skipped_count,
-            all_diffs
-        );
-        set_clipboard(&final_output)?;
-        eprintln!("\n✓ Final diff copied to clipboard!");
-    }
     
     Ok(())
 }
