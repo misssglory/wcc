@@ -158,11 +158,11 @@ fn replace_function_in_file(content: &str, func_match: &FunctionMatch, new_item_
                     match method {
                         ImplItem::Fn(method_fn) => {
                             if method_fn.sig.ident == func_match.func_name {
-                                // Replace method in impl block - ImplItemFn has block: Block (not boxed)
+                                // Replace method in impl block
                                 method_fn.attrs = func_match.original_attrs.clone();
                                 method_fn.vis = func_match.original_vis.clone();
                                 method_fn.sig = preserved_sig.clone();
-                                method_fn.block = (*new_item_fn.block).clone(); // Deref Box<Block> to Block
+                                method_fn.block = (*new_item_fn.block).clone();
                                 break;
                             }
                         }
@@ -245,6 +245,98 @@ fn print_colored_diff(old: &str, new: &str) {
             }
         }
     }
+}
+
+// Format code with rustfmt and optionally syntax highlight
+fn format_code_with_rustfmt(code: &str) -> Result<String> {
+    // Write code to temp file
+    let temp_file = tempfile::NamedTempFile::new()?;
+    let temp_path = temp_file.path();
+    fs::write(temp_path, code)?;
+    
+    // Run rustfmt on temp file
+    let output = Command::new("rustfmt")
+        .arg("--edition")
+        .arg("2021")
+        .arg(temp_path)
+        .output()?;
+    
+    if output.status.success() {
+        let formatted = fs::read_to_string(temp_path)?;
+        Ok(formatted)
+    } else {
+        Ok(code.to_string())
+    }
+}
+
+// Show code with a pager for scrolling
+fn show_with_pager(content: &str, title: &str) -> Result<()> {
+    use std::io::Write;
+    
+    // Try to use bat for syntax highlighting (preferred)
+    let bat_check = Command::new("bat")
+        .arg("--version")
+        .output();
+    
+    if bat_check.is_ok() {
+        // Use bat with Rust syntax highlighting
+        let mut child = Command::new("bat")
+            .arg("--language=rust")
+            .arg("--style=numbers,changes")
+            .arg("--color=always")
+            .arg("--paging=always")
+            .arg("--wrap=never")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(content.as_bytes())?;
+        }
+        
+        child.wait()?;
+    } else {
+        // Fallback to less with syntax highlighting disabled
+        let mut child = Command::new("less")
+            .arg("-R")
+            .arg("-X")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .spawn()?;
+        
+        if let Some(mut stdin) = child.stdin.take() {
+            // Add colored header
+            let header = format!("\x1b[1;36m{}\n\x1b[90m{}\x1b[0m\n\n", 
+                title, 
+                "=".repeat(80));
+            stdin.write_all(header.as_bytes())?;
+            stdin.write_all(content.as_bytes())?;
+        }
+        
+        child.wait()?;
+    }
+    
+    Ok(())
+}
+
+// Pretty print function with formatting
+fn pretty_print_function(item_fn: &ItemFn, title: &str) -> Result<String> {
+    let code = quote::quote!(#item_fn).to_string();
+    let formatted = format_code_with_rustfmt(&code)?;
+    
+    // Add line numbers
+    let lines: Vec<&str> = formatted.lines().collect();
+    let numbered: Vec<String> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| format!("{:4} {}", i + 1, line))
+        .collect();
+    
+    let separator = "\x1b[90m".to_string() + &"-".repeat(60) + "\x1b[0m\n";
+    let header = format!("\x1b[1;36m{}\x1b[0m\n{}\n", title, separator);
+    
+    Ok(format!("{}{}", header, numbered.join("\n")))
 }
 
 fn select_file_with_fzf(files: &[PathBuf]) -> Result<Option<PathBuf>> {
@@ -359,16 +451,9 @@ fn main() -> Result<()> {
         
         // Show current buffer content if configured
         if config.wcf.show_buffer_preview {
-            let new_function_str = quote::quote!(#new_item_fn).to_string();
-            eprintln!("\n\x1b[36m📋 Function from clipboard:\x1b[0m");
-            eprintln!("\x1b[90m{}\x1b[0m", "-".repeat(60));
-            for (i, line) in new_function_str.lines().enumerate().take(20) {
-                eprintln!("{:4} {}", i + 1, line);
-            }
-            if new_function_str.lines().count() > 20 {
-                eprintln!("     ... {} more lines", new_function_str.lines().count() - 20);
-            }
-            eprintln!("\x1b[90m{}\x1b[0m", "-".repeat(60));
+            // Pretty print the function
+            let pretty = pretty_print_function(&new_item_fn, "📋 Function from clipboard:")?;
+            println!("{}", pretty);
             
             print!("\n❓ Continue with this function? (y/n/skip all): ");
             io::stdout().flush()?;
@@ -436,9 +521,14 @@ fn main() -> Result<()> {
         for m in &selected_matches {
             eprintln!("\n  File: {}", m.file_path.display());
             eprintln!("  Original function:");
+            println!("{}", m.old_full_function);
             
-            // Show the diff preview
+            eprintln!("\n  New function (will preserve modifiers):");
             let new_function_str = quote::quote!(#new_item_fn).to_string();
+            let formatted = format_code_with_rustfmt(&new_function_str)?;
+            println!("{}", formatted);
+            
+            eprintln!("\n  Diff:");
             print_colored_diff(&m.old_full_function, &new_function_str);
         }
         
