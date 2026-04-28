@@ -1,3 +1,4 @@
+// src/bin/wff.rs
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local};
 use std::{
@@ -8,12 +9,14 @@ use std::{
 };
 use wcc::common::*;
 use wcc::config::{load_unified_config, UnifiedConfig};
+
 #[derive(Debug, Clone)]
 enum CodeBlockType {
     Function,
     Impl,
     Struct,
 }
+
 #[derive(Debug, Clone)]
 struct CodeBlockInfo {
     file_path: PathBuf,
@@ -28,6 +31,7 @@ struct CodeBlockInfo {
     visibility: String,
     asyncness: bool,
 }
+
 impl CodeBlockInfo {
     fn new(
         file_path: PathBuf,
@@ -56,6 +60,7 @@ impl CodeBlockInfo {
             asyncness,
         }
     }
+
     fn get_modifier_string(&self) -> String {
         match self.block_type {
             CodeBlockType::Function => {
@@ -83,6 +88,7 @@ impl CodeBlockInfo {
             }
         }
     }
+
     fn get_type_icon(&self) -> &'static str {
         match self.block_type {
             CodeBlockType::Function => "ƒ",
@@ -90,6 +96,7 @@ impl CodeBlockInfo {
             CodeBlockType::Struct => "Ⓢ",
         }
     }
+
     fn get_type_name(&self) -> &'static str {
         match self.block_type {
             CodeBlockType::Function => "function",
@@ -97,6 +104,18 @@ impl CodeBlockInfo {
             CodeBlockType::Struct => "struct",
         }
     }
+
+    fn get_telescope_entry(&self) -> String {
+        format!(
+            "{}│{}│{}│{}│{}",
+            self.get_type_icon(),
+            self.block_name,
+            self.relative_path.display(),
+            self.start_line,
+            self.end_line
+        )
+    }
+
     fn get_display_string(&self) -> String {
         format!(
             "{} {} {} ({}: lines {}-{})",
@@ -108,13 +127,15 @@ impl CodeBlockInfo {
             self.end_line
         )
     }
-    fn format_header(&self, config: &UnifiedConfig) -> Result<String> {
+
+    fn format_header(&self, config: &UnifiedConfig, show_line_numbers: bool) -> Result<String> {
         let timestamp = if let Some(modified) = self.file_modified {
             modified.format(&config.wcc.time_format).to_string()
         } else {
             let now = Local::now();
             now.format(&config.wcc.time_format).to_string()
         };
+
         let comment_prefix = match self.file_path.extension().and_then(|e| e.to_str()) {
             Some("rs") => "//",
             Some("py") => "#",
@@ -123,16 +144,28 @@ impl CodeBlockInfo {
             Some("go") => "//",
             _ => "//",
         };
-        Ok(format!(
-            "{} {} # {} # lines {}-{} # {}\n",
-            comment_prefix,
-            self.relative_path.display(),
-            self.block_name,
-            self.start_line,
-            self.end_line,
-            timestamp,
-        ))
+
+        if show_line_numbers {
+            Ok(format!(
+                "{} {} # {} # lines {}-{} # {}\n",
+                comment_prefix,
+                self.relative_path.display(),
+                self.block_name,
+                self.start_line,
+                self.end_line,
+                timestamp,
+            ))
+        } else {
+            Ok(format!(
+                "{} {} # {} # {}\n",
+                comment_prefix,
+                self.relative_path.display(),
+                self.block_name,
+                timestamp,
+            ))
+        }
     }
+
     fn print_stats(&self) -> Result<()> {
         let stats = calc_stats(&self.block_body);
         let file_percentage =
@@ -155,14 +188,28 @@ impl CodeBlockInfo {
         );
         Ok(())
     }
-    fn to_clipboard_payload(&self, config: &UnifiedConfig) -> Result<String> {
-        let header = self.format_header(config)?;
+
+    fn to_clipboard_payload(&self, config: &UnifiedConfig, show_line_numbers: bool) -> Result<String> {
+        let header = self.format_header(config, show_line_numbers)?;
         Ok(format!("{}\n{}", header, self.block_body))
     }
+    
+    fn to_json(&self) -> Result<String> {
+        Ok(format!(
+            r#"{{"type":"{:?}","name":"{}","path":"{}","line":{},"end_line":{}}}"#,
+            self.block_type,
+            self.block_name,
+            self.relative_path.display(),
+            self.start_line,
+            self.end_line
+        ))
+    }
 }
+
 struct CodeBlockScanner {
     skip_dirs: Vec<String>,
 }
+
 impl CodeBlockScanner {
     fn new() -> Self {
         Self {
@@ -176,11 +223,13 @@ impl CodeBlockScanner {
             ],
         }
     }
+
     fn scan_directory(&self, dir: &Path) -> Result<Vec<CodeBlockInfo>> {
         let mut blocks = Vec::new();
         self.walk_directory(dir, &mut blocks)?;
         Ok(blocks)
     }
+
     fn walk_directory(&self, dir: &Path, blocks: &mut Vec<CodeBlockInfo>) -> Result<()> {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
@@ -201,9 +250,11 @@ impl CodeBlockScanner {
         }
         Ok(())
     }
+
     fn is_rust_file(&self, path: &Path) -> bool {
         path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("rs")
     }
+
     fn find_blocks_in_file(&self, file_path: &Path) -> Result<Vec<CodeBlockInfo>> {
         let content = fs::read_to_string(file_path)?;
         let lines: Vec<&str> = content.lines().collect();
@@ -216,15 +267,18 @@ impl CodeBlockScanner {
             .strip_prefix(&current_dir)
             .unwrap_or(file_path)
             .to_path_buf();
+
         let mut blocks = Vec::new();
         let mut i = 0;
         while i < lines.len() {
             let line = lines[i];
             let trimmed = line.trim();
+            
             if trimmed.starts_with("//") {
                 i += 1;
                 continue;
             }
+
             if trimmed.contains("struct ") && !trimmed.contains("fn ") {
                 let mut start_idx = i;
                 while start_idx > 0 && lines[start_idx - 1].trim().starts_with("#[") {
@@ -244,8 +298,8 @@ impl CodeBlockScanner {
                     continue;
                 }
             }
+
             if trimmed.starts_with("impl ") {
-                eprintln!("Debug: Found impl block at line {}", i);
                 if let Some(impl_info) = self.extract_impl_block(
                     &lines,
                     i,
@@ -255,20 +309,12 @@ impl CodeBlockScanner {
                     modified_datetime,
                 )? {
                     let impl_end_line = impl_info.end_line;
-                    eprintln!(
-                        "Debug: Extracted impl: {} (lines {}-{})",
-                        impl_info.block_name, impl_info.start_line, impl_info.end_line
-                    );
                     blocks.push(impl_info);
                     let mut j = i + 1;
                     while j < impl_end_line {
                         let inner_line = lines[j];
                         let inner_trimmed = inner_line.trim();
                         if inner_trimmed.contains("fn ") && !inner_trimmed.starts_with("//") {
-                            eprintln!(
-                                "Debug: Found function inside impl at line {}: {}",
-                                j, inner_trimmed
-                            );
                             if let Some(func_info) = self.extract_function_block(
                                 &lines,
                                 j,
@@ -278,10 +324,6 @@ impl CodeBlockScanner {
                                 modified_datetime,
                             )? {
                                 if func_info.end_line <= impl_end_line {
-                                    eprintln!(
-                                        "Debug: Extracted function from impl: {}",
-                                        func_info.block_name
-                                    );
                                     let func_end_line = func_info.end_line;
                                     blocks.push(func_info);
                                     j = func_end_line;
@@ -295,6 +337,7 @@ impl CodeBlockScanner {
                     continue;
                 }
             }
+
             if line.contains("fn ") && !line.trim_start().starts_with("//") {
                 if let Some(func_info) = self.extract_function_block(
                     &lines,
@@ -310,10 +353,13 @@ impl CodeBlockScanner {
                     continue;
                 }
             }
+
             i += 1;
         }
+
         Ok(blocks)
     }
+
     fn extract_struct_block(
         &self,
         lines: &[&str],
@@ -327,9 +373,11 @@ impl CodeBlockScanner {
         while struct_idx < lines.len() && lines[struct_idx].trim().starts_with("#[") {
             struct_idx += 1;
         }
+        
         if struct_idx >= lines.len() {
             return Ok(None);
         }
+        
         let line = lines[struct_idx];
         let trimmed = line.trim();
         let (visibility, name) = if trimmed.starts_with("pub struct ") {
@@ -339,14 +387,17 @@ impl CodeBlockScanner {
         } else {
             return Ok(None);
         };
+        
         let struct_name = name
             .split(|c: char| !c.is_alphanumeric() && c != '_')
             .next()
             .unwrap_or("")
             .to_string();
+        
         if struct_name.is_empty() {
             return Ok(None);
         }
+
         let mut brace_count = 0;
         let mut found_brace = false;
         let mut end_line = struct_idx + 1;
@@ -368,7 +419,9 @@ impl CodeBlockScanner {
                 break;
             }
         }
+
         let block_body = lines[start_idx..end_line].join("\n");
+        
         Ok(Some(CodeBlockInfo::new(
             file_path.to_path_buf(),
             relative_path.clone(),
@@ -383,6 +436,7 @@ impl CodeBlockScanner {
             false,
         )))
     }
+
     fn extract_impl_block(
         &self,
         lines: &[&str],
@@ -397,6 +451,7 @@ impl CodeBlockScanner {
         if !trimmed.starts_with("impl ") {
             return Ok(None);
         }
+
         let after_impl = &trimmed[5..];
         let impl_name = after_impl
             .split(|c: char| c == '{' || c == 'w')
@@ -404,6 +459,7 @@ impl CodeBlockScanner {
             .unwrap_or("")
             .trim()
             .to_string();
+
         let mut brace_count = 0;
         let mut found_brace = false;
         let mut end_line = start_idx + 1;
@@ -425,7 +481,9 @@ impl CodeBlockScanner {
                 break;
             }
         }
+
         let block_body = lines[start_idx..end_line].join("\n");
+        
         Ok(Some(CodeBlockInfo::new(
             file_path.to_path_buf(),
             relative_path.clone(),
@@ -440,6 +498,7 @@ impl CodeBlockScanner {
             false,
         )))
     }
+
     fn extract_function_block(
         &self,
         lines: &[&str],
@@ -451,9 +510,11 @@ impl CodeBlockScanner {
     ) -> Result<Option<CodeBlockInfo>> {
         let line = lines[start_idx];
         let trimmed = line.trim();
+        
         let mut visibility = "";
         let mut asyncness = false;
         let mut fn_name = String::new();
+
         if trimmed.contains("pub async fn") {
             let after = trimmed.split("pub async fn").nth(1).unwrap_or("").trim();
             fn_name = after
@@ -493,9 +554,11 @@ impl CodeBlockScanner {
                 asyncness = true;
             }
         }
+
         if fn_name.is_empty() {
             return Ok(None);
         }
+
         let mut brace_count = 0;
         let mut found_brace = false;
         let mut end_line = start_idx + 1;
@@ -517,10 +580,13 @@ impl CodeBlockScanner {
                 break;
             }
         }
+
         if !found_brace {
             return Ok(None);
         }
+
         let block_body = lines[start_idx..end_line].join("\n");
+        
         Ok(Some(CodeBlockInfo::new(
             file_path.to_path_buf(),
             relative_path.clone(),
@@ -536,27 +602,166 @@ impl CodeBlockScanner {
         )))
     }
 }
+
+struct Application {
+    config: UnifiedConfig,
+    show_line_numbers: bool,
+    scanner: CodeBlockScanner,
+}
+
+impl Application {
+    fn new() -> Result<Self> {
+        let config = load_unified_config()?;
+        let args: Vec<String> = env::args().collect();
+        
+        let mut show_line_numbers = config.wff.show_line_numbers;
+        
+        let mut i = 1;
+        while i < args.len() {
+            match args[i].as_str() {
+                "-n" => {
+                    show_line_numbers = false;
+                }
+                "--telescope" => {
+                    // This flag will be handled in run()
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        
+        Ok(Self {
+            config,
+            show_line_numbers,
+            scanner: CodeBlockScanner::new(),
+        })
+    }
+
+    fn run(&self) -> Result<()> {
+        let args: Vec<String> = env::args().collect();
+        
+        // Check for telescope mode
+        let telescope_mode = args.iter().any(|arg| arg == "--telescope" || arg == "-t");
+        
+        // Find the target directory
+        let target_dir = if args.len() > 1 {
+            let last_arg = args.last().unwrap();
+            if last_arg == "-n" || last_arg == "--telescope" || last_arg == "-t" {
+                env::current_dir()?
+            } else {
+                let mut dir = env::current_dir()?;
+                for arg in &args[1..] {
+                    if !arg.starts_with('-') {
+                        dir = PathBuf::from(arg);
+                        break;
+                    }
+                }
+                dir
+            }
+        } else {
+            env::current_dir()?
+        };
+        
+        self.validate_directory(&target_dir)?;
+        
+        if telescope_mode {
+            // Output JSON for Telescope
+            self.output_for_telescope(&target_dir)?;
+        } else {
+            // Normal interactive mode with fzf
+            self.interactive_mode(&target_dir)?;
+        }
+        
+        Ok(())
+    }
+    
+    fn output_for_telescope(&self, dir: &Path) -> Result<()> {
+        let blocks = self.scanner.scan_directory(dir)?;
+        
+        if blocks.is_empty() {
+            eprintln!("No code blocks found");
+            return Ok(());
+        }
+        
+        // Output as newline-separated JSON for Telescope to parse
+        for block in blocks {
+            println!("{}", block.to_json()?);
+        }
+        
+        Ok(())
+    }
+    
+    fn interactive_mode(&self, dir: &Path) -> Result<()> {
+        eprintln!("🔍 Scanning directory: {}", dir.display());
+        
+        let blocks = self.scanner.scan_directory(dir)?;
+        
+        if blocks.is_empty() {
+            bail!("No functions, structs, or impl blocks found in directory");
+        }
+        
+        self.print_block_summary(&blocks);
+        
+        // Use fzf for selection
+        let selector = CodeBlockSelector::new();
+        let selected = selector.select_block(&blocks)?;
+        let payload = selected.to_clipboard_payload(&self.config, self.show_line_numbers)?;
+        
+        ClipboardManager::set_clipboard(&payload)?;
+        selected.print_stats()?;
+        
+        eprintln!("\n\x1b[1;32m✓ Code block copied to clipboard!\x1b[0m");
+        if !self.show_line_numbers {
+            eprintln!("\x1b[90mℹ Line numbers omitted (use -n flag or config to show them)\x1b[0m");
+        }
+        
+        Ok(())
+    }
+
+    fn validate_directory(&self, dir: &Path) -> Result<()> {
+        if !dir.exists() {
+            bail!("Directory does not exist: {}", dir.display());
+        }
+        Ok(())
+    }
+
+    fn print_block_summary(&self, blocks: &[CodeBlockInfo]) {
+        eprintln!("✓ Found {} code block(s)", blocks.len());
+        for block in blocks.iter().take(10) {
+            eprintln!("  • {}", block.get_display_string());
+        }
+        if blocks.len() > 10 {
+            eprintln!("  ... and {} more", blocks.len() - 10);
+        }
+    }
+}
+
 struct CodeBlockSelector {
     fzf_command: String,
 }
+
 impl CodeBlockSelector {
     fn new() -> Self {
         Self {
             fzf_command: "fzf".to_string(),
         }
     }
+
     fn is_available(&self) -> bool {
         Command::new(&self.fzf_command)
             .arg("--version")
             .output()
             .is_ok()
     }
+
     fn select_block(&self, blocks: &[CodeBlockInfo]) -> Result<CodeBlockInfo> {
         if !self.is_available() {
             bail!("fzf not found. Please install fzf to select functions/impl blocks");
         }
+
         let preview_lines = self.build_preview_lines(blocks);
         let preview_text = preview_lines.join("\n");
+        
         let mut fzf_child = Command::new(&self.fzf_command)
             .arg("--height")
             .arg("60%")
@@ -575,29 +780,38 @@ impl CodeBlockSelector {
             .stderr(Stdio::piped())
             .spawn()
             .context("Failed to spawn fzf")?;
+        
         {
             let mut stdin = fzf_child.stdin.take().context("Failed to open fzf stdin")?;
             stdin.write_all(preview_text.as_bytes())?;
         }
+
         let output = fzf_child
             .wait_with_output()
             .context("Failed to read fzf output")?;
+        
         if !output.status.success() {
             bail!("No code block selected");
         }
+
         let selected_line = String::from_utf8_lossy(&output.stdout);
         let first_line = selected_line.lines().next().unwrap_or("");
         let parts: Vec<&str> = first_line.split('│').collect();
+        
         if parts.is_empty() {
             bail!("Invalid selection format");
         }
+        
         let idx_str = parts[0].trim();
         let idx: usize = idx_str.parse().unwrap_or(0);
+        
         if idx == 0 || idx > blocks.len() {
             bail!("Invalid selection");
         }
+        
         Ok(blocks[idx - 1].clone())
     }
+
     fn build_preview_lines(&self, blocks: &[CodeBlockInfo]) -> Vec<String> {
         blocks
             .iter()
@@ -616,76 +830,15 @@ impl CodeBlockSelector {
             .collect()
     }
 }
+
 struct ClipboardManager;
+
 impl ClipboardManager {
     fn set_clipboard(content: &str) -> Result<()> {
         set_clipboard(content)
     }
 }
-struct Application {
-    config: UnifiedConfig,
-    scanner: CodeBlockScanner,
-    selector: CodeBlockSelector,
-}
-impl Application {
-    fn new() -> Result<Self> {
-        let config = load_unified_config()?;
-        Ok(Self {
-            config,
-            scanner: CodeBlockScanner::new(),
-            selector: CodeBlockSelector::new(),
-        })
-    }
-    fn run(&self) -> Result<()> {
-        let args: Vec<String> = env::args().skip(1).collect();
-        let target_dir = self.get_target_directory(&args)?;
-        self.validate_directory(&target_dir)?;
-        eprintln!("🔍 Scanning directory: {}", target_dir.display());
-        let blocks = self.scanner.scan_directory(&target_dir)?;
-        if blocks.is_empty() {
-            bail!("No functions, structs, or impl blocks found in directory");
-        }
-        self.print_block_summary(&blocks);
-        let selected = self.selector.select_block(&blocks)?;
-        let payload = selected.to_clipboard_payload(&self.config)?;
-        ClipboardManager::set_clipboard(&payload)?;
-        selected.print_stats()?;
-        eprintln!("\n\x1b[1;32m✓ Code block copied to clipboard!\x1b[0m");
-        Ok(())
-    }
-    fn get_target_directory(&self, args: &[String]) -> Result<PathBuf> {
-        Ok(if args.is_empty() {
-            env::current_dir()?
-        } else {
-            PathBuf::from(&args[0])
-        })
-    }
-    fn validate_directory(&self, dir: &Path) -> Result<()> {
-        if !dir.exists() {
-            bail!("Directory does not exist: {}", dir.display());
-        }
-        Ok(())
-    }
-    fn print_block_summary(&self, blocks: &[CodeBlockInfo]) {
-        eprintln!("✓ Found {} code block(s)", blocks.len());
-        for block in blocks {
-            eprintln!("  • {}", block.get_display_string());
-        }
-        eprintln!("\n\x1b[33mDebug - All found blocks:\x1b[0m");
-        for block in blocks {
-            match block.block_type {
-                CodeBlockType::Function => eprintln!("  Function: {}", block.block_name),
-                CodeBlockType::Impl => eprintln!("  Impl: {}", block.block_name),
-                CodeBlockType::Struct => eprintln!("  Struct: {}", block.block_name),
-            }
-        }
-    }
-}
-fn fn_name_contains(s: &str, pattern: &str) -> bool {
-    s.contains(pattern)
-        && !s.contains(&format!("{}_", pattern))
-        && !s.contains(&format!("{}:", pattern))
-}
+
 fn main() -> Result<()> {
     let app = Application::new()?;
     app.run()

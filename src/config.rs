@@ -1,4 +1,3 @@
-// src/config.rs
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -16,6 +15,8 @@ pub struct UnifiedConfig {
     pub wcl: WclConfig,
     #[serde(default)]
     pub wcf: WcfConfig,
+    #[serde(default)]
+    pub wff: WffConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -55,13 +56,17 @@ pub struct WclConfig {
     pub parallel_processing: bool,
     pub max_threads: usize,
     pub copy_file_contents: bool,
-
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WcfConfig {
     pub auto_format: bool,
     pub show_buffer_preview: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WffConfig {
+    pub show_line_numbers: bool,
 }
 
 impl Default for UnifiedConfig {
@@ -119,6 +124,9 @@ impl Default for UnifiedConfig {
             wcf: WcfConfig {
                 auto_format: true,
                 show_buffer_preview: true,
+            },
+            wff: WffConfig {
+                show_line_numbers: true,
             },
         }
     }
@@ -196,6 +204,8 @@ pub fn show_config() -> Result<()> {
     println!("  [wcf]");
     println!("    auto_format: {}", config.wcf.auto_format);
     println!("    show_buffer_preview: {}", config.wcf.show_buffer_preview);
+    println!("  [wff]");
+    println!("    show_line_numbers: {}", config.wff.show_line_numbers);
     println!();
     println!("  Config file: \x1b[90m{}\x1b[0m", get_config_path().display());
     
@@ -228,6 +238,7 @@ pub fn init_config() -> Result<()> {
     println!("  [wcp] - paste settings");
     println!("  [wcl] - analyzer settings with {} skip patterns", config.wcl.skip_patterns.len());
     println!("  [wcf] - function replacement settings");
+    println!("  [wff] - wff (function finder) settings");
     
     Ok(())
 }
