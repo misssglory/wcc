@@ -1,3 +1,4 @@
+// src/config.rs
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -64,9 +65,23 @@ pub struct WcfConfig {
     pub show_buffer_preview: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WffConfig {
     pub show_line_numbers: bool,
+    pub show_time_in_header: bool,
+    pub use_file_modification_time: bool,
+    pub time_format: String,
+}
+
+impl Default for WffConfig {
+    fn default() -> Self {
+        Self {
+            show_line_numbers: true,
+            show_time_in_header: true,
+            use_file_modification_time: true,
+            time_format: "%H:%M:%S %d.%m.%Y".to_string(),
+        }
+    }
 }
 
 impl Default for UnifiedConfig {
@@ -125,9 +140,7 @@ impl Default for UnifiedConfig {
                 auto_format: true,
                 show_buffer_preview: true,
             },
-            wff: WffConfig {
-                show_line_numbers: true,
-            },
+            wff: WffConfig::default(),
         }
     }
 }
@@ -186,6 +199,7 @@ pub fn show_config() -> Result<()> {
     println!("  [wcl]");
     println!("    max_file_size_kb: {}", config.wcl.max_file_size_kb);
     println!("    max_file_words_to_copy: {}", config.wcl.max_file_words_to_copy);
+    println!("    max_clipboard_bytes: {}", config.wcl.max_clipboard_bytes);
     println!("    skip_patterns: {:?}", config.wcl.skip_patterns);
     println!("    skip_dirs: {:?}", config.wcl.skip_dirs);
     println!("    show_empty_files: {}", config.wcl.show_empty_files);
@@ -206,6 +220,9 @@ pub fn show_config() -> Result<()> {
     println!("    show_buffer_preview: {}", config.wcf.show_buffer_preview);
     println!("  [wff]");
     println!("    show_line_numbers: {}", config.wff.show_line_numbers);
+    println!("    show_time_in_header: {}", config.wff.show_time_in_header);
+    println!("    use_file_modification_time: {}", config.wff.use_file_modification_time);
+    println!("    time_format: {}", config.wff.time_format);
     println!();
     println!("  Config file: \x1b[90m{}\x1b[0m", get_config_path().display());
     
@@ -238,7 +255,7 @@ pub fn init_config() -> Result<()> {
     println!("  [wcp] - paste settings");
     println!("  [wcl] - analyzer settings with {} skip patterns", config.wcl.skip_patterns.len());
     println!("  [wcf] - function replacement settings");
-    println!("  [wff] - wff (function finder) settings");
+    println!("  [wff] - wff (function finder) settings with time and line number options");
     
     Ok(())
 }
