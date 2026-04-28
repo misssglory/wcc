@@ -1,3 +1,4 @@
+// src/bin/wcf.rs
 use anyhow::{bail, Context, Result};
 use similar::{ChangeTag, TextDiff};
 use std::{
@@ -6,19 +7,30 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
-use syn::{parse_file, parse_str, File, ImplItem, Item, ItemFn, Visibility};
+use syn::{
+    parse_file, parse_str, Attribute, File, ImplItem, Item, ItemFn, ItemStruct, Visibility,
+};
 use wcc::common::*;
 use wcc::config::load_unified_config;
+
 #[derive(Debug, Clone)]
-struct FunctionMatch {
+enum CodeBlockType {
+    Function,
+    Struct,
+}
+
+#[derive(Debug, Clone)]
+struct CodeBlockMatch {
     file_path: PathBuf,
-    func_name: String,
-    old_full_function: String,
-    original_vis: Visibility,
+    block_name: String,
+    block_type: CodeBlockType,
+    old_full_block: String,
+    original_vis: Option<Visibility>,
     original_asyncness: Option<syn::token::Async>,
     original_unsafety: Option<syn::token::Unsafe>,
-    original_attrs: Vec<syn::Attribute>,
+    original_attrs: Vec<Attribute>,
 }
+
 fn format_code_with_rustfmt(code: &str, file_path: Option<&Path>) -> Result<String> {
     let temp_dir = tempfile::TempDir::new()?;
     let temp_file = temp_dir.path().join("temp.rs");
@@ -39,7 +51,8 @@ fn format_code_with_rustfmt(code: &str, file_path: Option<&Path>) -> Result<Stri
         Ok(code.to_string())
     }
 }
-fn format_function_with_lines(code: &str, file_path: Option<&Path>) -> Result<String> {
+
+fn format_code_with_lines(code: &str, file_path: Option<&Path>) -> Result<String> {
     let formatted = format_code_with_rustfmt(code, file_path)?;
     let lines: Vec<&str> = formatted.lines().collect();
     let numbered: Vec<String> = lines
@@ -49,9 +62,16 @@ fn format_function_with_lines(code: &str, file_path: Option<&Path>) -> Result<St
         .collect();
     Ok(numbered.join("\n"))
 }
+
 fn generate_formatted_diff(old: &str, new: &str, file_path: Option<&Path>) -> Result<String> {
     let old_formatted = format_code_with_rustfmt(old, file_path)?;
     let new_formatted = format_code_with_rustfmt(new, file_path)?;
+    
+    // Check if diff is empty
+    if old_formatted.trim() == new_formatted.trim() {
+        return Ok(String::new());
+    }
+    
     let diff = TextDiff::from_lines(&old_formatted, &new_formatted);
     let mut result = String::new();
     for change in diff.iter_all_changes() {
@@ -76,30 +96,58 @@ fn generate_formatted_diff(old: &str, new: &str, file_path: Option<&Path>) -> Re
     }
     Ok(result)
 }
-fn print_colored_formatted_diff(old: &str, new: &str, file_path: Option<&Path>) -> Result<()> {
+
+fn print_colored_formatted_diff(old: &str, new: &str, file_path: Option<&Path>) -> Result<bool> {
     let diff = generate_formatted_diff(old, new, file_path)?;
+    if diff.is_empty() {
+        println!("  \x1b[33m⚠ No changes detected (code already matches)\x1b[0m");
+        return Ok(false);
+    }
     print!("{}", diff);
-    Ok(())
+    Ok(true)
 }
-fn parse_clipboard_functions(content: &str) -> Result<Vec<(String, ItemFn)>> {
+
+fn parse_clipboard_blocks(content: &str) -> Result<Vec<(String, CodeBlockType, String)>> {
     let content = content.trim();
-    let mut functions = Vec::new();
+    let mut blocks = Vec::new();
+    
     match parse_file(content) {
         Ok(file) => {
             for item in file.items {
-                if let Item::Fn(item_fn) = item {
-                    let func_name = item_fn.sig.ident.to_string();
-                    functions.push((func_name, item_fn));
+                match item {
+                    Item::Fn(item_fn) => {
+                        let name = item_fn.sig.ident.to_string();
+                        let block_str = quote::quote!(# item_fn).to_string();
+                        blocks.push((name, CodeBlockType::Function, block_str));
+                    }
+                    Item::Struct(item_struct) => {
+                        let name = item_struct.ident.to_string();
+                        let block_str = quote::quote!(# item_struct).to_string();
+                        blocks.push((name, CodeBlockType::Struct, block_str));
+                    }
+                    Item::Impl(item_impl) => {
+                        // Extract individual functions from impl block
+                        for method in item_impl.items {
+                            if let ImplItem::Fn(method_fn) = method {
+                                let name = method_fn.sig.ident.to_string();
+                                let block_str = quote::quote!(# method_fn).to_string();
+                                blocks.push((name, CodeBlockType::Function, block_str));
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
         Err(_) => {
+            // Fallback to string parsing for structs
             let mut pos = 0;
-            while let Some(start_pos) = content[pos..].find("fn ") {
+            while let Some(start_pos) = content[pos..].find("struct ") {
                 let abs_start = pos + start_pos;
                 let mut brace_count = 0;
                 let mut end_pos = abs_start;
                 let mut in_brace = false;
+                
                 for (i, ch) in content[abs_start..].char_indices() {
                     match ch {
                         '{' => {
@@ -116,34 +164,73 @@ fn parse_clipboard_functions(content: &str) -> Result<Vec<(String, ItemFn)>> {
                         _ => {}
                     }
                 }
+                
+                let full_struct = content[abs_start..end_pos].to_string();
+                if let Ok(item_struct) = parse_str::<ItemStruct>(&full_struct) {
+                    let name = item_struct.ident.to_string();
+                    blocks.push((name, CodeBlockType::Struct, full_struct));
+                }
+                pos = end_pos;
+            }
+            
+            // Parse functions
+            let mut pos = 0;
+            while let Some(start_pos) = content[pos..].find("fn ") {
+                let abs_start = pos + start_pos;
+                let mut brace_count = 0;
+                let mut end_pos = abs_start;
+                let mut in_brace = false;
+                
+                for (i, ch) in content[abs_start..].char_indices() {
+                    match ch {
+                        '{' => {
+                            brace_count += 1;
+                            in_brace = true;
+                        }
+                        '}' => {
+                            brace_count -= 1;
+                            if in_brace && brace_count == 0 {
+                                end_pos = abs_start + i + 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                
                 let full_function = content[abs_start..end_pos].to_string();
                 if let Ok(item_fn) = parse_str::<ItemFn>(&full_function) {
-                    let func_name = item_fn.sig.ident.to_string();
-                    functions.push((func_name, item_fn));
+                    let name = item_fn.sig.ident.to_string();
+                    blocks.push((name, CodeBlockType::Function, full_function));
                 }
                 pos = end_pos;
             }
         }
     }
-    if functions.is_empty() {
-        bail!("No valid functions found in clipboard");
+    
+    if blocks.is_empty() {
+        bail!("No valid functions or structs found in clipboard");
     }
-    Ok(functions)
+    
+    Ok(blocks)
 }
-fn find_function_in_file(file_path: &Path, func_name: &str) -> Result<Vec<FunctionMatch>> {
+
+fn find_function_in_file(file_path: &Path, func_name: &str) -> Result<Vec<CodeBlockMatch>> {
     let content = fs::read_to_string(file_path)?;
     let file = parse_file(&content)?;
     let mut matches = Vec::new();
+    
     for item in file.items {
         match item {
             Item::Fn(item_fn) => {
                 if item_fn.sig.ident == func_name {
                     let fn_str = quote::quote!(# item_fn).to_string();
-                    matches.push(FunctionMatch {
+                    matches.push(CodeBlockMatch {
                         file_path: file_path.to_path_buf(),
-                        func_name: func_name.to_string(),
-                        old_full_function: fn_str,
-                        original_vis: item_fn.vis,
+                        block_name: func_name.to_string(),
+                        block_type: CodeBlockType::Function,
+                        old_full_block: fn_str,
+                        original_vis: Some(item_fn.vis),
                         original_asyncness: item_fn.sig.asyncness,
                         original_unsafety: item_fn.sig.unsafety,
                         original_attrs: item_fn.attrs,
@@ -155,11 +242,12 @@ fn find_function_in_file(file_path: &Path, func_name: &str) -> Result<Vec<Functi
                     if let ImplItem::Fn(method_fn) = &method {
                         if method_fn.sig.ident == func_name {
                             let fn_str = quote::quote!(# method_fn).to_string();
-                            matches.push(FunctionMatch {
+                            matches.push(CodeBlockMatch {
                                 file_path: file_path.to_path_buf(),
-                                func_name: func_name.to_string(),
-                                old_full_function: fn_str,
-                                original_vis: method_fn.vis.clone(),
+                                block_name: func_name.to_string(),
+                                block_type: CodeBlockType::Function,
+                                old_full_block: fn_str,
+                                original_vis: Some(method_fn.vis.clone()),
                                 original_asyncness: method_fn.sig.asyncness,
                                 original_unsafety: method_fn.sig.unsafety,
                                 original_attrs: method_fn.attrs.clone(),
@@ -171,50 +259,77 @@ fn find_function_in_file(file_path: &Path, func_name: &str) -> Result<Vec<Functi
             _ => {}
         }
     }
+    
     Ok(matches)
 }
-fn replace_function_in_file(
-    content: &str,
-    func_match: &FunctionMatch,
-    new_item_fn: &ItemFn,
-) -> Result<String> {
-    let mut file: File = parse_file(content)?;
-    let final_vis = if !matches!(func_match.original_vis, Visibility::Public(_)) {
-        if matches!(new_item_fn.vis, Visibility::Public(_)) {
-            new_item_fn.vis.clone()
-        } else {
-            func_match.original_vis.clone()
+
+fn find_struct_in_file(file_path: &Path, struct_name: &str) -> Result<Vec<CodeBlockMatch>> {
+    let content = fs::read_to_string(file_path)?;
+    let file = parse_file(&content)?;
+    let mut matches = Vec::new();
+    
+    for item in file.items {
+        if let Item::Struct(item_struct) = item {
+            if item_struct.ident == struct_name {
+                let struct_str = quote::quote!(# item_struct).to_string();
+                matches.push(CodeBlockMatch {
+                    file_path: file_path.to_path_buf(),
+                    block_name: struct_name.to_string(),
+                    block_type: CodeBlockType::Struct,
+                    old_full_block: struct_str,
+                    original_vis: Some(item_struct.vis),
+                    original_asyncness: None,
+                    original_unsafety: None,
+                    original_attrs: item_struct.attrs,
+                });
+            }
         }
-    } else {
-        func_match.original_vis.clone()
-    };
-    let final_asyncness = if func_match.original_asyncness.is_none() {
-        new_item_fn.sig.asyncness
-    } else {
-        func_match.original_asyncness
-    };
-    let final_unsafety = if func_match.original_unsafety.is_none() {
-        new_item_fn.sig.unsafety
-    } else {
-        func_match.original_unsafety
-    };
-    let mut preserved_sig = new_item_fn.sig.clone();
-    preserved_sig.asyncness = final_asyncness;
-    preserved_sig.unsafety = final_unsafety;
+    }
+    
+    Ok(matches)
+}
+
+fn replace_function_in_file(content: &str, func_match: &CodeBlockMatch, new_block_str: &str) -> Result<String> {
+    let mut file: File = parse_file(content)?;
+    let new_item_fn: ItemFn = parse_str(new_block_str)?;
+    
     for item in &mut file.items {
         match item {
             Item::Fn(item_fn) => {
-                if item_fn.sig.ident == func_match.func_name {
+                if item_fn.sig.ident == func_match.block_name {
                     let mut final_attrs = func_match.original_attrs.clone();
                     for attr in &new_item_fn.attrs {
                         if !final_attrs.contains(attr) {
                             final_attrs.push(attr.clone());
                         }
                     }
+                    
+                    let final_vis = if func_match.original_vis.is_some() {
+                        func_match.original_vis.clone().unwrap()
+                    } else {
+                        new_item_fn.vis.clone()
+                    };
+                    
+                    let final_asyncness = if func_match.original_asyncness.is_some() {
+                        func_match.original_asyncness
+                    } else {
+                        new_item_fn.sig.asyncness
+                    };
+                    
+                    let final_unsafety = if func_match.original_unsafety.is_some() {
+                        func_match.original_unsafety
+                    } else {
+                        new_item_fn.sig.unsafety
+                    };
+                    
+                    let mut preserved_sig = new_item_fn.sig.clone();
+                    preserved_sig.asyncness = final_asyncness;
+                    preserved_sig.unsafety = final_unsafety;
+                    
                     *item_fn = ItemFn {
                         attrs: final_attrs,
-                        vis: final_vis.clone(),
-                        sig: preserved_sig.clone(),
+                        vis: final_vis,
+                        sig: preserved_sig,
                         block: new_item_fn.block.clone(),
                     };
                     break;
@@ -222,32 +337,92 @@ fn replace_function_in_file(
             }
             Item::Impl(item_impl) => {
                 for method in &mut item_impl.items {
-                    match method {
-                        ImplItem::Fn(method_fn) => {
-                            if method_fn.sig.ident == func_match.func_name {
-                                let mut final_attrs = func_match.original_attrs.clone();
-                                for attr in &new_item_fn.attrs {
-                                    if !final_attrs.contains(attr) {
-                                        final_attrs.push(attr.clone());
-                                    }
+                    if let ImplItem::Fn(method_fn) = method {
+                        if method_fn.sig.ident == func_match.block_name {
+                            let mut final_attrs = func_match.original_attrs.clone();
+                            for attr in &new_item_fn.attrs {
+                                if !final_attrs.contains(attr) {
+                                    final_attrs.push(attr.clone());
                                 }
-                                method_fn.attrs = final_attrs;
-                                method_fn.vis = final_vis.clone();
-                                method_fn.sig = preserved_sig.clone();
-                                method_fn.block = (*new_item_fn.block).clone();
-                                break;
                             }
+                            
+                            let final_vis = if func_match.original_vis.is_some() {
+                                func_match.original_vis.clone().unwrap()
+                            } else {
+                                new_item_fn.vis.clone()
+                            };
+                            
+                            let final_asyncness = if func_match.original_asyncness.is_some() {
+                                func_match.original_asyncness
+                            } else {
+                                new_item_fn.sig.asyncness
+                            };
+                            
+                            let final_unsafety = if func_match.original_unsafety.is_some() {
+                                func_match.original_unsafety
+                            } else {
+                                new_item_fn.sig.unsafety
+                            };
+                            
+                            let mut preserved_sig = new_item_fn.sig.clone();
+                            preserved_sig.asyncness = final_asyncness;
+                            preserved_sig.unsafety = final_unsafety;
+                            
+                            method_fn.attrs = final_attrs;
+                            method_fn.vis = final_vis;
+                            method_fn.sig = preserved_sig;
+                            method_fn.block = (*new_item_fn.block).clone();
+                            break;
                         }
-                        _ => {}
                     }
                 }
             }
             _ => {}
         }
     }
+    
     let new_content = prettyplease::unparse(&file);
     Ok(new_content)
 }
+
+fn replace_struct_in_file(content: &str, struct_match: &CodeBlockMatch, new_block_str: &str) -> Result<String> {
+    let mut file: File = parse_file(content)?;
+    let new_item_struct: ItemStruct = parse_str(new_block_str)?;
+    
+    for item in &mut file.items {
+        if let Item::Struct(item_struct) = item {
+            if item_struct.ident == struct_match.block_name {
+                let mut final_attrs = struct_match.original_attrs.clone();
+                for attr in &new_item_struct.attrs {
+                    if !final_attrs.contains(attr) {
+                        final_attrs.push(attr.clone());
+                    }
+                }
+                
+                let final_vis = if struct_match.original_vis.is_some() {
+                    struct_match.original_vis.clone().unwrap()
+                } else {
+                    new_item_struct.vis.clone()
+                };
+                
+                *item_struct = ItemStruct {
+                    attrs: final_attrs,
+                    vis: final_vis,
+                    struct_token: new_item_struct.struct_token,
+                    ident: new_item_struct.ident.clone(),
+                    generics: new_item_struct.generics.clone(),
+                    fields: new_item_struct.fields.clone(),
+                    semi_token: new_item_struct.semi_token,
+                };
+                break;
+            }
+        }
+    }
+    
+    let new_content = prettyplease::unparse(&file);
+    Ok(new_content)
+}
+
 fn run_rustfmt_in_dir(file_path: &Path) -> Result<()> {
     let output = Command::new("rustfmt").arg(file_path).output()?;
     if !output.status.success() {
@@ -258,16 +433,19 @@ fn run_rustfmt_in_dir(file_path: &Path) -> Result<()> {
     }
     Ok(())
 }
+
 fn select_file_with_fzf(files: &[PathBuf]) -> Result<Option<PathBuf>> {
     let fzf_check = Command::new("fzf").arg("--version").output();
     if fzf_check.is_err() {
         bail!("fzf not found");
     }
+    
     let file_list: String = files
         .iter()
         .map(|f| f.display().to_string())
         .collect::<Vec<_>>()
         .join("\n");
+    
     let mut fzf_child = Command::new("fzf")
         .arg("--height")
         .arg("40%")
@@ -277,55 +455,66 @@ fn select_file_with_fzf(files: &[PathBuf]) -> Result<Option<PathBuf>> {
         .stdout(Stdio::piped())
         .spawn()
         .context("Failed to spawn fzf")?;
+    
     {
         let mut stdin = fzf_child.stdin.take().context("Failed to open fzf stdin")?;
         stdin.write_all(file_list.as_bytes())?;
     }
+    
     let output = fzf_child
         .wait_with_output()
         .context("Failed to read fzf output")?;
+    
     if !output.status.success() {
         return Ok(None);
     }
+    
     let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if selected.is_empty() {
         return Ok(None);
     }
+    
     Ok(Some(PathBuf::from(selected)))
 }
-fn scan_directory_for_function(dir: &Path, func_name: &str) -> Result<Vec<FunctionMatch>> {
+
+fn scan_directory_for_block(dir: &Path, block_name: &str, block_type: &CodeBlockType) -> Result<Vec<CodeBlockMatch>> {
     let mut all_matches = Vec::new();
-    fn walk_dir(dir: &Path, func_name: &str, all_matches: &mut Vec<FunctionMatch>) -> Result<()> {
+    
+    fn walk_dir(dir: &Path, block_name: &str, block_type: &CodeBlockType, all_matches: &mut Vec<CodeBlockMatch>) -> Result<()> {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.is_dir() {
-                let skip_dirs = [
-                    "target",
-                    "node_modules",
-                    ".git",
-                    ".cargo",
-                    ".idea",
-                    ".vscode",
-                ];
+                let skip_dirs = ["target", "node_modules", ".git", ".cargo", ".idea", ".vscode"];
                 if let Some(name) = path.file_name() {
                     let name_str = name.to_string_lossy();
                     if skip_dirs.contains(&name_str.as_ref()) {
                         continue;
                     }
                 }
-                walk_dir(&path, func_name, all_matches)?;
+                walk_dir(&path, block_name, block_type, all_matches)?;
             } else if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                if let Ok(matches) = find_function_in_file(&path, func_name) {
-                    all_matches.extend(matches);
+                match block_type {
+                    CodeBlockType::Function => {
+                        if let Ok(matches) = find_function_in_file(&path, block_name) {
+                            all_matches.extend(matches);
+                        }
+                    }
+                    CodeBlockType::Struct => {
+                        if let Ok(matches) = find_struct_in_file(&path, block_name) {
+                            all_matches.extend(matches);
+                        }
+                    }
                 }
             }
         }
         Ok(())
     }
-    walk_dir(dir, func_name, &mut all_matches)?;
+    
+    walk_dir(dir, block_name, block_type, &mut all_matches)?;
     Ok(all_matches)
 }
+
 fn main() -> Result<()> {
     let config = load_unified_config()?;
     let args: Vec<String> = env::args().skip(1).collect();
@@ -334,81 +523,90 @@ fn main() -> Result<()> {
     } else {
         PathBuf::from(&args[0])
     };
+    
     eprintln!("📋 Reading clipboard content...");
     let clipboard_content = get_clipboard_text()?;
-    eprintln!("🔍 Parsing functions from clipboard...");
-    let mut functions = match parse_clipboard_functions(&clipboard_content) {
-        Ok(funcs) => funcs,
+    
+    eprintln!("🔍 Parsing code blocks from clipboard...");
+    let mut blocks = match parse_clipboard_blocks(&clipboard_content) {
+        Ok(blocks) => blocks,
         Err(e) => {
-            eprintln!("⚠ Failed to parse clipboard as Rust functions: {}", e);
-            eprintln!("Make sure the clipboard contains valid Rust function definitions");
+            eprintln!("⚠ Failed to parse clipboard as Rust code: {}", e);
+            eprintln!("Make sure the clipboard contains valid Rust function or struct definitions");
             return Ok(());
         }
     };
-    eprintln!("✓ Found {} function(s):", functions.len());
-    for (name, _) in &functions {
-        eprintln!("  • {}", name);
+    
+    eprintln!("✓ Found {} code block(s):", blocks.len());
+    for (name, block_type, _) in &blocks {
+        let type_str = match block_type {
+            CodeBlockType::Function => "function",
+            CodeBlockType::Struct => "struct",
+        };
+        eprintln!("  • {} ({})", name, type_str);
     }
+    
     let mut processed_count = 0;
     let mut skipped_count = 0;
-    while !functions.is_empty() {
-        let (func_name, new_item_fn) = functions.remove(0);
+    
+    while !blocks.is_empty() {
+        let (block_name, block_type, new_block_str) = blocks.remove(0);
+        let type_str = match block_type {
+            CodeBlockType::Function => "function",
+            CodeBlockType::Struct => "struct",
+        };
+        
         eprintln!("\n\x1b[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
-        eprintln!("📝 Processing function: \x1b[1;33m{}\x1b[0m", func_name);
+        eprintln!("📝 Processing {}: \x1b[1;33m{}\x1b[0m", type_str, block_name);
         eprintln!("\x1b[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
+        
         if config.wcf.show_buffer_preview {
-            let new_function_str = quote::quote!(# new_item_fn).to_string();
-            let formatted = format_function_with_lines(&new_function_str, None)?;
-            println!("\n\x1b[1;36m📋 Function from clipboard:\x1b[0m");
+            let formatted = format_code_with_lines(&new_block_str, None)?;
+            println!("\n\x1b[1;36m📋 Code block from clipboard:\x1b[0m");
             println!("\x1b[90m{}\x1b[0m", "-".repeat(60));
             println!("{}", formatted);
             println!("\x1b[90m{}\x1b[0m", "-".repeat(60));
-            print!("\n❓ Continue with this function? (y/n/skip all): ");
+            
+            print!("\n❓ Continue with this code block? (y/n/skip all): ");
             io::stdout().flush()?;
             let mut input = String::new();
             io::stdin().read_line(&mut input)?;
             match input.trim().to_lowercase().as_str() {
                 "skip all" => {
-                    eprintln!("⚠ Skipping all remaining functions");
+                    eprintln!("⚠ Skipping all remaining blocks");
                     break;
                 }
                 "n" | "no" => {
-                    eprintln!("⚠ Skipping function: {}", func_name);
+                    eprintln!("⚠ Skipping {}: {}", type_str, block_name);
                     skipped_count += 1;
                     continue;
                 }
                 _ => {}
             }
         }
-        eprintln!("\n🔎 Scanning for function '{}'...", func_name);
-        let matches = scan_directory_for_function(&target_dir, &func_name)?;
+        
+        eprintln!("\n🔎 Scanning for {} '{}'...", type_str, block_name);
+        let matches = scan_directory_for_block(&target_dir, &block_name, &block_type)?;
+        
         if matches.is_empty() {
-            eprintln!("⚠ No matches found for '{}', skipping", func_name);
+            eprintln!("⚠ No matches found for '{}', skipping", block_name);
             skipped_count += 1;
             continue;
         }
-        eprintln!("✓ Found {} matching function(s):", matches.len());
+        
+        eprintln!("✓ Found {} matching {} block(s):", matches.len(), type_str);
         for m in &matches {
-            let visibility = match &m.original_vis {
-                Visibility::Public(_) => "pub",
-                _ => "",
-            };
-            let asyncness = if m.original_asyncness.is_some() {
-                "async"
+            if let Some(vis) = &m.original_vis {
+                let vis_str = match vis {
+                    Visibility::Public(_) => "pub",
+                    _ => "",
+                };
+                eprintln!("  • {} (visibility: {})", m.file_path.display(), vis_str);
             } else {
-                ""
-            };
-            let unsafety = if m.original_unsafety.is_some() {
-                "unsafe"
-            } else {
-                ""
-            };
-            eprintln!("  • {}", m.file_path.display());
-            eprintln!(
-                "    Original modifiers: {} {} {}",
-                visibility, asyncness, unsafety
-            );
+                eprintln!("  • {}", m.file_path.display());
+            }
         }
+        
         let selected_matches = if matches.len() > 1 {
             let files: Vec<PathBuf> = matches.iter().map(|m| m.file_path.clone()).collect();
             eprintln!("\n📁 Multiple files found. Select one to modify:");
@@ -418,7 +616,7 @@ fn main() -> Result<()> {
                     .filter(|m| m.file_path == selected_file)
                     .collect(),
                 None => {
-                    eprintln!("⚠ No file selected for '{}', skipping", func_name);
+                    eprintln!("⚠ No file selected for '{}', skipping", block_name);
                     skipped_count += 1;
                     continue;
                 }
@@ -426,64 +624,69 @@ fn main() -> Result<()> {
         } else {
             matches
         };
+        
         let sample_file_path = selected_matches.first().map(|m| m.file_path.as_path());
+        
         eprintln!("\n📝 Preview of changes:");
+        let mut has_changes = false;
         for m in &selected_matches {
             eprintln!("\n  File: {}", m.file_path.display());
-            let new_function_str = quote::quote!(# new_item_fn).to_string();
             eprintln!("\n  \x1b[1;33mDiff (formatted with rustfmt):\x1b[0m");
             println!("\x1b[90m{}\x1b[0m", "-".repeat(60));
-            print_colored_formatted_diff(
-                &m.old_full_function,
-                &new_function_str,
-                sample_file_path,
-            )?;
+            let changed = print_colored_formatted_diff(&m.old_full_block, &new_block_str, sample_file_path)?;
             println!("\x1b[90m{}\x1b[0m", "-".repeat(60));
-            let visibility = match &m.original_vis {
-                Visibility::Public(_) => "pub",
-                _ => "",
-            };
-            let asyncness = if m.original_asyncness.is_some() {
-                "async"
-            } else {
-                ""
-            };
-            eprintln!(
-                "\n  \x1b[1;32m✓ Will preserve modifiers: {} {}\x1b[0m",
-                visibility, asyncness
-            );
+            if changed {
+                has_changes = true;
+            }
         }
+        
+        if !has_changes {
+            eprintln!("\n\x1b[33m⚠ No changes detected for '{}', auto-skipping\x1b[0m", block_name);
+            skipped_count += 1;
+            continue;
+        }
+        
         print!("\n❓ Apply these changes? (y/n): ");
         io::stdout().flush()?;
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
+        
         if input.trim().to_lowercase() != "y" {
-            eprintln!("⚠ Skipping function: {}", func_name);
+            eprintln!("⚠ Skipping {}: {}", type_str, block_name);
             skipped_count += 1;
             continue;
         }
+        
         eprintln!("\n🔄 Applying changes...");
-        for func_match in &selected_matches {
-            let file_path = &func_match.file_path;
+        for block_match in &selected_matches {
+            let file_path = &block_match.file_path;
             let old_content = fs::read_to_string(file_path)?;
             let backup_path = PathBuf::from(format!("{}.bkp", file_path.display()));
             if !backup_path.exists() {
                 fs::write(&backup_path, &old_content)?;
                 eprintln!("  ✓ Created backup: {}", backup_path.display());
             }
-            let new_content = replace_function_in_file(&old_content, func_match, &new_item_fn)?;
+            
+            let new_content = match block_type {
+                CodeBlockType::Function => replace_function_in_file(&old_content, block_match, &new_block_str)?,
+                CodeBlockType::Struct => replace_struct_in_file(&old_content, block_match, &new_block_str)?,
+            };
             fs::write(file_path, &new_content)?;
+            
             if let Err(e) = run_rustfmt_in_dir(file_path) {
                 eprintln!("  Warning: rustfmt failed: {}", e);
             }
             eprintln!("  ✓ Updated: {}", file_path.display());
             processed_count += 1;
         }
-        eprintln!("\n✅ Function '{}' processed successfully!", func_name);
+        
+        eprintln!("\n✅ {} '{}' processed successfully!", type_str, block_name);
     }
+    
     eprintln!("\n\x1b[1;32m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
-    eprintln!("\x1b[1;32m✅ All functions processed!\x1b[0m");
-    eprintln!("  Functions processed: {}", processed_count);
-    eprintln!("  Functions skipped: {}", skipped_count);
+    eprintln!("\x1b[1;32m✅ All code blocks processed!\x1b[0m");
+    eprintln!("  Blocks processed: {}", processed_count);
+    eprintln!("  Blocks skipped: {}", skipped_count);
+    
     Ok(())
 }
