@@ -524,6 +524,9 @@ fn main() -> Result<()> {
         PathBuf::from(&args[0])
     };
     
+    // Track the last selected file across blocks
+    let mut last_selected_file: Option<PathBuf> = None;
+    
     eprintln!("📋 Reading clipboard content...");
     let clipboard_content = get_clipboard_text()?;
     
@@ -586,11 +589,33 @@ fn main() -> Result<()> {
         }
         
         eprintln!("\n🔎 Scanning for {} '{}'...", type_str, block_name);
-        let matches = scan_directory_for_block(&target_dir, &block_name, &block_type)?;
+        let mut matches = scan_directory_for_block(&target_dir, &block_name, &block_type)?;
+        
+        // Filter matches if we have a last selected file and it contains the current block
+        if let Some(ref last_file) = last_selected_file {
+            // Check if the last selected file contains the current block
+            let file_matches: Vec<CodeBlockMatch> = matches
+                .iter()
+                .filter(|m| m.file_path == *last_file)
+                .cloned()
+                .collect();
+            
+            if !file_matches.is_empty() {
+                eprintln!("✓ Using previously selected file: {}", last_file.display());
+                matches = file_matches;
+            } else {
+                eprintln!("ℹ Last selected file ({}) does not contain '{}', will prompt for new selection", 
+                         last_file.display(), block_name);
+                // Flush the remembered file since it doesn't contain this block
+                last_selected_file = None;
+            }
+        }
         
         if matches.is_empty() {
             eprintln!("⚠ No matches found for '{}', skipping", block_name);
             skipped_count += 1;
+            // Flush the remembered file since we couldn't find a match
+            last_selected_file = None;
             continue;
         }
         
@@ -608,20 +633,40 @@ fn main() -> Result<()> {
         }
         
         let selected_matches = if matches.len() > 1 {
-            let files: Vec<PathBuf> = matches.iter().map(|m| m.file_path.clone()).collect();
-            eprintln!("\n📁 Multiple files found. Select one to modify:");
-            match select_file_with_fzf(&files)? {
-                Some(selected_file) => matches
-                    .into_iter()
-                    .filter(|m| m.file_path == selected_file)
-                    .collect(),
-                None => {
-                    eprintln!("⚠ No file selected for '{}', skipping", block_name);
-                    skipped_count += 1;
-                    continue;
+            // Check if we have a remembered file that matches
+            let remembered_match = if let Some(ref last_file) = last_selected_file {
+                matches.iter().find(|m| m.file_path == *last_file).cloned()
+            } else {
+                None
+            };
+            
+            if let Some(matched) = remembered_match {
+                eprintln!("\n📁 Using previously selected file: {}", matched.file_path.display());
+                vec![matched]
+            } else {
+                let files: Vec<PathBuf> = matches.iter().map(|m| m.file_path.clone()).collect();
+                eprintln!("\n📁 Multiple files found. Select one to modify:");
+                match select_file_with_fzf(&files)? {
+                    Some(selected_file) => {
+                        // Remember this file for subsequent blocks
+                        last_selected_file = Some(selected_file.clone());
+                        matches
+                            .into_iter()
+                            .filter(|m| m.file_path == selected_file)
+                            .collect()
+                    }
+                    None => {
+                        eprintln!("⚠ No file selected for '{}', skipping", block_name);
+                        skipped_count += 1;
+                        continue;
+                    }
                 }
             }
         } else {
+            // Single match - remember it for future blocks
+            if matches.len() == 1 {
+                last_selected_file = Some(matches[0].file_path.clone());
+            }
             matches
         };
         
@@ -643,6 +688,7 @@ fn main() -> Result<()> {
         if !has_changes {
             eprintln!("\n\x1b[33m⚠ No changes detected for '{}', auto-skipping\x1b[0m", block_name);
             skipped_count += 1;
+            // Don't flush the remembered file on no changes, just skip this block
             continue;
         }
         
@@ -654,6 +700,8 @@ fn main() -> Result<()> {
         if input.trim().to_lowercase() != "y" {
             eprintln!("⚠ Skipping {}: {}", type_str, block_name);
             skipped_count += 1;
+            // Flush remembered file if user explicitly skipped
+            last_selected_file = None;
             continue;
         }
         
