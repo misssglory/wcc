@@ -302,11 +302,15 @@ impl CodeBlockScanner {
                     modified_datetime,
                 )? {
                     let impl_end_line = impl_info.end_line;
-                    blocks.push(impl_info);
+                    blocks.push(impl_info.clone());
                     let mut j = i + 1;
                     while j < impl_end_line {
                         let inner_line = lines[j];
                         let inner_trimmed = inner_line.trim();
+                        if inner_trimmed.starts_with("//") {
+                            j += 1;
+                            continue;
+                        }
                         if inner_trimmed.contains("fn ") && !inner_trimmed.starts_with("//") {
                             if let Some(func_info) = self.extract_function_block(
                                 &lines,
@@ -331,18 +335,29 @@ impl CodeBlockScanner {
                 }
             }
             if line.contains("fn ") && !line.trim_start().starts_with("//") {
-                if let Some(func_info) = self.extract_function_block(
-                    &lines,
-                    i,
-                    file_path,
-                    &relative_path,
-                    total_lines,
-                    modified_datetime,
-                )? {
-                    let end_line = func_info.end_line;
-                    blocks.push(func_info);
-                    i = end_line;
-                    continue;
+                let mut is_inside_impl = false;
+                for block in &blocks {
+                    if let CodeBlockType::Impl = block.block_type {
+                        if block.start_line <= i + 1 && i + 1 <= block.end_line {
+                            is_inside_impl = true;
+                            break;
+                        }
+                    }
+                }
+                if !is_inside_impl {
+                    if let Some(func_info) = self.extract_function_block(
+                        &lines,
+                        i,
+                        file_path,
+                        &relative_path,
+                        total_lines,
+                        modified_datetime,
+                    )? {
+                        let end_line = func_info.end_line;
+                        blocks.push(func_info);
+                        i = end_line;
+                        continue;
+                    }
                 }
             }
             i += 1;
@@ -434,11 +449,16 @@ impl CodeBlockScanner {
         }
         let after_impl = &trimmed[5..];
         let impl_name = after_impl
-            .split(|c: char| c == '{' || c == 'w')
+            .split(|c: char| c == '{' || c == ' ' || c == '<')
             .next()
             .unwrap_or("")
             .trim()
             .to_string();
+        let impl_name = if impl_name.is_empty() {
+            "impl block".to_string()
+        } else {
+            impl_name
+        };
         let mut brace_count = 0;
         let mut found_brace = false;
         let mut end_line = start_idx + 1;
@@ -459,6 +479,9 @@ impl CodeBlockScanner {
             if found_brace && brace_count == 0 {
                 break;
             }
+        }
+        if !found_brace {
+            return Ok(None);
         }
         let block_body = lines[start_idx..end_line].join("\n");
         Ok(Some(CodeBlockInfo::new(
