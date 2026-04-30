@@ -1,0 +1,1023 @@
+// Code Graph Analysis
+// Generated: 2026-04-30 19:08:12
+// Root: /home/mg/gh/wcc/src/bin
+// ============================================================
+
+// ⚡ FUNCTIONS
+// ============================================================
+
+// imports: wcl.rs
+//   use anyhow::Context;
+//   use anyhow::Result;
+//   use anyhow::bail;
+//   use rayon::prelude::*;
+//   use std::collections::BTreeMap;
+//   use std::env;
+//   use std::fs;
+//   use std::io::Write;
+//   use std::path::Path;
+//   use std::path::PathBuf;
+//   use std::process::Command;
+//   use std::sync::Arc;
+//   use std::sync::atomic::AtomicUsize;
+//   use std::sync::atomic::Ordering;
+//   use std::thread;
+//   use std::time::Duration;
+//   use wcc::common::*;
+//   use wcc::config::load_unified_config;
+
+// wcl.rs
+fn analyze_file (path : & Path, config : & wcc :: WclConfig) -> FileStats {
+    // Calls: detect_classes_in_file, detect_functions_in_file, detect_usage_in_file, should_skip_file
+}
+
+// imports: wcp.rs
+//   use anyhow::Context;
+//   use anyhow::Result;
+//   use anyhow::bail;
+//   use similar::ChangeTag;
+//   use similar::TextDiff;
+//   use std::collections::BTreeMap;
+//   use std::env;
+//   use std::fs;
+//   use std::io::Write;
+//   use std::io::self;
+//   use std::path::Path;
+//   use std::path::PathBuf;
+//   use std::process::Command;
+//   use std::process::Stdio;
+//   use wcc::common::*;
+
+// wcp.rs
+fn backup_path (path : & Path) -> PathBuf {
+}
+
+// imports: wce.rs
+//   use anyhow::Context;
+//   use anyhow::Result;
+//   use regex::Regex;
+//   use std::collections::HashMap;
+//   use std::fs;
+//   use std::io::Write;
+//   use std::io::self;
+//   use std::path::Path;
+//   use std::path::PathBuf;
+//   use syn::ImplItem;
+//   use syn::Item;
+//   use syn::ItemFn;
+//   use syn::Visibility;
+//   use syn::parse_file;
+//   use syn::spanned::Spanned;
+//   use wcc::common::*;
+//   use wcc::config::load_unified_config;
+
+// wce.rs
+fn build_grouped_error_report (groups : & [FunctionErrorGroup]) -> Result < String > {
+}
+
+// imports: wcg.rs
+//   use anyhow::Context;
+//   use anyhow::Result;
+//   use anyhow::bail;
+//   use chrono::Local;
+//   use quote::ToTokens;
+//   use std::collections::BTreeMap;
+//   use std::collections::HashMap;
+//   use std::collections::HashSet;
+//   use std::env;
+//   use std::fs;
+//   use std::path::Path;
+//   use std::path::PathBuf;
+//   use syn::Attribute;
+//   use syn::Field;
+//   use syn::Fields;
+//   use syn::GenericParam;
+//   use syn::Generics;
+//   use syn::ImplItem;
+//   use syn::ItemImpl;
+//   use syn::ItemStruct;
+//   use syn::ItemTrait;
+//   use syn::ReturnType;
+//   use syn::Signature;
+//   use syn::TraitItem;
+//   use syn::TypeParamBound;
+//   use syn::WhereClause;
+//   use syn::parse_file;
+//   use syn::visit::Visit;
+//   use wcc::common::*;
+//   use wcc::config::WcgConfig;
+//   use wcc::config::load_unified_config;
+
+// wcg.rs
+fn calc_clipboard_stats (s : & str) -> ClipboardStats {
+}
+
+// imports: wcu.rs
+//   use anyhow::Context;
+//   use anyhow::Result;
+//   use arboard::Clipboard;
+//   use base64::Engine;
+//   use base64::engine::general_purpose::STANDARD as B64;
+//   use chrono::DateTime;
+//   use chrono::Utc;
+//   use clap::Parser;
+//   use clap::Subcommand;
+//   use crossterm::cursor::MoveToColumn;
+//   use crossterm::event::Event;
+//   use crossterm::event::KeyCode;
+//   use crossterm::event::self;
+//   use crossterm::execute;
+//   use crossterm::style::Color as TermColor;
+//   use crossterm::style::Print;
+//   use crossterm::style::ResetColor;
+//   use crossterm::style::SetForegroundColor;
+//   use crossterm::terminal::Clear;
+//   use crossterm::terminal::ClearType;
+//   use crossterm::terminal::EnterAlternateScreen;
+//   use crossterm::terminal::LeaveAlternateScreen;
+//   use crossterm::terminal::disable_raw_mode;
+//   use crossterm::terminal::enable_raw_mode;
+//   use flate2::Compression;
+//   use flate2::read::GzDecoder;
+//   use flate2::write::GzEncoder;
+//   use ratatui::Frame;
+//   use ratatui::Terminal;
+//   use ratatui::backend::CrosstermBackend;
+//   use ratatui::layout::Constraint;
+//   use ratatui::layout::Direction;
+//   use ratatui::layout::Layout;
+//   use ratatui::style::Color;
+//   use ratatui::style::Style;
+//   use ratatui::widgets::Block;
+//   use ratatui::widgets::Borders;
+//   use ratatui::widgets::Cell;
+//   use ratatui::widgets::Clear as TuiClear;
+//   use ratatui::widgets::Paragraph;
+//   use ratatui::widgets::Row;
+//   use ratatui::widgets::Table;
+//   use ratatui::widgets::Wrap;
+//   use serde::Deserialize;
+//   use serde::Serialize;
+//   use signal_hook::consts::signal::SIGINT;
+//   use signal_hook::consts::signal::SIGTERM;
+//   use signal_hook::flag;
+//   use std::fs;
+//   use std::io::BufRead;
+//   use std::io::BufReader;
+//   use std::io::IsTerminal;
+//   use std::io::Read;
+//   use std::io::Write;
+//   use std::io::self;
+//   use std::path::Path;
+//   use std::path::PathBuf;
+//   use std::process::Child;
+//   use std::process::Command;
+//   use std::process::Stdio;
+//   use std::sync::Arc;
+//   use std::sync::atomic::AtomicBool;
+//   use std::sync::atomic::Ordering;
+//   use std::sync::mpsc::Receiver;
+//   use std::sync::mpsc::Sender;
+//   use std::sync::mpsc::self;
+//   use std::thread;
+//   use std::time::Duration;
+//   use std::time::Instant;
+//   use thiserror::Error;
+
+// wcu.rs
+fn clear_cli_status_line () -> Result < () > {
+}
+
+// wcl.rs
+fn collect_paths (dir : & Path, paths : & mut Vec < PathBuf >, config : & wcc :: WclConfig) -> Result < () > {
+    // Calls: collect_paths, should_skip_dir
+}
+
+// wcg.rs
+fn collect_use_tree (prefix : String, tree : & syn :: UseTree, out : & mut Vec < ImportInfo >) {
+    // Calls: collect_use_tree
+}
+
+// wcu.rs
+fn compress_if_needed (s : & str, threshold : usize) -> Result < Option < String > > {
+}
+
+// wcu.rs
+fn decompress_b64 (s : & str) -> Result < String > {
+}
+
+// wcp.rs
+fn deduce_filename_from_content (content : & str) -> Option < String > {
+}
+
+// wcl.rs
+fn detect_classes_in_file (content : & str, ext : & str, config : & wcc :: WclConfig) -> Vec < ClassInfo > {
+    // Calls: detect_functions_in_file, extract_class_name, extract_function_body
+}
+
+// wcp.rs
+fn detect_function_name (line : & str) -> Option < String > {
+}
+
+// wcl.rs
+fn detect_functions_in_file (content : & str, ext : & str, config : & wcc :: WclConfig) -> Vec < FunctionInfo > {
+    // Calls: extract_arrow_function_name, extract_c_function_name, extract_function_body, extract_function_name
+}
+
+// wcl.rs
+fn detect_usage_in_file (content : & str, functions : & [FunctionInfo], classes : & [ClassInfo]) -> BTreeMap < String , usize > {
+}
+
+// wcp.rs
+fn diff_stats (old : & str, new : & str) -> DiffStats {
+}
+
+// wcu.rs
+fn draw_cli_status (command : & [String], out : & StreamTail, err : & StreamTail, started : Instant) -> Result < () > {
+}
+
+// wcu.rs
+fn draw_ui (f : & mut Frame, state : & TuiState, command : & [String], out : & StreamTail, err : & StreamTail, started : Instant) {
+}
+
+// wcl.rs
+fn extract_arrow_function_name (line : & str) -> Option < String > {
+}
+
+// wcl.rs
+fn extract_c_function_name (line : & str) -> Option < String > {
+}
+
+// wcl.rs
+fn extract_class_name (line : & str, keyword : & str) -> Option < String > {
+}
+
+// wce.rs
+fn extract_code_snippet (file_path : & Path, line : usize) -> Option < String > {
+}
+
+// imports: wcn.rs
+//   use anyhow::Context;
+//   use anyhow::Result;
+//   use anyhow::bail;
+//   use chrono::DateTime;
+//   use chrono::Local;
+//   use std::env;
+//   use std::fs;
+//   use std::io::Write;
+//   use std::path::Path;
+//   use std::path::PathBuf;
+//   use std::process::Command;
+//   use std::process::Stdio;
+//   use wcc::common::*;
+//   use wcc::config::load_unified_config;
+
+// wcn.rs
+fn extract_content (content : & str, args : & Args, path : & Path) -> Result < String > {
+    // Calls: extract_function
+}
+
+// wcn.rs
+fn extract_function (content : & str, func_name : & str, ext : & str) -> Result < String > {
+    // Calls: find_function_end
+}
+
+// wcl.rs
+fn extract_function_body (lines : & [& str], start_idx : usize, ext : & str) -> usize {
+}
+
+// wcl.rs
+fn extract_function_name (line : & str, keyword : & str) -> Option < String > {
+}
+
+// wcn.rs
+fn find_function_end (lines : & [& str], start : usize, ext : & str) -> usize {
+}
+
+// wce.rs
+fn find_function_end_syn (lines : & [& str], start_line : usize) -> usize {
+}
+
+// imports: wcf.rs
+//   use anyhow::Context;
+//   use anyhow::Result;
+//   use anyhow::bail;
+//   use similar::ChangeTag;
+//   use similar::TextDiff;
+//   use std::env;
+//   use std::fs;
+//   use std::io::Write;
+//   use std::io::self;
+//   use std::path::Path;
+//   use std::path::PathBuf;
+//   use std::process::Command;
+//   use std::process::Stdio;
+//   use syn::Attribute;
+//   use syn::File;
+//   use syn::ImplItem;
+//   use syn::Item;
+//   use syn::ItemFn;
+//   use syn::ItemStruct;
+//   use syn::Visibility;
+//   use syn::parse_file;
+//   use syn::parse_str;
+//   use wcc::common::*;
+//   use wcc::config::load_unified_config;
+
+// wcf.rs
+fn find_function_in_file (file_path : & Path, func_name : & str) -> Result < Vec < CodeBlockMatch > > {
+}
+
+// wce.rs
+fn find_function_with_syn (file_path : & Path, line : usize) -> Option < (String , String , usize , usize , Option < String > , bool) > {
+    // Calls: find_function_end_syn
+}
+
+// wcf.rs
+fn find_struct_in_file (file_path : & Path, struct_name : & str) -> Result < Vec < CodeBlockMatch > > {
+}
+
+// wcf.rs
+fn format_code_with_lines (code : & str, file_path : Option < & Path >) -> Result < String > {
+    // Calls: format_code_with_rustfmt
+}
+
+// wcf.rs
+fn format_code_with_rustfmt (code : & str, file_path : Option < & Path >) -> Result < String > {
+}
+
+// wcl.rs
+fn format_file_contents_for_clipboard (stats : & DirectoryStats, root : & Path, config : & wcc :: WclConfig) -> String {
+    // Calls: select_files_for_clipboard
+}
+
+// wcl.rs
+fn format_report (stats : & DirectoryStats, root : & Path, config : & wcc :: WclConfig) -> String {
+    // Calls: get_consistent_color
+}
+
+// wcp.rs
+fn function_diff_stats (old : & str, new : & str) -> BTreeMap < String , DiffStats > {
+    // Calls: map_lines_to_function
+}
+
+// wcf.rs
+fn generate_formatted_diff (old : & str, new : & str, file_path : Option < & Path >) -> Result < String > {
+    // Calls: format_code_with_rustfmt
+}
+
+// wcl.rs
+fn get_consistent_color (filename : & str) -> String {
+    // Calls: hsl_to_rgb
+}
+
+// wcp.rs
+fn get_user_filename () -> Result < String > {
+}
+
+// wce.rs
+fn group_errors_by_function (errors : & [ErrorInfo]) -> Vec < FunctionErrorGroup > {
+}
+
+// wcn.rs
+fn header_present (content : & str, filename : & str) -> bool {
+}
+
+// wcu.rs
+fn history_files (dir : & Path) -> Result < Vec < PathBuf > > {
+}
+
+// wcu.rs
+fn history_path_for (dir : & Path, entry : & HistoryEntry) -> PathBuf {
+}
+
+// wcl.rs
+fn hsl_to_rgb (h : f64, s : f64, l : f64) -> (u8 , u8 , u8) {
+}
+
+// wcg.rs
+fn import_matches_call (import : & ImportInfo, call : & str) -> bool {
+}
+
+// wcg.rs
+fn is_ignored_call (name : & str) -> bool {
+}
+
+// wcg.rs
+fn last_segment (path : & syn :: Path) -> String {
+}
+
+// wcu.rs
+fn load_config () -> Result < Config > {
+}
+
+// wcu.rs
+fn load_history (dir : & Path) -> Result < Vec < HistoryEntry > > {
+    // Calls: history_files
+}
+
+// imports: wff.rs
+//   use anyhow::Context;
+//   use anyhow::Result;
+//   use anyhow::bail;
+//   use chrono::DateTime;
+//   use chrono::Local;
+//   use std::env;
+//   use std::fs;
+//   use std::io::Write;
+//   use std::path::Path;
+//   use std::path::PathBuf;
+//   use std::process::Command;
+//   use std::process::Stdio;
+//   use wcc::common::*;
+//   use wcc::config::UnifiedConfig;
+//   use wcc::config::load_unified_config;
+
+// wff.rs
+fn main () -> Result < () > {
+    // Calls: run
+}
+
+// wcp.rs
+fn map_lines_to_function (src : & str) -> BTreeMap < usize , String > {
+    // Calls: detect_function_name
+}
+
+// wcn.rs
+fn parse_args () -> Result < Args > {
+}
+
+// wce.rs
+fn parse_cargo_errors (content : & str) -> Result < Vec < ErrorInfo > > {
+    // Calls: extract_code_snippet, find_function_with_syn
+}
+
+// wcf.rs
+fn parse_clipboard_blocks (content : & str) -> Result < Vec < (String , CodeBlockType , String) > > {
+}
+
+// wcg.rs
+fn path_to_string (path : & syn :: Path) -> String {
+}
+
+// wcf.rs
+fn print_colored_formatted_diff (old : & str, new : & str, file_path : Option < & Path >) -> Result < bool > {
+    // Calls: generate_formatted_diff
+}
+
+// wcu.rs
+fn print_final_stats (command : & [String], out : & StreamTail, err : & StreamTail, started : Instant) {
+}
+
+// wcg.rs
+fn qualify_call_from_import (import : & ImportInfo, call : & str) -> String {
+}
+
+// wcf.rs
+fn replace_function_in_file (content : & str, func_match : & CodeBlockMatch, new_block_str : & str) -> Result < String > {
+}
+
+// wcf.rs
+fn replace_struct_in_file (content : & str, struct_match : & CodeBlockMatch, new_block_str : & str) -> Result < String > {
+}
+
+// wcu.rs
+fn run_cli_loop (command : & [String], child : & mut Child, rx : Receiver < Msg >, out : & mut StreamTail, err : & mut StreamTail, started : Instant, term : & Arc < AtomicBool >, retain : & RetainPolicy, show_live_stats : bool) -> Result < () > {
+    // Calls: clear_cli_status_line, draw_cli_status
+}
+
+// wcu.rs
+fn run_command (command : Vec < String >, cfg : & Config, tui : bool) -> Result < HistoryEntry > {
+    // Calls: clear_cli_status_line, compress_if_needed, print_final_stats, run_cli_loop, run_tui_loop, save_history, set_clipboard, spawn_reader, spawn_stdin_forwarder
+}
+
+// wcf.rs
+fn run_rustfmt_in_dir (file_path : & Path) -> Result < () > {
+}
+
+// wcu.rs
+fn run_tui_loop (command : & [String], child : & mut Child, rx : Receiver < Msg >, out : & mut StreamTail, err : & mut StreamTail, started : Instant, term : & Arc < AtomicBool >, cfg : & Config) -> Result < () > {
+    // Calls: decompress_b64, draw_ui, history_path_for, load_history, set_clipboard
+}
+
+// wcu.rs
+fn save_history (cfg : & Config, entry : & HistoryEntry) -> Result < () > {
+    // Calls: history_path_for
+}
+
+// wcf.rs
+fn scan_directory_for_block (dir : & Path, block_name : & str, block_type : & CodeBlockType) -> Result < Vec < CodeBlockMatch > > {
+    // Calls: find_function_in_file, find_struct_in_file, walk_dir
+}
+
+// wcf.rs
+fn select_file_with_fzf (files : & [PathBuf]) -> Result < Option < PathBuf > > {
+}
+
+// wcl.rs
+fn select_files_for_clipboard fn select_files_for_clipboard < 'a > (stats : & 'a DirectoryStats , _root : & Path , max_bytes : usize ,) -> Vec < & 'a FileStats > . generics (stats : & 'a DirectoryStats, _root : & Path, max_bytes : usize) -> Vec < & 'a FileStats > {
+}
+
+// wcp.rs
+fn select_path_with_fzf () -> Result < PathBuf > {
+    // Calls: get_user_filename
+}
+
+// wcl.rs
+fn set_clipboard_content (content : & str) -> Result < () > {
+}
+
+// wcl.rs
+fn should_skip_dir (path : & Path, config : & wcc :: WclConfig) -> bool {
+}
+
+// wcl.rs
+fn should_skip_file (path : & Path, config : & wcc :: WclConfig) -> bool {
+}
+
+// wcu.rs
+fn spawn_reader fn spawn_reader < R : io :: Read + Send + 'static > (reader : R , tx : Sender < Msg > , is_err : bool) . generics (reader : R, tx : Sender < Msg >, is_err : bool) {
+}
+
+// wcu.rs
+fn spawn_stdin_forwarder (mut child_stdin : std :: process :: ChildStdin) {
+}
+
+// wcu.rs
+fn trim_tail (input : & str, retain : & RetainPolicy) -> String {
+}
+
+// wcf.rs
+fn walk_dir (dir : & Path, block_name : & str, block_type : & CodeBlockType, all_matches : & mut Vec < CodeBlockMatch >) -> Result < () > {
+    // Calls: find_function_in_file, find_struct_in_file, walk_dir
+}
+
+// 🏭 IMPLEMENTATIONS
+// ============================================================
+
+// wff.rs
+impl Application
+{
+    fn new () -> Result < Self >;
+        // Calls: as_str, env::args, load_unified_config
+    fn run (&self) -> Result < () >;
+        // Calls: env::args, env::current_dir, interactive_mode, last, output_for_telescope, validate_directory
+    fn output_for_telescope (&self, dir : & Path) -> Result < () >;
+        // Calls: scan_directory
+    fn interactive_mode (&self, dir : & Path) -> Result < () >;
+        // Calls: ClipboardManager::set_clipboard, print_block_summary, print_stats, scan_directory, select_block, to_clipboard_payload
+    fn validate_directory (&self, dir : & Path) -> Result < () >;
+        // Calls: exists
+    fn print_block_summary (&self, blocks : & [CodeBlockInfo]);
+}
+
+// wff.rs
+impl ClipboardManager
+{
+    fn set_clipboard (content : & str) -> Result < () >;
+        // Calls: set_clipboard
+}
+
+// wff.rs
+impl CodeBlockInfo
+{
+    fn new (file_path : PathBuf, relative_path : PathBuf, block_name : String, block_body : String, start_line : usize, end_line : usize, file_lines : usize, file_modified : Option < DateTime < Local > >, block_type : CodeBlockType, visibility : String, asyncness : bool) -> Self;
+    fn get_modifier_string (&self) -> String;
+    fn get_type_icon (&self) -> & 'static str;
+    fn get_type_name (&self) -> & 'static str;
+    fn get_telescope_entry (&self) -> String;
+    fn get_display_string (&self) -> String;
+    fn format_header (&self, config : & UnifiedConfig, show_line_numbers : bool) -> Result < String >;
+        // Calls: Local::now, and_then, extension, format, to_str
+    fn add_line_numbers_to_body (&self) -> String;
+        // Calls: floor, log10
+    fn print_stats (&self) -> Result < () >;
+        // Calls: calc_stats
+    fn to_clipboard_payload (&self, config : & UnifiedConfig, show_line_numbers : bool) -> Result < String >;
+        // Calls: add_line_numbers_to_body, format_header
+    fn to_json (&self) -> Result < String >;
+}
+
+// wff.rs
+impl CodeBlockScanner
+{
+    fn new () -> Self;
+    fn scan_directory (&self, dir : & Path) -> Result < Vec < CodeBlockInfo > >;
+        // Calls: walk_directory
+    fn walk_directory (&self, dir : & Path, blocks : & mut Vec < CodeBlockInfo >) -> Result < () >;
+        // Calls: extend, file_name, find_blocks_in_file, fs::read_dir, is_dir, is_rust_file, path, to_string_lossy, walk_directory
+    fn is_rust_file (&self, path : & Path) -> bool;
+        // Calls: and_then, extension, is_file, to_str
+    fn find_blocks_in_file (&self, file_path : & Path) -> Result < Vec < CodeBlockInfo > >;
+        // Calls: env::current_dir, extract_function_block, extract_impl_block, extract_struct_block, fs::metadata, fs::read_to_string, modified, strip_prefix, to_path_buf
+    fn extract_struct_block (&self, lines : & [& str], start_idx : usize, file_path : & Path, relative_path : & PathBuf, total_lines : usize, modified_datetime : DateTime < Local >) -> Result < Option < CodeBlockInfo > >;
+        // Calls: is_alphanumeric, next, to_path_buf
+    fn extract_impl_block (&self, lines : & [& str], start_idx : usize, file_path : & Path, relative_path : & PathBuf, total_lines : usize, modified_datetime : DateTime < Local >) -> Result < Option < CodeBlockInfo > >;
+        // Calls: next, to_path_buf
+    fn extract_function_block (&self, lines : & [& str], start_idx : usize, file_path : & Path, relative_path : & PathBuf, total_lines : usize, modified_datetime : DateTime < Local >) -> Result < Option < CodeBlockInfo > >;
+        // Calls: is_alphanumeric, next, nth, to_path_buf
+}
+
+// wff.rs
+impl CodeBlockSelector
+{
+    fn new () -> Self;
+    fn is_available (&self) -> bool;
+        // Calls: arg, is_ok, output
+    fn select_block (&self, blocks : & [CodeBlockInfo]) -> Result < CodeBlockInfo >;
+        // Calls: Stdio::piped, String::from_utf8_lossy, arg, as_bytes, build_preview_lines, context, is_available, next, parse, spawn, stderr, stdin, stdout, success, wait_with_output, write_all
+    fn build_preview_lines (&self, blocks : & [CodeBlockInfo]) -> Vec < String >;
+}
+
+// wcg.rs
+impl CodeGraph
+{
+    fn add_struct (&mut self, struct_info : StructInfo);
+    fn add_function (&mut self, func_info : FunctionInfo);
+    fn add_impl (&mut self, impl_info : ImplInfo);
+    fn add_trait (&mut self, trait_info : TraitInfo);
+    fn resolve_imported_call (&self, caller : & FunctionInfo, call : & str) -> Option < String >;
+        // Calls: contains_key, import_matches_call, qualify_call_from_import
+    fn resolve_calls (&mut self);
+        // Calls: clear, contains_key, is_ignored_call, or_default, resolve_imported_call
+    fn add_import (&mut self, path : PathBuf, import : ImportInfo);
+        // Calls: or_default
+    fn render_file_imports (&self, path : & Path, root : & Path) -> String;
+        // Calls: dedup, sort, strip_prefix
+}
+
+// wcg.rs
+impl CodeGraphScanner
+{
+    fn new () -> Self;
+    fn scan_directory (&self, dir : & Path) -> Result < CodeGraph >;
+        // Calls: resolve_calls, walk_directory
+    fn walk_directory (&self, dir : & Path, graph : & mut CodeGraph) -> Result < () >;
+        // Calls: analyze_file, file_name, fs::read_dir, is_dir, is_rust_file, merge_graphs, path, to_string_lossy, walk_directory
+    fn is_rust_file (&self, path : & Path) -> bool;
+        // Calls: and_then, extension, is_file, to_str
+    fn analyze_file (&self, file_path : & Path) -> Result < CodeGraph >;
+        // Calls: fs::read_to_string, parse_file, to_path_buf, visit_file
+    fn merge_graphs (&self, target : & mut CodeGraph, source : CodeGraph);
+        // Calls: extend, or_default
+}
+
+// wcg.rs
+impl<ast> Visit < 'ast > for CodeGraphVisitor
+{
+    fn visit_item_fn (&mut self, item_fn : & 'ast syn :: ItemFn);
+        // Calls: add_function, extract_function_calls, format_signature, get_attributes, get_visibility, parse_generics, parse_where_clause, syn::visit::visit_item_fn, to_token_stream
+    fn visit_item_impl (&mut self, item_impl : & 'ast ItemImpl);
+        // Calls: add_function, add_impl, extract_function_calls, format_signature, get_attributes, get_visibility, parse_generics, parse_where_clause, syn::visit::visit_item_impl, to_token_stream, unwrap_or_default
+    fn visit_item_use (&mut self, item_use : & 'ast syn :: ItemUse);
+        // Calls: add_import, collect_use_tree, syn::visit::visit_item_use
+}
+
+// wcu.rs
+impl Default for Config
+{
+    fn default () -> Self;
+        // Calls: dirs::home_dir
+}
+
+// wcg.rs
+impl<a> Visit < 'a > for FunctionCallVisitor < 'a >
+{
+    fn visit_expr_call (&mut self, expr_call : & 'a syn :: ExprCall);
+        // Calls: extract_call_path, syn::visit::visit_expr_call
+    fn visit_expr_method_call (&mut self, method_call : & 'a syn :: ExprMethodCall);
+        // Calls: syn::visit::visit_expr_method_call
+}
+
+// wcu.rs
+impl StreamTail
+{
+    fn new () -> Self;
+    fn push (&mut self, chunk : & str, retain : & RetainPolicy);
+        // Calls: as_bytes, trim_tail
+}
+
+// ❓ UNRESOLVED FUNCTION CALLS
+// ============================================================
+
+// add_import calls:
+//   - or_default
+
+// analyze_file calls:
+//   - calc_stats
+
+// backup_path calls:
+//   - as_os_str
+//   - to_os_string
+
+// calc_clipboard_stats calls:
+//   - as_bytes
+
+// clear_cli_status_line calls:
+//   - flush
+
+// collect_paths calls:
+//   - is_dir
+//   - is_file
+
+// compress_if_needed calls:
+//   - as_bytes
+//   - encode
+//   - finish
+//   - write_all
+
+// decompress_b64 calls:
+//   - decode
+//   - read_to_string
+
+// detect_classes_in_file calls:
+//   - calc_stats
+
+// detect_function_name calls:
+//   - is_alphanumeric
+
+// detect_functions_in_file calls:
+//   - calc_stats
+
+// detect_usage_in_file calls:
+//   - matches
+
+// diff_stats calls:
+//   - TextDiff::from_lines
+//   - iter_all_changes
+//   - tag
+
+// draw_cli_status calls:
+//   - flush
+
+// draw_ui calls:
+//   - Constraint::Length
+//   - Constraint::Min
+//   - Constraint::Percentage
+//   - block
+//   - borders
+//   - constraints
+//   - direction
+//   - fg
+//   - header
+//   - render_widget
+//   - size
+//   - style
+//   - title
+//   - widths
+//   - wrap
+
+// extract_arrow_function_name calls:
+//   - is_alphanumeric
+
+// extract_c_function_name calls:
+//   - is_alphanumeric
+
+// extract_class_name calls:
+//   - is_alphanumeric
+
+// extract_function calls:
+//   - is_match
+//   - regex_escape
+
+// extract_function_block calls:
+//   - is_alphanumeric
+
+// extract_function_calls calls:
+//   - rsplit
+//   - visit_block
+
+// extract_function_name calls:
+//   - is_alphanumeric
+
+// extract_struct_block calls:
+//   - is_alphanumeric
+
+// find_blocks_in_file calls:
+//   - env::current_dir
+//   - modified
+
+// find_function_with_syn calls:
+//   - span
+//   - start
+
+// format_code_with_rustfmt calls:
+//   - arg
+//   - current_dir
+//   - fs::write
+//   - parent
+
+// format_file_contents_for_clipboard calls:
+//   - std::ptr::eq
+
+// format_header calls:
+//   - format
+
+// format_report calls:
+//   - sort_by_key
+
+// function_diff_stats calls:
+//   - TextDiff::from_lines
+//   - iter_all_changes
+//   - or_default
+//   - retain
+//   - tag
+
+// generate_formatted_diff calls:
+//   - TextDiff::from_lines
+//   - iter_all_changes
+//   - tag
+
+// get_consistent_color calls:
+//   - wrapping_add
+//   - wrapping_mul
+
+// get_user_filename calls:
+//   - flush
+//   - read_line
+//   - to_lowercase
+
+// group_errors_by_function calls:
+//   - into_values
+//   - sort_by_key
+
+// history_files calls:
+//   - reverse
+
+// hsl_to_rgb calls:
+//   - abs
+
+// interactive_mode calls:
+//   - ClipboardManager::set_clipboard
+
+// is_available calls:
+//   - arg
+
+// is_ignored_call calls:
+//   - rsplit
+
+// is_rust_file calls:
+//   - is_file
+
+// load_config calls:
+//   - dirs::config_dir
+//   - fs::create_dir_all
+//   - fs::write
+//   - parent
+//   - toml::from_str
+//   - toml::to_string_pretty
+
+// merge_graphs calls:
+//   - or_default
+
+// parse_args calls:
+//   - parse
+
+// parse_cargo_errors calls:
+//   - captures
+//   - parse
+
+// parse_clipboard_blocks calls:
+//   - char_indices
+
+// path_to_string calls:
+//   - to_token_stream
+
+// print_stats calls:
+//   - calc_stats
+
+// push calls:
+//   - as_bytes
+
+// render_file_imports calls:
+//   - dedup
+
+// resolve_calls calls:
+//   - clear
+//   - contains_key
+//   - or_default
+
+// resolve_imported_call calls:
+//   - contains_key
+
+// run calls:
+//   - env::current_dir
+
+// run_cli_loop calls:
+//   - Duration::from_millis
+//   - flush
+//   - kill
+//   - thread::sleep
+//   - try_recv
+//   - try_wait
+
+// run_command calls:
+//   - is_terminal
+
+// run_rustfmt_in_dir calls:
+//   - String::from_utf8_lossy
+//   - arg
+
+// run_tui_loop calls:
+//   - Duration::from_millis
+//   - disable_raw_mode
+//   - draw
+//   - enable_raw_mode
+//   - event::poll
+//   - event::read
+//   - fs::remove_file
+//   - kill
+//   - show_cursor
+//   - try_recv
+//   - try_wait
+
+// save_history calls:
+//   - fs::create_dir_all
+//   - fs::write
+//   - serde_json::to_vec_pretty
+
+// scan_directory_for_block calls:
+//   - is_dir
+//   - is_file
+
+// select_block calls:
+//   - String::from_utf8_lossy
+//   - arg
+//   - as_bytes
+//   - parse
+//   - write_all
+
+// select_file_with_fzf calls:
+//   - String::from_utf8_lossy
+//   - arg
+//   - as_bytes
+//   - write_all
+
+// select_files_for_clipboard calls:
+//   - sort_by_key
+
+// select_path_with_fzf calls:
+//   - String::from_utf8_lossy
+//   - arg
+//   - as_bytes
+//   - eq_ignore_ascii_case
+//   - first
+//   - flush
+//   - read_line
+//   - write_all
+
+// set_clipboard_content calls:
+//   - Duration::from_millis
+//   - arg
+//   - as_bytes
+//   - flush
+//   - set_text
+//   - std::env::var_os
+//   - std::process::Stdio::null
+//   - std::process::Stdio::piped
+//   - thread::sleep
+//   - write_all
+
+// should_skip_file calls:
+//   - fs::read
+
+// spawn_reader calls:
+//   - Msg::Stderr
+//   - Msg::Stdout
+//   - String::from_utf8_lossy
+//   - read_until
+//   - send
+
+// spawn_stdin_forwarder calls:
+//   - flush
+//   - read
+//   - write_all
+
+// trim_tail calls:
+//   - String::from_utf8_lossy
+//   - as_bytes
+
+// visit_expr_call calls:
+//   - syn::visit::visit_expr_call
+
+// visit_expr_method_call calls:
+//   - syn::visit::visit_expr_method_call
+
+// visit_item_fn calls:
+//   - syn::visit::visit_item_fn
+//   - to_token_stream
+
+// visit_item_impl calls:
+//   - syn::visit::visit_item_impl
+//   - to_token_stream
+
+// visit_item_use calls:
+//   - syn::visit::visit_item_use
+
+// walk_dir calls:
+//   - is_dir
+//   - is_file
+
+// walk_directory calls:
+//   - is_dir
+

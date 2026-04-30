@@ -551,6 +551,14 @@ impl<'ast> Visit<'ast> for CodeGraphVisitor {
         self.current_impl_target = old_target;
         syn::visit::visit_item_impl(self, item_impl);
     }
+    fn visit_item_use(&mut self, item_use: &'ast syn::ItemUse) {
+        let mut imports = Vec::new();
+        collect_use_tree(String::new(), &item_use.tree, &mut imports);
+        for import in imports {
+            self.graph.add_import(self.current_file.clone(), import);
+        }
+        syn::visit::visit_item_use(self, item_use);
+    }
 }
 struct CodeGraphScanner {
     skip_dirs: Vec<String>,
@@ -624,6 +632,14 @@ impl CodeGraphScanner {
         for (name, trait_info) in source.traits {
             target.traits.insert(name, trait_info);
         }
+        for (path, file_imports) in source.file_imports {
+            target
+                .file_imports
+                .entry(path)
+                .or_default()
+                .imports
+                .extend(file_imports.imports);
+        }
     }
 }
 #[derive(Debug, Clone, Copy)]
@@ -689,12 +705,12 @@ impl Application {
             env::current_dir()?
         };
         self.validate_directory(&target_dir)?;
-        eprintln!("🔍 Scanning directory: {}", target_dir.display());
+        eprintln!("Scanning directory: {}", target_dir.display());
         let start = std::time::Instant::now();
         let graph = self.scanner.scan_directory(&target_dir)?;
         let duration = start.elapsed();
         eprintln!(
-            "✓ Found {} structs, {} functions, {} impls, {} traits",
+            "Found {} structs, {} functions, {} impls, {} traits",
             graph.structs.len(),
             graph.functions.len(),
             graph.impls.len(),
@@ -713,11 +729,14 @@ impl Application {
             "\x1b[90m└─ clipboard:\x1b[0m  \x1b[36m{} lines\x1b[0m  \x1b[33m{} words\x1b[0m  \x1b[35m{} bytes\x1b[0m",
             stats.lines, stats.words, stats.bytes
         );
+        if self.show_line_numbers {
+            eprintln!("\x1b[90mLine numbers are shown; use -n to toggle\x1b[0m");
+        }
         if self.show_calls {
-            eprintln!("\x1b[90mℹ Function calls are shown (use -c to toggle)\x1b[0m");
+            eprintln!("\x1b[90mFunction calls are shown; use -c to toggle\x1b[0m");
         }
         if self.show_fields {
-            eprintln!("\x1b[90mℹ Struct fields are shown (use -f to toggle)\x1b[0m");
+            eprintln!("\x1b[90mStruct fields are shown; use -f to toggle\x1b[0m");
         }
         Ok(())
     }
@@ -922,7 +941,9 @@ impl Application {
         report
     }
     fn format_clipboard_content(&self, graph: &CodeGraph, root: &Path) -> String {
+        use std::collections::HashSet;
         let mut content = String::new();
+        let mut printed_imports: HashSet<PathBuf> = HashSet::new();
         let timestamp = Local::now();
         content.push_str("// Code Graph Analysis\n");
         content.push_str(&format!(
@@ -939,6 +960,9 @@ impl Application {
                     .path
                     .strip_prefix(root)
                     .unwrap_or(&struct_info.path);
+                if printed_imports.insert(struct_info.path.clone()) {
+                    content.push_str(&graph.render_file_imports(&struct_info.path, root));
+                }
                 let visibility = if struct_info.visibility == "pub" {
                     "pub "
                 } else {
@@ -986,6 +1010,9 @@ impl Application {
                     .path
                     .strip_prefix(root)
                     .unwrap_or(&trait_info.path);
+                if printed_imports.insert(trait_info.path.clone()) {
+                    content.push_str(&graph.render_file_imports(&trait_info.path, root));
+                }
                 let generics = if !trait_info.generics.is_empty() {
                     format!("<{}>", trait_info.generics.join(", "))
                 } else {
@@ -1013,6 +1040,9 @@ impl Application {
             content.push_str("// ============================================================\n\n");
             for func in top_level_functions {
                 let rel_path = func.path.strip_prefix(root).unwrap_or(&func.path);
+                if printed_imports.insert(func.path.clone()) {
+                    content.push_str(&graph.render_file_imports(&func.path, root));
+                }
                 let visibility = if func.visibility == "pub" { "pub " } else { "" };
                 content.push_str(&format!("// {}\n", rel_path.display()));
                 content.push_str(&format!("{}{} {{\n", visibility, func.signature));
@@ -1029,6 +1059,9 @@ impl Application {
             content.push_str("// ============================================================\n\n");
             for impl_info in graph.impls.values() {
                 let rel_path = impl_info.path.strip_prefix(root).unwrap_or(&impl_info.path);
+                if printed_imports.insert(impl_info.path.clone()) {
+                    content.push_str(&graph.render_file_imports(&impl_info.path, root));
+                }
                 let generics = if !impl_info.generics.is_empty() {
                     format!("<{}>", impl_info.generics.join(", "))
                 } else {
@@ -1079,9 +1112,6 @@ impl Application {
             }
         }
         content
-    }
-    fn graph_file_imports<'a>(&self, graph: &'a CodeGraph, path: &Path) -> Option<&'a FileImports> {
-        graph.file_imports.get(path)
     }
 }
 fn collect_use_tree(prefix: String, tree: &syn::UseTree, out: &mut Vec<ImportInfo>) {
