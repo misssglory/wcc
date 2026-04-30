@@ -18,6 +18,8 @@ pub struct UnifiedConfig {
     pub wcf: WcfConfig,
     #[serde(default)]
     pub wff: WffConfig,
+    #[serde(default)]
+    pub wcg: WcgConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -73,6 +75,13 @@ pub struct WffConfig {
     pub time_format: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WcgConfig {
+    pub show_line_numbers: bool,
+    pub show_calls: bool,
+    pub show_fields: bool,
+}
+
 impl Default for WffConfig {
     fn default() -> Self {
         Self {
@@ -80,6 +89,16 @@ impl Default for WffConfig {
             show_time_in_header: true,
             use_file_modification_time: true,
             time_format: "%H:%M:%S %d.%m.%Y".to_string(),
+        }
+    }
+}
+
+impl Default for WcgConfig {
+    fn default() -> Self {
+        Self {
+            show_line_numbers: true,
+            show_calls: true,
+            show_fields: true,
         }
     }
 }
@@ -101,7 +120,7 @@ impl Default for UnifiedConfig {
             wcl: WclConfig {
                 max_file_size_kb: 50,
                 max_file_words_to_copy: 10000,
-                max_clipboard_bytes: 40 * 1024,  // 40KB default
+                max_clipboard_bytes: 40 * 1024,
                 skip_patterns: vec![
                     ".o".to_string(), ".pyc".to_string(), ".pyo".to_string(),
                     ".so".to_string(), ".dll".to_string(), ".dylib".to_string(),
@@ -141,6 +160,7 @@ impl Default for UnifiedConfig {
                 show_buffer_preview: true,
             },
             wff: WffConfig::default(),
+            wcg: WcgConfig::default(),
         }
     }
 }
@@ -223,6 +243,10 @@ pub fn show_config() -> Result<()> {
     println!("    show_time_in_header: {}", config.wff.show_time_in_header);
     println!("    use_file_modification_time: {}", config.wff.use_file_modification_time);
     println!("    time_format: {}", config.wff.time_format);
+    println!("  [wcg]");
+    println!("    show_line_numbers: {}", config.wcg.show_line_numbers);
+    println!("    show_calls: {}", config.wcg.show_calls);
+    println!("    show_fields: {}", config.wcg.show_fields);
     println!();
     println!("  Config file: \x1b[90m{}\x1b[0m", get_config_path().display());
     
@@ -256,6 +280,7 @@ pub fn init_config() -> Result<()> {
     println!("  [wcl] - analyzer settings with {} skip patterns", config.wcl.skip_patterns.len());
     println!("  [wcf] - function replacement settings");
     println!("  [wff] - wff (function finder) settings with time and line number options");
+    println!("  [wcg] - code graph analyzer settings");
     
     Ok(())
 }
