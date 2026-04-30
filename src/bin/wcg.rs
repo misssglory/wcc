@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use chrono::Local;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
 };
@@ -70,12 +70,24 @@ struct TraitInfo {
     path: PathBuf,
 }
 #[derive(Debug, Clone, Default)]
+struct ImportInfo {
+    full_path: String,
+    alias: Option<String>,
+    last_segment: String,
+    is_glob: bool,
+}
+#[derive(Debug, Clone, Default)]
+struct FileImports {
+    imports: Vec<ImportInfo>,
+}
+#[derive(Debug, Clone, Default)]
 struct CodeGraph {
-    structs: HashMap<String, StructInfo>,
-    functions: HashMap<String, FunctionInfo>,
-    impls: HashMap<String, ImplInfo>,
-    traits: HashMap<String, TraitInfo>,
-    unresolved_calls: HashMap<String, HashSet<String>>,
+    structs: BTreeMap<String, StructInfo>,
+    functions: BTreeMap<String, FunctionInfo>,
+    impls: BTreeMap<String, ImplInfo>,
+    traits: BTreeMap<String, TraitInfo>,
+    unresolved_calls: BTreeMap<String, HashSet<String>>,
+    file_imports: BTreeMap<PathBuf, FileImports>,
 }
 impl CodeGraph {
     fn add_struct(&mut self, struct_info: StructInfo) {
@@ -90,8 +102,31 @@ impl CodeGraph {
     fn add_trait(&mut self, trait_info: TraitInfo) {
         self.traits.insert(trait_info.name.clone(), trait_info);
     }
+    fn resolve_imported_call(&self, caller: &FunctionInfo, call: &str) -> Option<String> {
+        let imports = self.file_imports.get(&caller.path)?;
+        for import in &imports.imports {
+            if !import_matches_call(import, call) {
+                continue;
+            }
+            let qualified = qualify_call_from_import(import, call);
+            if self.functions.contains_key(&qualified) || self.traits.contains_key(&qualified) {
+                return Some(qualified);
+            }
+            if self.functions.contains_key(call) || self.traits.contains_key(call) {
+                return Some(call.to_string());
+            }
+            if import.is_glob {
+                let candidate = format!("{}::{}", import.full_path.trim_end_matches("::*"), call);
+                if self.functions.contains_key(&candidate) || self.traits.contains_key(&candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+        None
+    }
     fn resolve_calls(&mut self) {
         let mut resolved = HashMap::new();
+        self.unresolved_calls.clear();
         for (func_name, func_info) in &self.functions {
             let mut resolved_calls = HashSet::new();
             for call in &func_info.calls {
@@ -102,10 +137,12 @@ impl CodeGraph {
                     resolved_calls.insert(call.clone());
                 } else if self.traits.contains_key(call) {
                     resolved_calls.insert(format!("trait::{}", call));
+                } else if let Some(imported) = self.resolve_imported_call(func_info, call) {
+                    resolved_calls.insert(imported);
                 } else {
                     self.unresolved_calls
                         .entry(func_name.clone())
-                        .or_insert_with(HashSet::new)
+                        .or_default()
                         .insert(call.clone());
                 }
             }
@@ -116,6 +153,40 @@ impl CodeGraph {
                 func.calls = calls;
             }
         }
+    }
+    fn add_import(&mut self, path: PathBuf, import: ImportInfo) {
+        self.file_imports
+            .entry(path)
+            .or_default()
+            .imports
+            .push(import);
+    }
+    fn render_file_imports(&self, path: &Path, root: &Path) -> String {
+        let mut out = String::new();
+        let rel_path = path.strip_prefix(root).unwrap_or(path);
+        out.push_str(&format!("// imports: {}\n", rel_path.display()));
+        if let Some(file_imports) = self.file_imports.get(path) {
+            let mut items: Vec<String> = file_imports
+                .imports
+                .iter()
+                .map(|i| {
+                    if let Some(alias) = &i.alias {
+                        format!("use {} as {};", i.full_path, alias)
+                    } else {
+                        format!("use {};", i.full_path)
+                    }
+                })
+                .collect();
+            items.sort();
+            items.dedup();
+            for item in items {
+                out.push_str(&format!("//   {}\n", item));
+            }
+        } else {
+            out.push_str("//   (no imports found)\n");
+        }
+        out.push('\n');
+        out
     }
 }
 struct CodeGraphVisitor {
@@ -555,6 +626,19 @@ impl CodeGraphScanner {
         }
     }
 }
+#[derive(Debug, Clone, Copy)]
+struct ClipboardStats {
+    lines: usize,
+    words: usize,
+    bytes: usize,
+}
+fn calc_clipboard_stats(s: &str) -> ClipboardStats {
+    ClipboardStats {
+        lines: s.lines().count(),
+        words: s.split_whitespace().count(),
+        bytes: s.as_bytes().len(),
+    }
+}
 struct Application {
     config: WcgConfig,
     scanner: CodeGraphScanner,
@@ -620,9 +704,14 @@ impl Application {
         let clipboard_content = self.format_clipboard_content(&graph, &target_dir);
         println!("{}", report);
         set_clipboard(&clipboard_content)?;
+        let stats = calc_clipboard_stats(&clipboard_content);
         eprintln!(
             "\n\x1b[1;32m✓ Code graph copied to clipboard! (took {:.2?})\x1b[0m",
             duration
+        );
+        eprintln!(
+            "\x1b[90m└─ clipboard:\x1b[0m  \x1b[36m{} lines\x1b[0m  \x1b[33m{} words\x1b[0m  \x1b[35m{} bytes\x1b[0m",
+            stats.lines, stats.words, stats.bytes
         );
         if self.show_calls {
             eprintln!("\x1b[90mℹ Function calls are shown (use -c to toggle)\x1b[0m");
@@ -991,11 +1080,96 @@ impl Application {
         }
         content
     }
+    fn graph_file_imports<'a>(&self, graph: &'a CodeGraph, path: &Path) -> Option<&'a FileImports> {
+        graph.file_imports.get(path)
+    }
 }
-
+fn collect_use_tree(prefix: String, tree: &syn::UseTree, out: &mut Vec<ImportInfo>) {
+    match tree {
+        syn::UseTree::Path(use_path) => {
+            let new_prefix = if prefix.is_empty() {
+                use_path.ident.to_string()
+            } else {
+                format!("{}::{}", prefix, use_path.ident)
+            };
+            collect_use_tree(new_prefix, &use_path.tree, out);
+        }
+        syn::UseTree::Name(use_name) => {
+            let full = if prefix.is_empty() {
+                use_name.ident.to_string()
+            } else {
+                format!("{}::{}", prefix, use_name.ident)
+            };
+            out.push(ImportInfo {
+                full_path: full.clone(),
+                alias: None,
+                last_segment: use_name.ident.to_string(),
+                is_glob: false,
+            });
+        }
+        syn::UseTree::Rename(use_rename) => {
+            let full = if prefix.is_empty() {
+                use_rename.ident.to_string()
+            } else {
+                format!("{}::{}", prefix, use_rename.ident)
+            };
+            out.push(ImportInfo {
+                full_path: full,
+                alias: Some(use_rename.rename.to_string()),
+                last_segment: use_rename.ident.to_string(),
+                is_glob: false,
+            });
+        }
+        syn::UseTree::Glob(_) => {
+            out.push(ImportInfo {
+                full_path: format!("{}::*", prefix),
+                alias: None,
+                last_segment: "*".to_string(),
+                is_glob: true,
+            });
+        }
+        syn::UseTree::Group(group) => {
+            for item in &group.items {
+                collect_use_tree(prefix.clone(), item, out);
+            }
+        }
+    }
+}
+fn path_to_string(path: &syn::Path) -> String {
+    use quote::ToTokens;
+    path.to_token_stream().to_string()
+}
+fn last_segment(path: &syn::Path) -> String {
+    path.segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default()
+}
+fn import_matches_call(import: &ImportInfo, call: &str) -> bool {
+    if let Some(alias) = &import.alias {
+        if alias == call {
+            return true;
+        }
+    }
+    if import.last_segment == call {
+        return true;
+    }
+    if import.is_glob {
+        return true;
+    }
+    false
+}
+fn qualify_call_from_import(import: &ImportInfo, call: &str) -> String {
+    if import.is_glob {
+        format!("{}::{}", import.full_path.trim_end_matches("::*"), call)
+    } else if import.alias.is_some() {
+        import.full_path.clone()
+    } else {
+        import.full_path.clone()
+    }
+}
 fn is_ignored_call(name: &str) -> bool {
     let simple = name.rsplit("::").next().unwrap_or(name);
-
     if matches!(
         name,
         "Local::now"
@@ -1016,7 +1190,6 @@ fn is_ignored_call(name: &str) -> bool {
     ) {
         return true;
     }
-
     matches!(
         simple,
         "Ok" | "Err"
@@ -1134,7 +1307,6 @@ fn is_ignored_call(name: &str) -> bool {
             | "signed_duration_since"
     )
 }
-
 fn main() -> Result<()> {
     let app = Application::new()?;
     app.run()
