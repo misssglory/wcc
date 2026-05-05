@@ -13,6 +13,7 @@ enum CodeBlockType {
     Function,
     Impl,
     Struct,
+    Enum,
 }
 #[derive(Debug, Clone)]
 struct CodeBlockInfo {
@@ -81,6 +82,13 @@ impl CodeBlockInfo {
                     "struct ".to_string()
                 }
             }
+            CodeBlockType::Enum => {
+                if self.visibility == "pub" {
+                    "pub enum ".to_string()
+                } else {
+                    "enum ".to_string()
+                }
+            }
         }
     }
     fn get_type_icon(&self) -> &'static str {
@@ -88,6 +96,7 @@ impl CodeBlockInfo {
             CodeBlockType::Function => "ƒ",
             CodeBlockType::Impl => "ℑ",
             CodeBlockType::Struct => "Ⓢ",
+            CodeBlockType::Enum => "Ⓔ",
         }
     }
     fn get_type_name(&self) -> &'static str {
@@ -95,6 +104,7 @@ impl CodeBlockInfo {
             CodeBlockType::Function => "function",
             CodeBlockType::Impl => "impl block",
             CodeBlockType::Struct => "struct",
+            CodeBlockType::Enum => "enum",
         }
     }
     fn get_telescope_entry(&self) -> String {
@@ -292,6 +302,25 @@ impl CodeBlockScanner {
                     continue;
                 }
             }
+            if trimmed.contains("enum ") && !trimmed.contains("fn ") {
+                let mut start_idx = i;
+                while start_idx > 0 && lines[start_idx - 1].trim().starts_with("#[") {
+                    start_idx -= 1;
+                }
+                if let Some(enum_info) = self.extract_enum_block(
+                    &lines,
+                    start_idx,
+                    file_path,
+                    &relative_path,
+                    total_lines,
+                    modified_datetime,
+                )? {
+                    let end_line = enum_info.end_line;
+                    blocks.push(enum_info);
+                    i = end_line;
+                    continue;
+                }
+            }
             if trimmed.starts_with("impl ") {
                 if let Some(impl_info) = self.extract_impl_block(
                     &lines,
@@ -334,16 +363,13 @@ impl CodeBlockScanner {
                     continue;
                 }
             }
-            if line.contains("fn ") && !line.trim_start().starts_with("//") {
-                let mut is_inside_impl = false;
-                for block in &blocks {
-                    if let CodeBlockType::Impl = block.block_type {
-                        if block.start_line <= i + 1 && i + 1 <= block.end_line {
-                            is_inside_impl = true;
-                            break;
-                        }
-                    }
-                }
+            if trimmed.contains("fn ") && !trimmed.starts_with("//") {
+                let current_line_num = i + 1;
+                let is_inside_impl = blocks.iter().any(|block| {
+                    matches!(block.block_type, CodeBlockType::Impl)
+                        && block.start_line <= current_line_num
+                        && current_line_num <= block.end_line
+                });
                 if !is_inside_impl {
                     if let Some(func_info) = self.extract_function_block(
                         &lines,
@@ -591,6 +617,78 @@ impl CodeBlockScanner {
             CodeBlockType::Function,
             visibility.to_string(),
             asyncness,
+        )))
+    }
+    fn extract_enum_block(
+        &self,
+        lines: &[&str],
+        start_idx: usize,
+        file_path: &Path,
+        relative_path: &PathBuf,
+        total_lines: usize,
+        modified_datetime: DateTime<Local>,
+    ) -> Result<Option<CodeBlockInfo>> {
+        let mut enum_idx = start_idx;
+        while enum_idx < lines.len() && lines[enum_idx].trim().starts_with("#[") {
+            enum_idx += 1;
+        }
+        if enum_idx >= lines.len() {
+            return Ok(None);
+        }
+        let line = lines[enum_idx];
+        let trimmed = line.trim();
+        let (visibility, name) = if trimmed.starts_with("pub enum ") {
+            ("pub", trimmed[9..].trim())
+        } else if trimmed.starts_with("enum ") {
+            ("", trimmed[5..].trim())
+        } else {
+            return Ok(None);
+        };
+        let enum_name = name
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        if enum_name.is_empty() {
+            return Ok(None);
+        }
+        let mut brace_count = 0;
+        let mut found_brace = false;
+        let mut end_line = enum_idx + 1;
+        for j in enum_idx..lines.len() {
+            let current_line = lines[j];
+            for ch in current_line.chars() {
+                if ch == '{' {
+                    brace_count += 1;
+                    found_brace = true;
+                } else if ch == '}' {
+                    brace_count -= 1;
+                    if found_brace && brace_count == 0 {
+                        end_line = j + 1;
+                        break;
+                    }
+                }
+            }
+            if found_brace && brace_count == 0 {
+                break;
+            }
+        }
+        if !found_brace {
+            return Ok(None);
+        }
+        let block_body = lines[start_idx..end_line].join("\n");
+        Ok(Some(CodeBlockInfo::new(
+            file_path.to_path_buf(),
+            relative_path.clone(),
+            enum_name,
+            block_body,
+            start_idx + 1,
+            end_line,
+            total_lines,
+            Some(modified_datetime),
+            CodeBlockType::Enum,
+            visibility.to_string(),
+            false,
         )))
     }
 }
