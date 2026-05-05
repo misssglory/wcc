@@ -591,6 +591,10 @@ fn main() -> Result<()> {
     }
     let mut processed_count = 0;
     let mut skipped_count = 0;
+    let mut processed_blocks: Vec<String> = Vec::new();
+    let mut skipped_no_changes_blocks: Vec<String> = Vec::new();
+    let mut not_found_blocks: Vec<String> = Vec::new();
+    let mut manually_skipped_blocks: Vec<String> = Vec::new();
     while !blocks.is_empty() {
         let (block_name, block_type, new_block_str) = blocks.remove(0);
         let type_str = match block_type {
@@ -622,6 +626,7 @@ fn main() -> Result<()> {
                 "n" | "no" => {
                     eprintln!("⚠ Skipping {}: {}", type_str, block_name);
                     skipped_count += 1;
+                    manually_skipped_blocks.push(format!("{} {}", type_str, block_name));
                     continue;
                 }
                 _ => {}
@@ -649,6 +654,7 @@ fn main() -> Result<()> {
         if matches.is_empty() {
             eprintln!("⚠ No matches found for '{}', skipping", block_name);
             skipped_count += 1;
+            not_found_blocks.push(format!("{} {}", type_str, block_name));
             last_selected_file = None;
             continue;
         }
@@ -690,6 +696,7 @@ fn main() -> Result<()> {
                     None => {
                         eprintln!("⚠ No file selected for '{}', skipping", block_name);
                         skipped_count += 1;
+                        manually_skipped_blocks.push(format!("{} {}", type_str, block_name));
                         continue;
                     }
                 }
@@ -720,6 +727,7 @@ fn main() -> Result<()> {
                 block_name
             );
             skipped_count += 1;
+            skipped_no_changes_blocks.push(format!("{} {}", type_str, block_name));
             continue;
         }
         print!("\n❓ Apply these changes? (y/n): ");
@@ -729,6 +737,7 @@ fn main() -> Result<()> {
         if input.trim().to_lowercase() != "y" {
             eprintln!("⚠ Skipping {}: {}", type_str, block_name);
             skipped_count += 1;
+            manually_skipped_blocks.push(format!("{} {}", type_str, block_name));
             last_selected_file = None;
             continue;
         }
@@ -760,10 +769,43 @@ fn main() -> Result<()> {
             processed_count += 1;
         }
         eprintln!("\n✅ {} '{}' processed successfully!", type_str, block_name);
+        processed_blocks.push(format!("{} {}", type_str, block_name));
     }
     eprintln!("\n\x1b[1;32m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
     eprintln!("\x1b[1;32m✅ All code blocks processed!\x1b[0m");
     eprintln!("  Blocks processed: {}", processed_count);
     eprintln!("  Blocks skipped: {}", skipped_count);
+    eprintln!("\n\x1b[1;36mProcessed blocks:\x1b[0m");
+    if processed_blocks.is_empty() {
+        eprintln!("  • none");
+    } else {
+        for block in &processed_blocks {
+            eprintln!("  • {}", block);
+        }
+    }
+    eprintln!("\n\x1b[1;33mSkipped (no changes detected):\x1b[0m");
+    if skipped_no_changes_blocks.is_empty() {
+        eprintln!("  • none");
+    } else {
+        for block in &skipped_no_changes_blocks {
+            eprintln!("  • {}", block);
+        }
+    }
+    eprintln!("\n\x1b[1;33mSkipped (user decision / no file selected):\x1b[0m");
+    if manually_skipped_blocks.is_empty() {
+        eprintln!("  • none");
+    } else {
+        for block in &manually_skipped_blocks {
+            eprintln!("  • {}", block);
+        }
+    }
+    eprintln!("\n\x1b[1;31mNot found:\x1b[0m");
+    if not_found_blocks.is_empty() {
+        eprintln!("  • none");
+    } else {
+        for block in &not_found_blocks {
+            eprintln!("  • {}", block);
+        }
+    }
     Ok(())
 }
