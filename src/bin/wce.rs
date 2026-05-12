@@ -17,6 +17,7 @@ struct ErrorInfo {
     column: usize,
     error_code: String,
     message: String,
+    full_error_block: String,
     code_snippet: Option<String>,
     function_name: Option<String>,
     function_body: Option<String>,
@@ -24,7 +25,6 @@ struct ErrorInfo {
     function_end_line: usize,
     function_visibility: Option<String>,
     function_asyncness: bool,
-    full_error_block: String,
 }
 #[derive(Debug, Clone)]
 struct FunctionErrorGroup {
@@ -44,7 +44,7 @@ fn main() -> Result<()> {
     eprintln!("🔍 Parsing cargo build errors...");
     let errors = parse_cargo_errors(&clipboard_content)?;
     if errors.is_empty() {
-        eprintln!("✓ No errors found in clipboard");
+        eprintln!("✓ No source-mapped errors found in clipboard");
         return Ok(());
     }
     let grouped_errors = group_errors_by_function(&errors);
@@ -55,40 +55,51 @@ fn main() -> Result<()> {
     );
     for (idx, group) in grouped_errors.iter().enumerate() {
         eprintln!("\n\x1b[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
+
         let visibility = group.function_visibility.as_deref().unwrap_or("");
         let asyncness = if group.function_asyncness {
             "async "
         } else {
             ""
         };
-        let modifier = format!(
-            "{}{}",
-            visibility,
-            if !visibility.is_empty() && !asyncness.is_empty() {
-                " "
-            } else {
-                ""
-            }
-        );
+        let function_display = color_function_name(&group.function_name);
+        let file_display = color_path_for_display(&group.file_path);
+
         eprintln!(
             "\x1b[1;36mFunction {}: {}{}{}\x1b[0m",
             idx + 1,
-            modifier,
+            if visibility.is_empty() {
+                ""
+            } else {
+                &format!("{} ", visibility)
+            },
             asyncness,
-            group.function_name
+            function_display
         );
+
         eprintln!(
             "\x1b[90m  {}: lines {}-{}\x1b[0m",
-            group.file_path.display(),
-            group.function_start_line,
-            group.function_end_line
+            file_display, group.function_start_line, group.function_end_line
         );
+
         eprintln!("\x1b[33m  {} error(s):\x1b[0m", group.errors.len());
+
         for error in &group.errors {
             eprintln!(
-                "\x1b[31m    • [{}] at line {}: {}\x1b[0m",
-                error.error_code, error.line, error.message
+                "\x1b[31m    • [{}] at line {}:{}: {}\x1b[0m",
+                error.error_code, error.line, error.column, error.message
             );
+
+            for line in error.full_error_block.lines() {
+                eprintln!("      {}", colorize_diagnostic_line(line));
+            }
+
+            if let Some(snippet) = &error.code_snippet {
+                eprintln!("\n\x1b[90m      Code snippet:\x1b[0m");
+                for line in snippet.lines() {
+                    eprintln!("      {}", line);
+                }
+            }
         }
     }
     print!(
@@ -119,68 +130,73 @@ fn parse_cargo_errors(content: &str) -> Result<Vec<ErrorInfo>> {
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
-        if let Some(caps) = error_start_re.captures(line) {
-            let error_code = caps
-                .get(1)
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_else(|| "UNKNOWN".to_string());
-            let message = caps
-                .get(2)
-                .map(|m| m.as_str().trim().to_string())
-                .unwrap_or_default();
-            let mut block_lines = vec![line];
-            let mut j = i + 1;
-            while j < lines.len() {
-                let next = lines[j];
-                if error_start_re.is_match(next) || warning_start_re.is_match(next) {
-                    break;
-                }
-                block_lines.push(next);
-                j += 1;
+        let Some(caps) = error_start_re.captures(line) else {
+            i += 1;
+            continue;
+        };
+        let error_code = caps
+            .get(1)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_else(|| "UNKNOWN".to_string());
+        let message = caps
+            .get(2)
+            .map(|m| m.as_str().trim().to_string())
+            .unwrap_or_default();
+        let mut block_lines = vec![line];
+        let mut j = i + 1;
+        while j < lines.len() {
+            let next = lines[j];
+            if error_start_re.is_match(next) || warning_start_re.is_match(next) {
+                break;
             }
-            let full_error_block = block_lines.join("\n");
-            let mut error = ErrorInfo {
-                file_path: PathBuf::new(),
-                line: 0,
-                column: 0,
-                error_code,
-                message,
-                code_snippet: None,
-                function_name: None,
-                function_body: None,
-                function_start_line: 0,
-                function_end_line: 0,
-                function_visibility: None,
-                function_asyncness: false,
-                full_error_block,
-            };
-            for block_line in &block_lines {
-                if let Some(loc_caps) = location_re.captures(block_line) {
-                    let file = loc_caps.get(1).unwrap().as_str();
-                    error.file_path = PathBuf::from(file);
-                    error.line = loc_caps.get(2).unwrap().as_str().parse().unwrap_or(0);
-                    error.column = loc_caps.get(3).unwrap().as_str().parse().unwrap_or(0);
-                    break;
-                }
+            block_lines.push(next);
+            j += 1;
+        }
+        let mut found_location = None;
+        for block_line in &block_lines {
+            if let Some(loc_caps) = location_re.captures(block_line) {
+                let file_path = PathBuf::from(loc_caps.get(1).unwrap().as_str());
+                let line_num = loc_caps.get(2).unwrap().as_str().parse().unwrap_or(0);
+                let column = loc_caps.get(3).unwrap().as_str().parse().unwrap_or(0);
+                found_location = Some((file_path, line_num, column));
+                break;
             }
-            if error.file_path.exists() && error.line > 0 {
-                error.code_snippet = extract_code_snippet(&error.file_path, error.line);
-                if let Some((func_name, func_body, start, end, visibility, asyncness)) =
-                    find_function_with_syn(&error.file_path, error.line)
-                {
-                    error.function_name = Some(func_name);
-                    error.function_body = Some(func_body);
-                    error.function_start_line = start;
-                    error.function_end_line = end;
-                    error.function_visibility = visibility;
-                    error.function_asyncness = asyncness;
-                }
-            }
-            errors.push(error);
+        }
+        let Some((file_path, line_num, column)) = found_location else {
             i = j;
             continue;
+        };
+        let full_error_block = block_lines.join("\n");
+        let mut error = ErrorInfo {
+            file_path,
+            line: line_num,
+            column,
+            error_code,
+            message,
+            full_error_block,
+            code_snippet: None,
+            function_name: None,
+            function_body: None,
+            function_start_line: 0,
+            function_end_line: 0,
+            function_visibility: None,
+            function_asyncness: false,
+        };
+        if error.file_path.exists() {
+            error.code_snippet = extract_code_snippet(&error.file_path, error.line);
+            if let Some((func_name, func_body, start, end, visibility, asyncness)) =
+                find_function_with_syn(&error.file_path, error.line)
+            {
+                error.function_name = Some(func_name);
+                error.function_body = Some(func_body);
+                error.function_start_line = start;
+                error.function_end_line = end;
+                error.function_visibility = visibility;
+                error.function_asyncness = asyncness;
+            }
         }
-        i += 1;
+        errors.push(error);
+        i = j;
     }
     Ok(errors)
 }
@@ -322,28 +338,23 @@ fn build_grouped_error_report(groups: &[FunctionErrorGroup]) -> Result<String> {
         } else {
             ""
         };
-        let signature_prefix = match (visibility.is_empty(), asyncness.is_empty()) {
-            (false, false) => format!("{} {}", visibility, asyncness.trim_end()),
-            (false, true) => visibility.to_string(),
-            (true, false) => asyncness.trim_end().to_string(),
-            (true, true) => String::new(),
-        };
+        let colored_function_name = color_function_name(&group.function_name);
+        let colored_file_path = color_path_for_display(&group.file_path);
         output.push_str("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-        if signature_prefix.is_empty() {
-            output.push_str(&format!("Function {}: {}\n", idx + 1, group.function_name));
-        } else {
-            output.push_str(&format!(
-                "Function {}: {} {}\n",
-                idx + 1,
-                signature_prefix,
-                group.function_name
-            ));
-        }
+        output.push_str(&format!(
+            "Function {}: {}{}{}\n",
+            idx + 1,
+            if visibility.is_empty() {
+                ""
+            } else {
+                &format!("{} ", visibility)
+            },
+            asyncness,
+            colored_function_name
+        ));
         output.push_str(&format!(
             "  {}: lines {}-{}\n",
-            group.file_path.display(),
-            group.function_start_line,
-            group.function_end_line
+            colored_file_path, group.function_start_line, group.function_end_line
         ));
         output.push_str(&format!("  {} error(s):\n\n", group.errors.len()));
         for (error_idx, error) in group.errors.iter().enumerate() {
@@ -355,12 +366,18 @@ fn build_grouped_error_report(groups: &[FunctionErrorGroup]) -> Result<String> {
                 error.column
             ));
             if !error.message.is_empty() {
-                output.push_str(&format!("  Summary: {}\n", error.message));
+                output.push_str(&format!(
+                    "  Summary: {}\n",
+                    colorize_diagnostic_line(&format!(
+                        "error[{}]: {}",
+                        error.error_code, error.message
+                    ))
+                ));
             }
             output.push_str("  Full diagnostic:\n");
             for line in error.full_error_block.lines() {
                 output.push_str("    ");
-                output.push_str(line);
+                output.push_str(&colorize_diagnostic_line(line));
                 output.push('\n');
             }
             if let Some(ref snippet) = error.code_snippet {
@@ -418,4 +435,36 @@ fn print_stats(errors: &[ErrorInfo], groups: &[FunctionErrorGroup], output: &str
     println!("  \x1b[33mTotal chars:\x1b[0m {}", stats.chars);
     println!("  \x1b[33mTotal bytes:\x1b[0m {}", stats.bytes);
     Ok(())
+}
+
+fn color_path_for_display(path: &Path) -> String {
+    let full = path.display().to_string();
+    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+        if let Some(prefix) = full.strip_suffix(name) {
+            return format!("{}{}", prefix, color_filename(name));
+        }
+    }
+    color_filename(&full)
+}
+
+fn colorize_diagnostic_line(line: &str) -> String {
+    let trimmed = line.trim_start();
+    let indent_len = line.len().saturating_sub(trimmed.len());
+    let indent = &line[..indent_len];
+
+    if trimmed.starts_with("error[") || trimmed.starts_with("error:") {
+        format!("\x1b[1;31m{}{}\x1b[0m", indent, trimmed)
+    } else if trimmed.starts_with("warning[") || trimmed.starts_with("warning:") {
+        format!("\x1b[1;33m{}{}\x1b[0m", indent, trimmed)
+    } else if trimmed.starts_with("= note:") {
+        format!("\x1b[35m{}{}\x1b[0m", indent, trimmed)
+    } else if trimmed.starts_with("= help:") {
+        format!("\x1b[36m{}{}\x1b[0m", indent, trimmed)
+    } else if trimmed.starts_with("-->") {
+        format!("\x1b[90m{}{}\x1b[0m", indent, trimmed)
+    } else if trimmed == "|" || trimmed.starts_with('|') {
+        format!("\x1b[90m{}{}\x1b[0m", indent, trimmed)
+    } else {
+        line.to_string()
+    }
 }
