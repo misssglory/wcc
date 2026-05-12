@@ -983,10 +983,19 @@ fn main() -> Result<()> {
         eprintln!("✓ Found {} matching {} block(s):", matches.len(), type_str);
         for m in &matches {
             let rel_path = relative_display_path(&m.file_path);
-            if let Some((start, end)) = m.line_range {
-                eprintln!("  • {}:{}-{}", rel_path, start, end);
-            } else {
-                eprintln!("  • {}", rel_path);
+            match m.line_range {
+                Some((start, end)) => {
+                    eprintln!(
+                        "  • {}:{}-{} {}",
+                        ansi_dim(rel_path),
+                        start,
+                        end,
+                        heatmap_lines(Some((start, end)))
+                    );
+                }
+                None => {
+                    eprintln!("  • {} {}", ansi_dim(rel_path), heatmap_lines(None));
+                }
             }
         }
         let selected_matches = if matches.len() > 1 {
@@ -1146,4 +1155,37 @@ fn relative_display_path(path: &Path) -> String {
         .unwrap_or(path)
         .display()
         .to_string()
+}
+
+fn ansi_dim(s: impl AsRef<str>) -> String {
+    format!("\x1b[90m{}\x1b[0m", s.as_ref())
+}
+
+fn ansi_cyan(s: impl AsRef<str>) -> String {
+    format!("\x1b[36m{}\x1b[0m", s.as_ref())
+}
+
+fn ansi_green(s: impl AsRef<str>) -> String {
+    format!("\x1b[32m{}\x1b[0m", s.as_ref())
+}
+
+fn ansi_yellow(s: impl AsRef<str>) -> String {
+    format!("\x1b[33m{}\x1b[0m", s.as_ref())
+}
+
+fn ansi_red(s: impl AsRef<str>) -> String {
+    format!("\x1b[31m{}\x1b[0m", s.as_ref())
+}
+
+fn block_line_count(range: Option<(usize, usize)>) -> Option<usize> {
+    range.map(|(start, end)| end.saturating_sub(start) + 1)
+}
+
+fn heatmap_lines(range: Option<(usize, usize)>) -> String {
+    match block_line_count(range) {
+        Some(n) if n <= 8 => ansi_green(format!("{}L", n)),
+        Some(n) if n <= 20 => ansi_yellow(format!("{}L", n)),
+        Some(n) => ansi_red(format!("{}L", n)),
+        None => ansi_dim("?L"),
+    }
 }
