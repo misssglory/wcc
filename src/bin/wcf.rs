@@ -705,7 +705,10 @@ fn scan_directory_for_block(
     );
     Ok(all_matches)
 }
-fn select_match_with_fzf(matches: &[CodeBlockMatch]) -> Result<Option<CodeBlockMatch>> {
+fn select_match_with_fzf(
+    matches: &[CodeBlockMatch],
+    current_block_str: &str,
+) -> Result<Option<CodeBlockMatch>> {
     let fzf_check = Command::new("fzf").arg("--version").output();
     if fzf_check.is_err() {
         bail!("fzf not found");
@@ -752,60 +755,77 @@ fn select_match_with_fzf(matches: &[CodeBlockMatch]) -> Result<Option<CodeBlockM
         CodeBlockType::Enum => "enum",
     };
     let header_name = &matches[0].block_name;
+    let current_lines = current_block_line_count(current_block_str);
     eprintln!(
-        "\n📁 Multiple matches found for \x1b[1;36m{}\x1b[0m \x1b[1;33m{}\x1b[0m. Select one to modify:",
-        block_type, header_name
+        "\n📁 Multiple matches found for \x1b[1;36m{}\x1b[0m \x1b[1;33m{}\x1b[0m {}. Select one to modify:",
+        block_type, header_name, ansi_dim(format!("({} lines in current block)",
+        current_lines))
     );
-    let rendered_rows: Vec<(usize, String, String, String, String)> = matches
+    let rendered_rows: Vec<(usize, String, String, String, String, String)> = matches
         .iter()
         .enumerate()
         .map(|(idx, m)| {
-            let location = if let Some((start, end)) = m.line_range {
-                format!("{}:{}-{}", relative_display_path(&m.file_path), start, end)
-            } else {
-                relative_display_path(&m.file_path)
-            };
+            let total_lines = file_total_lines(&m.file_path);
+            let location = relative_display_path(&m.file_path);
+            let range = colorized_range(m.line_range, total_lines);
+            let range_bar = heatmap_range_bar(m.line_range, total_lines);
             let line_count = heatmap_lines(m.line_range);
             let outer = m
                 .context_label
                 .as_ref()
                 .map(|s| ansi_cyan(s))
-                .unwrap_or_default();
+                .unwrap_or_else(|| ansi_dim("?outer"));
             let preview = compact_body_preview(&m.old_full_block);
-            (idx, location, line_count, outer, preview)
+            (
+                idx,
+                location,
+                range_bar,
+                range,
+                line_count,
+                format!("{}  {}", outer, preview),
+            )
         })
         .collect();
     let location_width = rendered_rows
         .iter()
-        .map(|(_, location, _, _, _)| strip_ansi(location).chars().count())
+        .map(|(_, location, _, _, _, _)| strip_ansi(location).chars().count())
+        .max()
+        .unwrap_or(0);
+    let range_bar_width = rendered_rows
+        .iter()
+        .map(|(_, _, range_bar, _, _, _)| strip_ansi(range_bar).chars().count())
+        .max()
+        .unwrap_or(0);
+    let range_width = rendered_rows
+        .iter()
+        .map(|(_, _, _, range, _, _)| strip_ansi(range).chars().count())
         .max()
         .unwrap_or(0);
     let lines_width = rendered_rows
         .iter()
-        .map(|(_, lines, _, _, _)| strip_ansi(lines).chars().count())
-        .max()
-        .unwrap_or(0);
-    let outer_width = rendered_rows
-        .iter()
-        .map(|(_, _, _, outer, _)| strip_ansi(outer).chars().count())
+        .map(|(_, _, _, _, lines, _)| strip_ansi(lines).chars().count())
         .max()
         .unwrap_or(0);
     let item_list = rendered_rows
         .into_iter()
-        .map(|(idx, location, line_count, outer, preview)| {
+        .map(|(idx, location, range_bar, range, line_count, tail)| {
             let location_pad = location_width.saturating_sub(strip_ansi(&location).chars().count());
+            let range_bar_pad =
+                range_bar_width.saturating_sub(strip_ansi(&range_bar).chars().count());
+            let range_pad = range_width.saturating_sub(strip_ansi(&range).chars().count());
             let lines_pad = lines_width.saturating_sub(strip_ansi(&line_count).chars().count());
-            let outer_pad = outer_width.saturating_sub(strip_ansi(&outer).chars().count());
             format!(
-                "{}\t{}{}  {}{}  {}{}  {}",
+                "{}\t{}{}  {}{}  {}{}  {}{}  {}",
                 idx,
                 location,
                 " ".repeat(location_pad),
+                range_bar,
+                " ".repeat(range_bar_pad),
+                range,
+                " ".repeat(range_pad),
                 line_count,
                 " ".repeat(lines_pad),
-                outer,
-                " ".repeat(outer_pad),
-                preview
+                tail
             )
         })
         .collect::<Vec<_>>()
@@ -983,7 +1003,7 @@ fn main() -> Result<()> {
             continue;
         }
         let selected_matches = if matches.len() > 1 {
-            match select_match_with_fzf(&matches)? {
+            match select_match_with_fzf(&matches, &new_block_str)? {
                 Some(selected_match) => {
                     last_selected_match = Some(selected_match.clone());
                     vec![selected_match]
@@ -1163,7 +1183,7 @@ fn heatmap_lines(range: Option<(usize, usize)>) -> String {
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,wcf=debug")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn,wcf=warn")),
         )
         .with_target(false)
         .with_thread_ids(true)
@@ -1393,4 +1413,68 @@ fn enrich_match_metadata_parallel(matches: &mut [CodeBlockMatch]) -> Result<()> 
         "metadata enrichment complete"
     );
     Ok(())
+}
+fn file_total_lines(path: &Path) -> usize {
+    fs::read_to_string(path)
+        .map(|s| s.lines().count().max(1))
+        .unwrap_or(1)
+}
+fn current_block_line_count(block: &str) -> usize {
+    block.lines().count().max(1)
+}
+fn ansi_truecolor(s: impl AsRef<str>, r: u8, g: u8, b: u8) -> String {
+    format!("\x1b[38;2;{};{};{}m{}\x1b[0m", r, g, b, s.as_ref())
+}
+fn heatmap_color_ratio(value: f32) -> (u8, u8, u8) {
+    let t = value.clamp(0.0, 1.0);
+    if t < 0.25 {
+        let k = t / 0.25;
+        (80, (160.0 + 55.0 * k) as u8, 255)
+    } else if t < 0.5 {
+        let k = (t - 0.25) / 0.25;
+        ((80.0 + 175.0 * k) as u8, 215, (255.0 - 120.0 * k) as u8)
+    } else if t < 0.75 {
+        let k = (t - 0.5) / 0.25;
+        (255, (215.0 - 95.0 * k) as u8, (135.0 - 95.0 * k) as u8)
+    } else {
+        let k = (t - 0.75) / 0.25;
+        (255, (120.0 - 60.0 * k) as u8, (40.0 - 20.0 * k) as u8)
+    }
+}
+fn heatmap_color(value: usize, min: usize, max: usize) -> String {
+    if max <= min {
+        return ansi_green(value.to_string());
+    }
+    let ratio = (value.saturating_sub(min)) as f32 / (max - min) as f32;
+    let (r, g, b) = heatmap_color_ratio(ratio);
+    ansi_truecolor(value.to_string(), r, g, b)
+}
+fn heatmap_range_bar(range: Option<(usize, usize)>, total_lines: usize) -> String {
+    match range {
+        Some((start, end)) => {
+            let total = total_lines.max(1);
+            let start_ratio = start.saturating_sub(1) as f32 / total as f32;
+            let end_ratio = end.saturating_sub(1) as f32 / total as f32;
+            let (sr, sg, sb) = heatmap_color_ratio(start_ratio);
+            let (er, eg, eb) = heatmap_color_ratio(end_ratio);
+            format!(
+                "{}{}{}",
+                ansi_truecolor("╭", sr, sg, sb),
+                ansi_dim("─"),
+                ansi_truecolor("╮", er, eg, eb)
+            )
+        }
+        None => ansi_dim("?─?"),
+    }
+}
+fn colorized_range(range: Option<(usize, usize)>, total_lines: usize) -> String {
+    match range {
+        Some((start, end)) => {
+            let total = total_lines.max(1);
+            let start_colored = heatmap_color(start, 1, total);
+            let end_colored = heatmap_color(end, 1, total);
+            format!("{}-{}", start_colored, end_colored)
+        }
+        None => ansi_dim("?L"),
+    }
 }
