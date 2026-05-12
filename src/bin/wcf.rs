@@ -28,6 +28,7 @@ struct CodeBlockMatch {
     original_asyncness: Option<syn::token::Async>,
     original_unsafety: Option<syn::token::Unsafe>,
     original_attrs: Vec<Attribute>,
+    line_range: Option<(usize, usize)>,
 }
 fn format_code_with_rustfmt(code: &str, file_path: Option<&Path>) -> Result<String> {
     let temp_dir = tempfile::TempDir::new()?;
@@ -43,8 +44,7 @@ fn format_code_with_rustfmt(code: &str, file_path: Option<&Path>) -> Result<Stri
     cmd.arg(&temp_file);
     let output = cmd.output()?;
     if output.status.success() {
-        let formatted = fs::read_to_string(&temp_file)?;
-        Ok(formatted)
+        Ok(fs::read_to_string(&temp_file)?)
     } else {
         Ok(code.to_string())
     }
@@ -137,7 +137,7 @@ fn parse_clipboard_blocks(content: &str) -> Result<Vec<(String, CodeBlockType, S
             let mut pos = 0;
             while let Some(start_pos) = content[pos..].find("struct ") {
                 let abs_start = pos + start_pos;
-                let (end_pos, found) = find_block_end(&content, abs_start);
+                let (end_pos, found) = find_block_end(content, abs_start);
                 if !found {
                     break;
                 }
@@ -151,7 +151,7 @@ fn parse_clipboard_blocks(content: &str) -> Result<Vec<(String, CodeBlockType, S
             let mut pos = 0;
             while let Some(start_pos) = content[pos..].find("enum ") {
                 let abs_start = pos + start_pos;
-                let (end_pos, found) = find_block_end(&content, abs_start);
+                let (end_pos, found) = find_block_end(content, abs_start);
                 if !found {
                     break;
                 }
@@ -165,7 +165,7 @@ fn parse_clipboard_blocks(content: &str) -> Result<Vec<(String, CodeBlockType, S
             let mut pos = 0;
             while let Some(start_pos) = content[pos..].find("fn ") {
                 let abs_start = pos + start_pos;
-                let (end_pos, found) = find_block_end(&content, abs_start);
+                let (end_pos, found) = find_block_end(content, abs_start);
                 if !found {
                     break;
                 }
@@ -205,14 +205,91 @@ fn find_block_end(content: &str, abs_start: usize) -> (usize, bool) {
     }
     (end_pos, false)
 }
+fn normalize_for_match(s: &str) -> String {
+    s.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+fn find_block_line_range(
+    content: &str,
+    block_str: &str,
+    lines: &[&str],
+) -> Result<Option<(usize, usize)>> {
+    let normalized_target = block_str
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>();
+    if normalized_target.is_empty() {
+        return Ok(None);
+    }
+    let first_line = normalized_target[0];
+    let second_line = normalized_target.get(1).copied();
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim() != first_line {
+            continue;
+        }
+        if let Some(expected_second) = second_line {
+            let next_non_empty = lines
+                .iter()
+                .skip(i + 1)
+                .map(|l| l.trim())
+                .find(|l| !l.is_empty());
+            if next_non_empty != Some(expected_second) {
+                continue;
+            }
+        }
+        let mut brace_count = 0;
+        let mut saw_open = false;
+        for (j, l) in lines.iter().enumerate().skip(i) {
+            for ch in l.chars() {
+                match ch {
+                    '{' => {
+                        brace_count += 1;
+                        saw_open = true;
+                    }
+                    '}' => {
+                        brace_count -= 1;
+                        if saw_open && brace_count == 0 {
+                            let candidate = lines[i..=j]
+                                .iter()
+                                .map(|s| s.trim())
+                                .filter(|l| !l.is_empty())
+                                .collect::<Vec<_>>();
+                            if candidate == normalized_target {
+                                return Ok(Some((i + 1, j + 1)));
+                            }
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if let Some(byte_start) = content.find(block_str) {
+        let start_line = content[..byte_start]
+            .bytes()
+            .filter(|b| *b == b'\n')
+            .count()
+            + 1;
+        let line_count = block_str.lines().count().max(1);
+        return Ok(Some((start_line, start_line + line_count - 1)));
+    }
+    Ok(None)
+}
 fn find_enum_in_file(file_path: &Path, enum_name: &str) -> Result<Vec<CodeBlockMatch>> {
     let content = fs::read_to_string(file_path)?;
     let file = parse_file(&content)?;
     let mut matches = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
     for item in file.items {
         if let Item::Enum(item_enum) = item {
             if item_enum.ident == enum_name {
                 let enum_str = quote::quote!(# item_enum).to_string();
+                let line_range = find_block_line_range(&content, &enum_str, &lines)?;
                 matches.push(CodeBlockMatch {
                     file_path: file_path.to_path_buf(),
                     block_name: enum_name.to_string(),
@@ -222,53 +299,9 @@ fn find_enum_in_file(file_path: &Path, enum_name: &str) -> Result<Vec<CodeBlockM
                     original_asyncness: None,
                     original_unsafety: None,
                     original_attrs: item_enum.attrs,
+                    line_range,
                 });
             }
-        }
-    }
-    Ok(matches)
-}
-fn find_function_in_file(file_path: &Path, func_name: &str) -> Result<Vec<CodeBlockMatch>> {
-    let content = fs::read_to_string(file_path)?;
-    let file = parse_file(&content)?;
-    let mut matches = Vec::new();
-    for item in file.items {
-        match item {
-            Item::Fn(item_fn) => {
-                if item_fn.sig.ident == func_name {
-                    let fn_str = quote::quote!(# item_fn).to_string();
-                    matches.push(CodeBlockMatch {
-                        file_path: file_path.to_path_buf(),
-                        block_name: func_name.to_string(),
-                        block_type: CodeBlockType::Function,
-                        old_full_block: fn_str,
-                        original_vis: Some(item_fn.vis),
-                        original_asyncness: item_fn.sig.asyncness,
-                        original_unsafety: item_fn.sig.unsafety,
-                        original_attrs: item_fn.attrs,
-                    });
-                }
-            }
-            Item::Impl(item_impl) => {
-                for method in item_impl.items {
-                    if let ImplItem::Fn(method_fn) = &method {
-                        if method_fn.sig.ident == func_name {
-                            let fn_str = quote::quote!(# method_fn).to_string();
-                            matches.push(CodeBlockMatch {
-                                file_path: file_path.to_path_buf(),
-                                block_name: func_name.to_string(),
-                                block_type: CodeBlockType::Function,
-                                old_full_block: fn_str,
-                                original_vis: Some(method_fn.vis.clone()),
-                                original_asyncness: method_fn.sig.asyncness,
-                                original_unsafety: method_fn.sig.unsafety,
-                                original_attrs: method_fn.attrs.clone(),
-                            });
-                        }
-                    }
-                }
-            }
-            _ => {}
         }
     }
     Ok(matches)
@@ -277,10 +310,12 @@ fn find_struct_in_file(file_path: &Path, struct_name: &str) -> Result<Vec<CodeBl
     let content = fs::read_to_string(file_path)?;
     let file = parse_file(&content)?;
     let mut matches = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
     for item in file.items {
         if let Item::Struct(item_struct) = item {
             if item_struct.ident == struct_name {
                 let struct_str = quote::quote!(# item_struct).to_string();
+                let line_range = find_block_line_range(&content, &struct_str, &lines)?;
                 matches.push(CodeBlockMatch {
                     file_path: file_path.to_path_buf(),
                     block_name: struct_name.to_string(),
@@ -290,44 +325,299 @@ fn find_struct_in_file(file_path: &Path, struct_name: &str) -> Result<Vec<CodeBl
                     original_asyncness: None,
                     original_unsafety: None,
                     original_attrs: item_struct.attrs,
+                    line_range,
                 });
             }
         }
     }
     Ok(matches)
 }
+fn last_segment(path: &syn::Path) -> String {
+    path.segments
+        .last()
+        .map(|seg| seg.ident.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+fn find_function_in_file(file_path: &Path, func_name: &str) -> Result<Vec<CodeBlockMatch>> {
+    let content = fs::read_to_string(file_path)?;
+    let file = parse_file(&content)?;
+    let mut matches = Vec::new();
+    fn byte_offset_to_line(content: &str, byte_offset: usize) -> usize {
+        content[..byte_offset]
+            .bytes()
+            .filter(|b| *b == b'\n')
+            .count()
+            + 1
+    }
+    fn enclosing_impl_type(file: &File, line_no: usize) -> Option<String> {
+        for item in &file.items {
+            if let Item::Impl(item_impl) = item {
+                let impl_str = quote::quote!(# item_impl).to_string();
+                let impl_lines = impl_str.lines().count().max(1);
+                for start_guess in 1..=line_no {
+                    let end_guess = start_guess + impl_lines - 1;
+                    if line_no >= start_guess && line_no <= end_guess {
+                        let impl_type = if let syn::Type::Path(type_path) = &*item_impl.self_ty {
+                            last_segment(&type_path.path)
+                        } else {
+                            "unknown".to_string()
+                        };
+                        return Some(impl_type);
+                    }
+                }
+            }
+        }
+        None
+    }
+    let needle = format!("fn {}", func_name);
+    let mut search_from = 0usize;
+    let bytes = content.as_bytes();
+    while search_from < content.len() {
+        let Some(rel_pos) = content[search_from..].find(&needle) else {
+            break;
+        };
+        let fn_pos = search_from + rel_pos;
+        let ident_ok_before = fn_pos == 0
+            || !content[..fn_pos]
+                .chars()
+                .last()
+                .map(|c| c.is_alphanumeric() || c == '_')
+                .unwrap_or(false);
+        if !ident_ok_before {
+            search_from = fn_pos + needle.len();
+            continue;
+        }
+        let mut sig_start = fn_pos;
+        while sig_start > 0 {
+            let prev_nl = content[..sig_start].rfind('\n').map(|p| p + 1).unwrap_or(0);
+            let line = &content[prev_nl..sig_start];
+            let trimmed = line.trim();
+            if trimmed.starts_with("#[")
+                || trimmed.starts_with("///")
+                || trimmed.starts_with("//!")
+                || trimmed.is_empty()
+            {
+                sig_start = prev_nl;
+                if prev_nl == 0 {
+                    break;
+                }
+                continue;
+            }
+            break;
+        }
+        let mut brace_start = None;
+        let mut i = fn_pos;
+        let mut paren_depth = 0i32;
+        let mut bracket_depth = 0i32;
+        let mut angle_depth = 0i32;
+        while i < content.len() {
+            let ch = bytes[i] as char;
+            match ch {
+                '(' => paren_depth += 1,
+                ')' => paren_depth -= 1,
+                '[' => bracket_depth += 1,
+                ']' => bracket_depth -= 1,
+                '<' => angle_depth += 1,
+                '>' => {
+                    if angle_depth > 0 {
+                        angle_depth -= 1;
+                    }
+                }
+                '{' if paren_depth == 0 && bracket_depth == 0 => {
+                    brace_start = Some(i);
+                    break;
+                }
+                ';' if paren_depth == 0 && bracket_depth == 0 => {
+                    brace_start = None;
+                    break;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let Some(open_brace) = brace_start else {
+            search_from = fn_pos + needle.len();
+            continue;
+        };
+        let mut depth = 0i32;
+        let mut block_end = None;
+        let mut j = open_brace;
+        while j < content.len() {
+            let ch = bytes[j] as char;
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        block_end = Some(j + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        let Some(end_pos) = block_end else {
+            search_from = fn_pos + needle.len();
+            continue;
+        };
+        let block_text = content[sig_start..end_pos].to_string();
+        let start_line = byte_offset_to_line(&content, sig_start);
+        let end_line = byte_offset_to_line(&content, end_pos.saturating_sub(1));
+        let parsed_top = parse_str::<ItemFn>(&block_text).ok();
+        let parsed_impl = parse_str::<syn::ImplItemFn>(&block_text).ok();
+        if parsed_top.is_none() && parsed_impl.is_none() {
+            search_from = end_pos;
+            continue;
+        }
+        if let Some(item_fn) = parsed_top {
+            if item_fn.sig.ident == func_name {
+                matches.push(CodeBlockMatch {
+                    file_path: file_path.to_path_buf(),
+                    block_name: func_name.to_string(),
+                    block_type: CodeBlockType::Function,
+                    old_full_block: block_text,
+                    original_vis: Some(item_fn.vis),
+                    original_asyncness: item_fn.sig.asyncness,
+                    original_unsafety: item_fn.sig.unsafety,
+                    original_attrs: item_fn.attrs,
+                    line_range: Some((start_line, end_line)),
+                });
+                search_from = end_pos;
+                continue;
+            }
+        }
+        if let Some(method_fn) = parsed_impl {
+            if method_fn.sig.ident == func_name {
+                let impl_type =
+                    enclosing_impl_type(&file, start_line).unwrap_or_else(|| "unknown".to_string());
+                matches.push(CodeBlockMatch {
+                    file_path: file_path.to_path_buf(),
+                    block_name: format!("{} (in impl {})", func_name, impl_type),
+                    block_type: CodeBlockType::Function,
+                    old_full_block: block_text,
+                    original_vis: Some(method_fn.vis),
+                    original_asyncness: method_fn.sig.asyncness,
+                    original_unsafety: method_fn.sig.unsafety,
+                    original_attrs: method_fn.attrs,
+                    line_range: Some((start_line, end_line)),
+                });
+            }
+        }
+        search_from = end_pos;
+    }
+    Ok(matches)
+}
+fn replace_block_by_line_range(
+    content: &str,
+    line_range: (usize, usize),
+    new_block_str: &str,
+    file_path: &Path,
+) -> Result<String> {
+    let (start_line, end_line) = line_range;
+    let start = start_line.saturating_sub(1);
+    let end = end_line.saturating_sub(1);
+    let lines: Vec<&str> = content.lines().collect();
+    if start >= lines.len() || end >= lines.len() || start > end {
+        bail!(
+            "Invalid line range {}-{} for {}",
+            start_line,
+            end_line,
+            file_path.display()
+        );
+    }
+    let formatted_new = format_code_with_rustfmt(new_block_str, Some(file_path))?;
+    let formatted_new = formatted_new.trim_end_matches('\n');
+    let mut out = Vec::new();
+    out.extend_from_slice(&lines[..start]);
+    out.push(formatted_new);
+    out.extend_from_slice(&lines[end + 1..]);
+    let mut result = out.join("\n");
+    if content.ends_with('\n') {
+        result.push('\n');
+    }
+    Ok(result)
+}
 fn replace_function_in_file(
     content: &str,
     func_match: &CodeBlockMatch,
     new_block_str: &str,
 ) -> Result<String> {
-    let mut file: File = parse_file(content)?;
-    let new_item_fn: ItemFn = parse_str(new_block_str)?;
-    for item in &mut file.items {
-        match item {
-            Item::Fn(item_fn) => {
-                if item_fn.sig.ident == func_match.block_name {
+    let formatted_new = format_code_with_rustfmt(new_block_str, Some(&func_match.file_path))?;
+    let formatted_new = formatted_new.trim_end_matches('\n').to_string();
+    if let Some((start_line, end_line)) = func_match.line_range {
+        let start = start_line - 1;
+        let end = end_line - 1;
+        let lines: Vec<&str> = content.lines().collect();
+        if start < lines.len() && end < lines.len() && start <= end {
+            let mut new_lines = Vec::new();
+            new_lines.extend_from_slice(&lines[..start]);
+            new_lines.push(formatted_new.as_str());
+            new_lines.extend_from_slice(&lines[end + 1..]);
+            let mut result = new_lines.join("\n");
+            if content.ends_with('\n') {
+                result.push('\n');
+            }
+            return Ok(result);
+        }
+    }
+    let old_block = func_match.old_full_block.trim();
+    if !old_block.is_empty() {
+        let exact_hits: Vec<usize> = content
+            .match_indices(old_block)
+            .map(|(idx, _)| idx)
+            .collect();
+        if exact_hits.len() == 1 {
+            let start = exact_hits[0];
+            let end = start + old_block.len();
+            let mut result = String::with_capacity(content.len() + formatted_new.len());
+            result.push_str(&content[..start]);
+            result.push_str(&formatted_new);
+            result.push_str(&content[end..]);
+            return Ok(result);
+        }
+        let old_block_fmt =
+            format_code_with_rustfmt(&func_match.old_full_block, Some(&func_match.file_path))?;
+        let old_block_fmt = old_block_fmt.trim();
+        if !old_block_fmt.is_empty() {
+            let formatted_content = format_code_with_rustfmt(content, Some(&func_match.file_path))?;
+            let fmt_hits: Vec<usize> = formatted_content
+                .match_indices(old_block_fmt)
+                .map(|(idx, _)| idx)
+                .collect();
+            if fmt_hits.len() == 1 {
+                let start = fmt_hits[0];
+                let end = start + old_block_fmt.len();
+                let mut replaced =
+                    String::with_capacity(formatted_content.len() + formatted_new.len());
+                replaced.push_str(&formatted_content[..start]);
+                replaced.push_str(&formatted_new);
+                replaced.push_str(&formatted_content[end..]);
+                return Ok(replaced);
+            }
+        }
+    }
+    if !func_match.block_name.contains(" (in impl ") {
+        let mut file: File = parse_file(content)?;
+        let new_item_fn: ItemFn = parse_str(new_block_str)?;
+        let target_name = &func_match.block_name;
+        let mut replaced = false;
+        for item in &mut file.items {
+            if let Item::Fn(item_fn) = item {
+                if item_fn.sig.ident == target_name {
                     let mut final_attrs = func_match.original_attrs.clone();
                     for attr in &new_item_fn.attrs {
                         if !final_attrs.contains(attr) {
                             final_attrs.push(attr.clone());
                         }
                     }
-                    let final_vis = if func_match.original_vis.is_some() {
-                        func_match.original_vis.clone().unwrap()
-                    } else {
-                        new_item_fn.vis.clone()
-                    };
-                    let final_asyncness = if func_match.original_asyncness.is_some() {
-                        func_match.original_asyncness
-                    } else {
-                        new_item_fn.sig.asyncness
-                    };
-                    let final_unsafety = if func_match.original_unsafety.is_some() {
-                        func_match.original_unsafety
-                    } else {
-                        new_item_fn.sig.unsafety
-                    };
+                    let final_vis = func_match
+                        .original_vis
+                        .clone()
+                        .unwrap_or_else(|| new_item_fn.vis.clone());
+                    let final_asyncness =
+                        func_match.original_asyncness.or(new_item_fn.sig.asyncness);
+                    let final_unsafety = func_match.original_unsafety.or(new_item_fn.sig.unsafety);
                     let mut preserved_sig = new_item_fn.sig.clone();
                     preserved_sig.asyncness = final_asyncness;
                     preserved_sig.unsafety = final_unsafety;
@@ -337,125 +627,49 @@ fn replace_function_in_file(
                         sig: preserved_sig,
                         block: new_item_fn.block.clone(),
                     };
+                    replaced = true;
                     break;
                 }
             }
-            Item::Impl(item_impl) => {
-                for method in &mut item_impl.items {
-                    if let ImplItem::Fn(method_fn) = method {
-                        if method_fn.sig.ident == func_match.block_name {
-                            let mut final_attrs = func_match.original_attrs.clone();
-                            for attr in &new_item_fn.attrs {
-                                if !final_attrs.contains(attr) {
-                                    final_attrs.push(attr.clone());
-                                }
-                            }
-                            let final_vis = if func_match.original_vis.is_some() {
-                                func_match.original_vis.clone().unwrap()
-                            } else {
-                                new_item_fn.vis.clone()
-                            };
-                            let final_asyncness = if func_match.original_asyncness.is_some() {
-                                func_match.original_asyncness
-                            } else {
-                                new_item_fn.sig.asyncness
-                            };
-                            let final_unsafety = if func_match.original_unsafety.is_some() {
-                                func_match.original_unsafety
-                            } else {
-                                new_item_fn.sig.unsafety
-                            };
-                            let mut preserved_sig = new_item_fn.sig.clone();
-                            preserved_sig.asyncness = final_asyncness;
-                            preserved_sig.unsafety = final_unsafety;
-                            method_fn.attrs = final_attrs;
-                            method_fn.vis = final_vis;
-                            method_fn.sig = preserved_sig;
-                            method_fn.block = (*new_item_fn.block).clone();
-                            break;
-                        }
-                    }
-                }
-            }
-            _ => {}
+        }
+        if replaced {
+            return Ok(prettyplease::unparse(&file));
         }
     }
-    let new_content = prettyplease::unparse(&file);
-    Ok(new_content)
+    bail!(
+        "Could not determine exact location for selected function '{}' in {}. line_range={:?}",
+        func_match.block_name,
+        func_match.file_path.display(),
+        func_match.line_range
+    )
 }
 fn replace_struct_in_file(
     content: &str,
     struct_match: &CodeBlockMatch,
     new_block_str: &str,
 ) -> Result<String> {
-    let mut file: File = parse_file(content)?;
-    let new_item_struct: ItemStruct = parse_str(new_block_str)?;
-    for item in &mut file.items {
-        if let Item::Struct(item_struct) = item {
-            if item_struct.ident == struct_match.block_name {
-                let mut final_attrs = struct_match.original_attrs.clone();
-                for attr in &new_item_struct.attrs {
-                    if !final_attrs.contains(attr) {
-                        final_attrs.push(attr.clone());
-                    }
-                }
-                let final_vis = if struct_match.original_vis.is_some() {
-                    struct_match.original_vis.clone().unwrap()
-                } else {
-                    new_item_struct.vis.clone()
-                };
-                *item_struct = ItemStruct {
-                    attrs: final_attrs,
-                    vis: final_vis,
-                    struct_token: new_item_struct.struct_token,
-                    ident: new_item_struct.ident.clone(),
-                    generics: new_item_struct.generics.clone(),
-                    fields: new_item_struct.fields.clone(),
-                    semi_token: new_item_struct.semi_token,
-                };
-                break;
-            }
-        }
-    }
-    let new_content = prettyplease::unparse(&file);
-    Ok(new_content)
+    let line_range = struct_match.line_range.with_context(|| {
+        format!(
+            "No exact line range found for struct '{}' in {}",
+            struct_match.block_name,
+            struct_match.file_path.display()
+        )
+    })?;
+    replace_block_by_line_range(content, line_range, new_block_str, &struct_match.file_path)
 }
 fn replace_enum_in_file(
     content: &str,
     enum_match: &CodeBlockMatch,
     new_block_str: &str,
 ) -> Result<String> {
-    let mut file: File = parse_file(content)?;
-    let new_item_enum: ItemEnum = parse_str(new_block_str)?;
-    for item in &mut file.items {
-        if let Item::Enum(item_enum) = item {
-            if item_enum.ident == enum_match.block_name {
-                let mut final_attrs = enum_match.original_attrs.clone();
-                for attr in &new_item_enum.attrs {
-                    if !final_attrs.contains(attr) {
-                        final_attrs.push(attr.clone());
-                    }
-                }
-                let final_vis = if let Some(ref vis) = enum_match.original_vis {
-                    vis.clone()
-                } else {
-                    new_item_enum.vis.clone()
-                };
-                *item_enum = ItemEnum {
-                    attrs: final_attrs,
-                    vis: final_vis,
-                    enum_token: new_item_enum.enum_token,
-                    ident: new_item_enum.ident.clone(),
-                    generics: new_item_enum.generics.clone(),
-                    brace_token: new_item_enum.brace_token,
-                    variants: new_item_enum.variants.clone(),
-                };
-                break;
-            }
-        }
-    }
-    let new_content = prettyplease::unparse(&file);
-    Ok(new_content)
+    let line_range = enum_match.line_range.with_context(|| {
+        format!(
+            "No exact line range found for enum '{}' in {}",
+            enum_match.block_name,
+            enum_match.file_path.display()
+        )
+    })?;
+    replace_block_by_line_range(content, line_range, new_block_str, &enum_match.file_path)
 }
 fn run_rustfmt_in_dir(file_path: &Path) -> Result<()> {
     let output = Command::new("rustfmt").arg(file_path).output()?;
@@ -466,41 +680,6 @@ fn run_rustfmt_in_dir(file_path: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-fn select_file_with_fzf(files: &[PathBuf]) -> Result<Option<PathBuf>> {
-    let fzf_check = Command::new("fzf").arg("--version").output();
-    if fzf_check.is_err() {
-        bail!("fzf not found");
-    }
-    let file_list: String = files
-        .iter()
-        .map(|f| f.display().to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut fzf_child = Command::new("fzf")
-        .arg("--height")
-        .arg("40%")
-        .arg("--border")
-        .arg("--ansi")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("Failed to spawn fzf")?;
-    {
-        let mut stdin = fzf_child.stdin.take().context("Failed to open fzf stdin")?;
-        stdin.write_all(file_list.as_bytes())?;
-    }
-    let output = fzf_child
-        .wait_with_output()
-        .context("Failed to read fzf output")?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if selected.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(PathBuf::from(selected)))
 }
 fn scan_directory_for_block(
     dir: &Path,
@@ -558,6 +737,72 @@ fn scan_directory_for_block(
     walk_dir(dir, block_name, block_type, &mut all_matches)?;
     Ok(all_matches)
 }
+fn select_match_with_fzf(matches: &[CodeBlockMatch]) -> Result<Option<CodeBlockMatch>> {
+    let fzf_check = Command::new("fzf").arg("--version").output();
+    if fzf_check.is_err() {
+        bail!("fzf not found");
+    }
+    let mut items = Vec::new();
+    for (idx, m) in matches.iter().enumerate() {
+        let type_str = match m.block_type {
+            CodeBlockType::Function => "fn",
+            CodeBlockType::Struct => "struct",
+            CodeBlockType::Enum => "enum",
+        };
+        let location = if let Some((start, end)) = m.line_range {
+            format!("{}:{}-{}", m.file_path.display(), start, end)
+        } else {
+            format!("{} [match {}]", m.file_path.display(), idx + 1)
+        };
+        let preview = m
+            .old_full_block
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .map(|l| l.trim())
+            .unwrap_or("");
+        items.push(format!(
+            "{}\t{:<7} {:<40} {}\t{}",
+            idx, type_str, m.block_name, location, preview
+        ));
+    }
+    let item_list = items.join("\n");
+    let mut fzf_child = Command::new("fzf")
+        .arg("--height")
+        .arg("40%")
+        .arg("--border")
+        .arg("--layout=reverse")
+        .arg("--no-multi")
+        .arg("--delimiter")
+        .arg("\t")
+        .arg("--with-nth")
+        .arg("2..")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("Failed to spawn fzf")?;
+    {
+        let mut stdin = fzf_child.stdin.take().context("Failed to open fzf stdin")?;
+        stdin.write_all(item_list.as_bytes())?;
+    }
+    let output = fzf_child
+        .wait_with_output()
+        .context("Failed to read fzf output")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if selected.is_empty() {
+        return Ok(None);
+    }
+    if let Some(idx_str) = selected.split('\t').next() {
+        if let Ok(idx) = idx_str.trim().parse::<usize>() {
+            if idx < matches.len() {
+                return Ok(Some(matches[idx].clone()));
+            }
+        }
+    }
+    Ok(None)
+}
 fn main() -> Result<()> {
     let config = load_unified_config()?;
     let args: Vec<String> = env::args().skip(1).collect();
@@ -566,7 +811,7 @@ fn main() -> Result<()> {
     } else {
         PathBuf::from(&args[0])
     };
-    let mut last_selected_file: Option<PathBuf> = None;
+    let mut last_selected_match: Option<CodeBlockMatch> = None;
     eprintln!("📋 Reading clipboard content...");
     let clipboard_content = get_clipboard_text()?;
     eprintln!("🔍 Parsing code blocks from clipboard...");
@@ -634,67 +879,83 @@ fn main() -> Result<()> {
         }
         eprintln!("\n🔎 Scanning for {} '{}'...", type_str, block_name);
         let mut matches = scan_directory_for_block(&target_dir, &block_name, &block_type)?;
-        if let Some(ref last_file) = last_selected_file {
-            let file_matches: Vec<CodeBlockMatch> = matches
-                .iter()
-                .filter(|m| m.file_path == *last_file)
-                .cloned()
-                .collect();
-            if !file_matches.is_empty() {
-                eprintln!("✓ Using previously selected file: {}", last_file.display());
-                matches = file_matches;
+        if let Some(ref last_match) = last_selected_match {
+            if last_match.block_name == block_name {
+                let file_matches: Vec<CodeBlockMatch> = matches
+                    .iter()
+                    .filter(|m| {
+                        m.file_path == last_match.file_path && m.line_range == last_match.line_range
+                    })
+                    .cloned()
+                    .collect();
+                if !file_matches.is_empty() {
+                    let range_str = last_match
+                        .line_range
+                        .map(|(s, e)| format!("{}-{}", s, e))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    eprintln!(
+                        "✓ Using previously selected match: {} (lines {})",
+                        last_match.file_path.display(),
+                        range_str
+                    );
+                    matches = file_matches;
+                } else {
+                    eprintln!(
+                        "ℹ Last selected match ({}) does not contain '{}', will prompt for new selection",
+                        last_match.file_path.display(), block_name
+                    );
+                    last_selected_match = None;
+                }
             } else {
-                eprintln!(
-                    "ℹ Last selected file ({}) does not contain '{}', will prompt for new selection",
-                    last_file.display(), block_name
-                );
-                last_selected_file = None;
+                last_selected_match = None;
             }
         }
         if matches.is_empty() {
             eprintln!("⚠ No matches found for '{}', skipping", block_name);
             skipped_count += 1;
             not_found_blocks.push(format!("{} {}", type_str, block_name));
-            last_selected_file = None;
+            last_selected_match = None;
             continue;
         }
         eprintln!("✓ Found {} matching {} block(s):", matches.len(), type_str);
         for m in &matches {
-            if let Some(vis) = &m.original_vis {
-                let vis_str = match vis {
-                    Visibility::Public(_) => "pub",
-                    _ => "",
-                };
-                eprintln!("  • {} (visibility: {})", m.file_path.display(), vis_str);
+            if let Some((start, end)) = m.line_range {
+                eprintln!("  • {} (lines {}-{})", m.file_path.display(), start, end);
             } else {
                 eprintln!("  • {}", m.file_path.display());
             }
         }
         let selected_matches = if matches.len() > 1 {
-            let remembered_match = if let Some(ref last_file) = last_selected_file {
-                matches.iter().find(|m| m.file_path == *last_file).cloned()
+            let remembered_match = if let Some(ref last_match) = last_selected_match {
+                matches
+                    .iter()
+                    .find(|m| {
+                        m.file_path == last_match.file_path && m.line_range == last_match.line_range
+                    })
+                    .cloned()
             } else {
                 None
             };
             if let Some(matched) = remembered_match {
+                let range_str = matched
+                    .line_range
+                    .map(|(s, e)| format!("{}-{}", s, e))
+                    .unwrap_or_else(|| "unknown".to_string());
                 eprintln!(
-                    "\n📁 Using previously selected file: {}",
-                    matched.file_path.display()
+                    "\n📁 Using previously selected match: {} (lines {})",
+                    matched.file_path.display(),
+                    range_str
                 );
                 vec![matched]
             } else {
-                let files: Vec<PathBuf> = matches.iter().map(|m| m.file_path.clone()).collect();
-                eprintln!("\n📁 Multiple files found. Select one to modify:");
-                match select_file_with_fzf(&files)? {
-                    Some(selected_file) => {
-                        last_selected_file = Some(selected_file.clone());
-                        matches
-                            .into_iter()
-                            .filter(|m| m.file_path == selected_file)
-                            .collect()
+                eprintln!("\n📁 Multiple matches found. Select one to modify:");
+                match select_match_with_fzf(&matches)? {
+                    Some(selected_match) => {
+                        last_selected_match = Some(selected_match.clone());
+                        vec![selected_match]
                     }
                     None => {
-                        eprintln!("⚠ No file selected for '{}', skipping", block_name);
+                        eprintln!("⚠ No match selected for '{}', skipping", block_name);
                         skipped_count += 1;
                         manually_skipped_blocks.push(format!("{} {}", type_str, block_name));
                         continue;
@@ -702,16 +963,18 @@ fn main() -> Result<()> {
                 }
             }
         } else {
-            if matches.len() == 1 {
-                last_selected_file = Some(matches[0].file_path.clone());
-            }
+            last_selected_match = Some(matches[0].clone());
             matches
         };
         let sample_file_path = selected_matches.first().map(|m| m.file_path.as_path());
         eprintln!("\n📝 Preview of changes:");
         let mut has_changes = false;
         for m in &selected_matches {
-            eprintln!("\n  File: {}", m.file_path.display());
+            let range_str = m
+                .line_range
+                .map(|(s, e)| format!("{}-{}", s, e))
+                .unwrap_or_else(|| "unknown".to_string());
+            eprintln!("\n  File: {} (lines {})", m.file_path.display(), range_str);
             eprintln!("\n  \x1b[1;33mDiff (formatted with rustfmt):\x1b[0m");
             println!("\x1b[90m{}\x1b[0m", "-".repeat(60));
             let changed =
@@ -738,7 +1001,7 @@ fn main() -> Result<()> {
             eprintln!("⚠ Skipping {}: {}", type_str, block_name);
             skipped_count += 1;
             manually_skipped_blocks.push(format!("{} {}", type_str, block_name));
-            last_selected_file = None;
+            last_selected_match = None;
             continue;
         }
         eprintln!("\n🔄 Applying changes...");
@@ -765,7 +1028,11 @@ fn main() -> Result<()> {
             if let Err(e) = run_rustfmt_in_dir(file_path) {
                 eprintln!("  Warning: rustfmt failed: {}", e);
             }
-            eprintln!("  ✓ Updated: {}", file_path.display());
+            let range_str = block_match
+                .line_range
+                .map(|(s, e)| format!("{}-{}", s, e))
+                .unwrap_or_else(|| "unknown".to_string());
+            eprintln!("  ✓ Updated: {} (lines {})", file_path.display(), range_str);
             processed_count += 1;
         }
         eprintln!("\n✅ {} '{}' processed successfully!", type_str, block_name);
