@@ -1,5 +1,10 @@
 use anyhow::{bail, Context, Result};
+use quote::ToTokens;
+use rayon::prelude::*;
 use similar::{ChangeTag, TextDiff};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 use std::{
     env, fs,
     io::{self, Write},
@@ -10,6 +15,8 @@ use syn::{
     parse_file, parse_str, Attribute, File, ImplItem, Item, ItemEnum, ItemFn, ItemStruct,
     Visibility,
 };
+use tracing::{debug, info, warn};
+use tracing_subscriber::EnvFilter;
 use wcc::common::*;
 use wcc::config::load_unified_config;
 #[derive(Debug, Clone)]
@@ -282,7 +289,11 @@ fn find_block_line_range(
     Ok(None)
 }
 fn find_enum_in_file(file_path: &Path, enum_name: &str) -> Result<Vec<CodeBlockMatch>> {
+    let started = Instant::now();
     let content = fs::read_to_string(file_path)?;
+    if !content.contains(enum_name) {
+        return Ok(Vec::new());
+    }
     let file = parse_file(&content)?;
     let mut matches = Vec::new();
     let lines: Vec<&str> = content.lines().collect();
@@ -306,10 +317,18 @@ fn find_enum_in_file(file_path: &Path, enum_name: &str) -> Result<Vec<CodeBlockM
             }
         }
     }
+    debug!(
+        file = % file_path.display(), enum_name, elapsed_ms = started.elapsed()
+        .as_millis(), match_count = matches.len(), "find_enum_in_file finished"
+    );
     Ok(matches)
 }
 fn find_struct_in_file(file_path: &Path, struct_name: &str) -> Result<Vec<CodeBlockMatch>> {
+    let started = Instant::now();
     let content = fs::read_to_string(file_path)?;
+    if !content.contains(struct_name) {
+        return Ok(Vec::new());
+    }
     let file = parse_file(&content)?;
     let mut matches = Vec::new();
     let lines: Vec<&str> = content.lines().collect();
@@ -333,6 +352,10 @@ fn find_struct_in_file(file_path: &Path, struct_name: &str) -> Result<Vec<CodeBl
             }
         }
     }
+    debug!(
+        file = % file_path.display(), struct_name, elapsed_ms = started.elapsed()
+        .as_millis(), match_count = matches.len(), "find_struct_in_file finished"
+    );
     Ok(matches)
 }
 fn last_segment(path: &syn::Path) -> String {
@@ -342,176 +365,74 @@ fn last_segment(path: &syn::Path) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 fn find_function_in_file(file_path: &Path, func_name: &str) -> Result<Vec<CodeBlockMatch>> {
-    let content = fs::read_to_string(file_path)?;
-    let file = parse_file(&content)?;
-    let mut matches = Vec::new();
-    fn byte_offset_to_line(content: &str, byte_offset: usize) -> usize {
-        content[..byte_offset]
-            .bytes()
-            .filter(|b| *b == b'\n')
-            .count()
-            + 1
+    let started = Instant::now();
+    let content = fs::read_to_string(file_path)
+        .with_context(|| format!("Failed to read {}", file_path.display()))?;
+    if !content.contains(func_name) {
+        debug!(
+            file = % file_path.display(), func_name, elapsed_ms = started.elapsed()
+            .as_millis(), "skip file early: function name not present in text"
+        );
+        return Ok(Vec::new());
     }
-    fn enclosing_impl_type(file: &File, line_no: usize) -> Option<String> {
-        for item in &file.items {
-            if let Item::Impl(item_impl) = item {
-                for method in &item_impl.items {
-                    if let ImplItem::Fn(method_fn) = method {
-                        let method_str = quote::quote!(# method_fn).to_string();
-                        let method_line_count = method_str.lines().count().max(1);
-                        for start_guess in 1..=line_no {
-                            let end_guess = start_guess + method_line_count - 1;
-                            if line_no >= start_guess && line_no <= end_guess {
-                                let impl_type =
-                                    if let syn::Type::Path(type_path) = &*item_impl.self_ty {
-                                        last_segment(&type_path.path)
-                                    } else {
-                                        "unknown".to_string()
-                                    };
-                                return Some(impl_type);
-                            }
+    let file =
+        parse_file(&content).with_context(|| format!("Failed to parse {}", file_path.display()))?;
+    let lines: Vec<&str> = content.lines().collect();
+    let mut matches = Vec::new();
+    for item in &file.items {
+        match item {
+            Item::Fn(item_fn) => {
+                if item_fn.sig.ident == func_name {
+                    let block_str = item_fn.to_token_stream().to_string();
+                    let line_range = find_block_line_range(&content, &block_str, &lines)?;
+                    matches.push(CodeBlockMatch {
+                        file_path: file_path.to_path_buf(),
+                        block_name: func_name.to_string(),
+                        block_type: CodeBlockType::Function,
+                        old_full_block: block_str,
+                        original_vis: Some(item_fn.vis.clone()),
+                        original_asyncness: item_fn.sig.asyncness,
+                        original_unsafety: item_fn.sig.unsafety,
+                        original_attrs: item_fn.attrs.clone(),
+                        line_range,
+                        context_label: None,
+                    });
+                }
+            }
+            Item::Impl(item_impl) => {
+                let impl_type = if let syn::Type::Path(type_path) = &*item_impl.self_ty {
+                    last_segment(&type_path.path)
+                } else {
+                    "unknown".to_string()
+                };
+                for impl_item in &item_impl.items {
+                    if let ImplItem::Fn(method_fn) = impl_item {
+                        if method_fn.sig.ident == func_name {
+                            let block_str = method_fn.to_token_stream().to_string();
+                            let line_range = find_block_line_range(&content, &block_str, &lines)?;
+                            matches.push(CodeBlockMatch {
+                                file_path: file_path.to_path_buf(),
+                                block_name: func_name.to_string(),
+                                block_type: CodeBlockType::Function,
+                                old_full_block: block_str,
+                                original_vis: Some(method_fn.vis.clone()),
+                                original_asyncness: method_fn.sig.asyncness,
+                                original_unsafety: method_fn.sig.unsafety,
+                                original_attrs: method_fn.attrs.clone(),
+                                line_range,
+                                context_label: Some(format!("impl {}", impl_type)),
+                            });
                         }
                     }
                 }
             }
+            _ => {}
         }
-        None
     }
-    let needle = format!("fn {}", func_name);
-    let mut search_from = 0usize;
-    let bytes = content.as_bytes();
-    while search_from < content.len() {
-        let Some(rel_pos) = content[search_from..].find(&needle) else {
-            break;
-        };
-        let fn_pos = search_from + rel_pos;
-        let ident_ok_before = fn_pos == 0
-            || !content[..fn_pos]
-                .chars()
-                .last()
-                .map(|c| c.is_alphanumeric() || c == '_')
-                .unwrap_or(false);
-        if !ident_ok_before {
-            search_from = fn_pos + needle.len();
-            continue;
-        }
-        let mut sig_start = fn_pos;
-        while sig_start > 0 {
-            let prev_nl = content[..sig_start].rfind('\n').map(|p| p + 1).unwrap_or(0);
-            let line = &content[prev_nl..sig_start];
-            let trimmed = line.trim();
-            if trimmed.starts_with("#[")
-                || trimmed.starts_with("///")
-                || trimmed.starts_with("//!")
-                || trimmed.is_empty()
-            {
-                sig_start = prev_nl;
-                if prev_nl == 0 {
-                    break;
-                }
-                continue;
-            }
-            break;
-        }
-        let mut brace_start = None;
-        let mut i = fn_pos;
-        let mut paren_depth = 0i32;
-        let mut bracket_depth = 0i32;
-        let mut angle_depth = 0i32;
-        while i < content.len() {
-            let ch = bytes[i] as char;
-            match ch {
-                '(' => paren_depth += 1,
-                ')' => paren_depth -= 1,
-                '[' => bracket_depth += 1,
-                ']' => bracket_depth -= 1,
-                '<' => angle_depth += 1,
-                '>' => {
-                    if angle_depth > 0 {
-                        angle_depth -= 1;
-                    }
-                }
-                '{' if paren_depth == 0 && bracket_depth == 0 => {
-                    brace_start = Some(i);
-                    break;
-                }
-                ';' if paren_depth == 0 && bracket_depth == 0 => {
-                    brace_start = None;
-                    break;
-                }
-                _ => {}
-            }
-            i += 1;
-        }
-        let Some(open_brace) = brace_start else {
-            search_from = fn_pos + needle.len();
-            continue;
-        };
-        let mut depth = 0i32;
-        let mut block_end = None;
-        let mut j = open_brace;
-        while j < content.len() {
-            let ch = bytes[j] as char;
-            match ch {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        block_end = Some(j + 1);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-            j += 1;
-        }
-        let Some(end_pos) = block_end else {
-            search_from = fn_pos + needle.len();
-            continue;
-        };
-        let block_text = content[sig_start..end_pos].to_string();
-        let start_line = byte_offset_to_line(&content, sig_start);
-        let end_line = byte_offset_to_line(&content, end_pos.saturating_sub(1));
-        let parsed_top = parse_str::<ItemFn>(&block_text).ok();
-        let parsed_impl = parse_str::<syn::ImplItemFn>(&block_text).ok();
-        if let Some(item_fn) = parsed_top {
-            if item_fn.sig.ident == func_name {
-                matches.push(CodeBlockMatch {
-                    file_path: file_path.to_path_buf(),
-                    block_name: func_name.to_string(),
-                    block_type: CodeBlockType::Function,
-                    old_full_block: block_text,
-                    original_vis: Some(item_fn.vis),
-                    original_asyncness: item_fn.sig.asyncness,
-                    original_unsafety: item_fn.sig.unsafety,
-                    original_attrs: item_fn.attrs,
-                    line_range: Some((start_line, end_line)),
-                    context_label: None,
-                });
-                search_from = end_pos;
-                continue;
-            }
-        }
-        if let Some(method_fn) = parsed_impl {
-            if method_fn.sig.ident == func_name {
-                let impl_type =
-                    enclosing_impl_type(&file, start_line).unwrap_or_else(|| "unknown".to_string());
-                matches.push(CodeBlockMatch {
-                    file_path: file_path.to_path_buf(),
-                    block_name: func_name.to_string(),
-                    block_type: CodeBlockType::Function,
-                    old_full_block: block_text,
-                    original_vis: Some(method_fn.vis),
-                    original_asyncness: method_fn.sig.asyncness,
-                    original_unsafety: method_fn.sig.unsafety,
-                    original_attrs: method_fn.attrs,
-                    line_range: Some((start_line, end_line)),
-                    context_label: Some(format!("impl {}", impl_type)),
-                });
-            }
-        }
-        search_from = end_pos;
-    }
+    debug!(
+        file = % file_path.display(), func_name, total_ms = started.elapsed()
+        .as_millis(), match_count = matches.len(), "find_function_in_file finished"
+    );
     Ok(matches)
 }
 fn replace_block_by_line_range(
@@ -692,14 +613,10 @@ fn scan_directory_for_block(
     block_name: &str,
     block_type: &CodeBlockType,
 ) -> Result<Vec<CodeBlockMatch>> {
-    let mut all_matches = Vec::new();
-    fn walk_dir(
-        dir: &Path,
-        block_name: &str,
-        block_type: &CodeBlockType,
-        all_matches: &mut Vec<CodeBlockMatch>,
-    ) -> Result<()> {
-        for entry in fs::read_dir(dir)? {
+    fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+        for entry in
+            fs::read_dir(dir).with_context(|| format!("Failed to read dir {}", dir.display()))?
+        {
             let entry = entry?;
             let path = entry.path();
             if path.is_dir() {
@@ -710,6 +627,7 @@ fn scan_directory_for_block(
                     ".cargo",
                     ".idea",
                     ".vscode",
+                    ".direnv",
                 ];
                 if let Some(name) = path.file_name() {
                     let name_str = name.to_string_lossy();
@@ -717,30 +635,74 @@ fn scan_directory_for_block(
                         continue;
                     }
                 }
-                walk_dir(&path, block_name, block_type, all_matches)?;
+                collect_rust_files(&path, out)?;
             } else if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                match block_type {
-                    CodeBlockType::Function => {
-                        if let Ok(matches) = find_function_in_file(&path, block_name) {
-                            all_matches.extend(matches);
-                        }
-                    }
-                    CodeBlockType::Struct => {
-                        if let Ok(matches) = find_struct_in_file(&path, block_name) {
-                            all_matches.extend(matches);
-                        }
-                    }
-                    CodeBlockType::Enum => {
-                        if let Ok(matches) = find_enum_in_file(&path, block_name) {
-                            all_matches.extend(matches);
-                        }
-                    }
-                }
+                out.push(path);
             }
         }
         Ok(())
     }
-    walk_dir(dir, block_name, block_type, &mut all_matches)?;
+    let total_started = Instant::now();
+    let mut files = Vec::new();
+    collect_rust_files(dir, &mut files)?;
+    debug!(
+        dir = % dir.display(), block_name, block_type = ? block_type, file_count = files
+        .len(), "collected rust files"
+    );
+    let scanned_files = AtomicUsize::new(0);
+    let candidate_files: Vec<PathBuf> = files
+        .par_iter()
+        .filter_map(|path| {
+            scanned_files.fetch_add(1, Ordering::Relaxed);
+            let content = match fs::read_to_string(path) {
+                Ok(content) => content,
+                Err(err) => {
+                    debug!(
+                        file = % path.display(), error = % err,
+                        "failed to read file during prefilter"
+                    );
+                    return None;
+                }
+            };
+            let hit = match block_type {
+                CodeBlockType::Function | CodeBlockType::Struct | CodeBlockType::Enum => {
+                    content.contains(block_name)
+                }
+            };
+            if hit {
+                Some(path.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    debug!(
+        dir = % dir.display(), block_name, block_type = ? block_type, scanned_files =
+        scanned_files.load(Ordering::Relaxed), candidate_files = candidate_files.len(),
+        prefilter_ms = total_started.elapsed().as_millis(), "parallel prefilter finished"
+    );
+    let mut all_matches = Vec::new();
+    for path in candidate_files {
+        let started = Instant::now();
+        let mut matches = match block_type {
+            CodeBlockType::Function => find_function_in_file(&path, block_name)?,
+            CodeBlockType::Struct => find_struct_in_file(&path, block_name)?,
+            CodeBlockType::Enum => find_enum_in_file(&path, block_name)?,
+        };
+        if !matches.is_empty() {
+            debug!(
+                file = % path.display(), block_name, block_type = ? block_type,
+                elapsed_ms = started.elapsed().as_millis(), match_count = matches.len(),
+                "resolved matches in candidate file"
+            );
+        }
+        all_matches.append(&mut matches);
+    }
+    info!(
+        dir = % dir.display(), block_name, block_type = ? block_type, total_matches =
+        all_matches.len(), elapsed_ms = total_started.elapsed().as_millis(),
+        "scan_directory_for_block finished"
+    );
     Ok(all_matches)
 }
 fn select_match_with_fzf(matches: &[CodeBlockMatch]) -> Result<Option<CodeBlockMatch>> {
@@ -765,6 +727,25 @@ fn select_match_with_fzf(matches: &[CodeBlockMatch]) -> Result<Option<CodeBlockM
         }
         String::new()
     }
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                if matches!(chars.peek(), Some('[')) {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            out.push(ch);
+        }
+        out
+    }
     let block_type = match matches[0].block_type {
         CodeBlockType::Function => "fn",
         CodeBlockType::Struct => "struct",
@@ -775,53 +756,56 @@ fn select_match_with_fzf(matches: &[CodeBlockMatch]) -> Result<Option<CodeBlockM
         "\n📁 Multiple matches found for \x1b[1;36m{}\x1b[0m \x1b[1;33m{}\x1b[0m. Select one to modify:",
         block_type, header_name
     );
-    let rendered_rows: Vec<(usize, String)> = matches
+    let rendered_rows: Vec<(usize, String, String, String, String)> = matches
         .iter()
         .enumerate()
         .map(|(idx, m)| {
-            let rel_path = relative_display_path(&m.file_path);
             let location = if let Some((start, end)) = m.line_range {
-                format!("{}:{}-{}", rel_path, start, end)
+                format!("{}:{}-{}", relative_display_path(&m.file_path), start, end)
             } else {
-                rel_path
+                relative_display_path(&m.file_path)
             };
+            let line_count = heatmap_lines(m.line_range);
+            let outer = m
+                .context_label
+                .as_ref()
+                .map(|s| ansi_cyan(s))
+                .unwrap_or_default();
             let preview = compact_body_preview(&m.old_full_block);
-            let row = if let Some(ctx) = &m.context_label {
-                format!("{}\t{}\t{}\t{}", idx, location, ctx, preview)
-            } else {
-                format!("{}\t{}\t\t{}", idx, location, preview)
-            };
-            (idx, row)
+            (idx, location, line_count, outer, preview)
         })
         .collect();
     let location_width = rendered_rows
         .iter()
-        .filter_map(|(_, row)| row.split('\t').nth(1))
-        .map(|s| s.chars().count())
+        .map(|(_, location, _, _, _)| strip_ansi(location).chars().count())
         .max()
         .unwrap_or(0);
-    let context_width = rendered_rows
+    let lines_width = rendered_rows
         .iter()
-        .filter_map(|(_, row)| row.split('\t').nth(2))
-        .map(|s| s.chars().count())
+        .map(|(_, lines, _, _, _)| strip_ansi(lines).chars().count())
+        .max()
+        .unwrap_or(0);
+    let outer_width = rendered_rows
+        .iter()
+        .map(|(_, _, _, outer, _)| strip_ansi(outer).chars().count())
         .max()
         .unwrap_or(0);
     let item_list = rendered_rows
         .into_iter()
-        .map(|(idx, row)| {
-            let mut parts = row.splitn(4, '\t');
-            let idx_part = parts.next().unwrap_or_default();
-            let loc_part = parts.next().unwrap_or_default();
-            let ctx_part = parts.next().unwrap_or_default();
-            let preview_part = parts.next().unwrap_or_default();
+        .map(|(idx, location, line_count, outer, preview)| {
+            let location_pad = location_width.saturating_sub(strip_ansi(&location).chars().count());
+            let lines_pad = lines_width.saturating_sub(strip_ansi(&line_count).chars().count());
+            let outer_pad = outer_width.saturating_sub(strip_ansi(&outer).chars().count());
             format!(
-                "{}\t{:<location_width$}  {:<context_width$}  {}",
+                "{}\t{}{}  {}{}  {}{}  {}",
                 idx,
-                loc_part,
-                ctx_part,
-                preview_part,
-                location_width = location_width,
-                context_width = context_width
+                location,
+                " ".repeat(location_pad),
+                line_count,
+                " ".repeat(lines_pad),
+                outer,
+                " ".repeat(outer_pad),
+                preview
             )
         })
         .collect::<Vec<_>>()
@@ -867,6 +851,7 @@ fn select_match_with_fzf(matches: &[CodeBlockMatch]) -> Result<Option<CodeBlockM
     Ok(None)
 }
 fn main() -> Result<()> {
+    init_tracing();
     let config = load_unified_config()?;
     let args: Vec<String> = env::args().skip(1).collect();
     let target_dir = if args.is_empty() {
@@ -941,7 +926,24 @@ fn main() -> Result<()> {
             }
         }
         eprintln!("\n🔎 Scanning for {} '{}'...", type_str, block_name);
+        let scan_started = Instant::now();
         let mut matches = scan_directory_for_block(&target_dir, &block_name, &block_type)?;
+        enrich_match_metadata_parallel(&mut matches)?;
+        let scan_elapsed = scan_started.elapsed();
+        let with_lines = matches.iter().filter(|m| m.line_range.is_some()).count();
+        let with_context = matches.iter().filter(|m| m.context_label.is_some()).count();
+        eprintln!(
+            "✓ Scan complete: found {} matching block(s) in {:?} ({} with lines, {} with context)",
+            matches.len(),
+            scan_elapsed,
+            with_lines,
+            with_context
+        );
+        info!(
+            block_name, block_type = ? block_type, match_count = matches.len(),
+            with_lines, with_context, elapsed_ms = scan_elapsed.as_millis(),
+            "block scan complete"
+        );
         if let Some(ref last_match) = last_selected_match {
             if last_match.block_name == block_name {
                 let file_matches: Vec<CodeBlockMatch> = matches
@@ -964,8 +966,8 @@ fn main() -> Result<()> {
                     matches = file_matches;
                 } else {
                     eprintln!(
-                        "ℹ Last selected match ({}) does not contain '{}', will prompt for new selection",
-                        last_match.file_path.display(), block_name
+                        "ℹ Last selected match no longer matches '{}', prompting again",
+                        block_name
                     );
                     last_selected_match = None;
                 }
@@ -980,59 +982,17 @@ fn main() -> Result<()> {
             last_selected_match = None;
             continue;
         }
-        eprintln!("✓ Found {} matching {} block(s):", matches.len(), type_str);
-        for m in &matches {
-            let rel_path = relative_display_path(&m.file_path);
-            match m.line_range {
-                Some((start, end)) => {
-                    eprintln!(
-                        "  • {}:{}-{} {}",
-                        ansi_dim(rel_path),
-                        start,
-                        end,
-                        heatmap_lines(Some((start, end)))
-                    );
+        let selected_matches = if matches.len() > 1 {
+            match select_match_with_fzf(&matches)? {
+                Some(selected_match) => {
+                    last_selected_match = Some(selected_match.clone());
+                    vec![selected_match]
                 }
                 None => {
-                    eprintln!("  • {} {}", ansi_dim(rel_path), heatmap_lines(None));
-                }
-            }
-        }
-        let selected_matches = if matches.len() > 1 {
-            let remembered_match = if let Some(ref last_match) = last_selected_match {
-                matches
-                    .iter()
-                    .find(|m| {
-                        m.file_path == last_match.file_path && m.line_range == last_match.line_range
-                    })
-                    .cloned()
-            } else {
-                None
-            };
-            if let Some(matched) = remembered_match {
-                let range_str = matched
-                    .line_range
-                    .map(|(s, e)| format!("{}-{}", s, e))
-                    .unwrap_or_else(|| "unknown".to_string());
-                eprintln!(
-                    "\n📁 Using previously selected match: {}:{}",
-                    relative_display_path(&matched.file_path),
-                    range_str
-                );
-                vec![matched]
-            } else {
-                eprintln!("\n📁 Multiple matches found. Select one to modify:");
-                match select_match_with_fzf(&matches)? {
-                    Some(selected_match) => {
-                        last_selected_match = Some(selected_match.clone());
-                        vec![selected_match]
-                    }
-                    None => {
-                        eprintln!("⚠ No match selected for '{}', skipping", block_name);
-                        skipped_count += 1;
-                        manually_skipped_blocks.push(format!("{} {}", type_str, block_name));
-                        continue;
-                    }
+                    eprintln!("⚠ No match selected for '{}', skipping", block_name);
+                    skipped_count += 1;
+                    manually_skipped_blocks.push(format!("{} {}", type_str, block_name));
+                    continue;
                 }
             }
         } else {
@@ -1047,7 +1007,17 @@ fn main() -> Result<()> {
                 .line_range
                 .map(|(s, e)| format!("{}-{}", s, e))
                 .unwrap_or_else(|| "unknown".to_string());
-            eprintln!("\n  File: {} (lines {})", m.file_path.display(), range_str);
+            let context_suffix = m
+                .context_label
+                .as_ref()
+                .map(|ctx| format!(" {}", ansi_cyan(ctx)))
+                .unwrap_or_default();
+            eprintln!(
+                "\n  File: {} (lines {}){}",
+                relative_display_path(&m.file_path),
+                range_str,
+                context_suffix
+            );
             eprintln!("\n  \x1b[1;33mDiff (formatted with rustfmt):\x1b[0m");
             println!("\x1b[90m{}\x1b[0m", "-".repeat(60));
             let changed =
@@ -1105,7 +1075,11 @@ fn main() -> Result<()> {
                 .line_range
                 .map(|(s, e)| format!("{}-{}", s, e))
                 .unwrap_or_else(|| "unknown".to_string());
-            eprintln!("  ✓ Updated: {} (lines {})", file_path.display(), range_str);
+            eprintln!(
+                "  ✓ Updated: {} (lines {})",
+                relative_display_path(file_path),
+                range_str
+            );
             processed_count += 1;
         }
         eprintln!("\n✅ {} '{}' processed successfully!", type_str, block_name);
@@ -1151,41 +1125,272 @@ fn main() -> Result<()> {
 }
 fn relative_display_path(path: &Path) -> String {
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    path.strip_prefix(&cwd)
-        .unwrap_or(path)
-        .display()
-        .to_string()
+    let rel = path.strip_prefix(&cwd).unwrap_or(path);
+    let parent = rel.parent().filter(|p| !p.as_os_str().is_empty());
+    let filename = rel
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| rel.display().to_string());
+    match parent {
+        Some(parent) => format!("{}/{}", parent.display(), color_filename(&filename)),
+        None => color_filename(&filename),
+    }
 }
-
 fn ansi_dim(s: impl AsRef<str>) -> String {
     format!("\x1b[90m{}\x1b[0m", s.as_ref())
 }
-
 fn ansi_cyan(s: impl AsRef<str>) -> String {
     format!("\x1b[36m{}\x1b[0m", s.as_ref())
 }
-
 fn ansi_green(s: impl AsRef<str>) -> String {
     format!("\x1b[32m{}\x1b[0m", s.as_ref())
 }
-
 fn ansi_yellow(s: impl AsRef<str>) -> String {
     format!("\x1b[33m{}\x1b[0m", s.as_ref())
 }
-
 fn ansi_red(s: impl AsRef<str>) -> String {
     format!("\x1b[31m{}\x1b[0m", s.as_ref())
 }
-
 fn block_line_count(range: Option<(usize, usize)>) -> Option<usize> {
     range.map(|(start, end)| end.saturating_sub(start) + 1)
 }
-
 fn heatmap_lines(range: Option<(usize, usize)>) -> String {
     match block_line_count(range) {
-        Some(n) if n <= 8 => ansi_green(format!("{}L", n)),
-        Some(n) if n <= 20 => ansi_yellow(format!("{}L", n)),
-        Some(n) => ansi_red(format!("{}L", n)),
+        Some(n) => format!("{}L", heatmap_color(n, 0, 80)),
         None => ansi_dim("?L"),
     }
+}
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,wcf=debug")),
+        )
+        .with_target(false)
+        .with_thread_ids(true)
+        .with_level(true)
+        .try_init();
+}
+fn find_block_metadata_in_content(
+    content: &str,
+    block_name: &str,
+    block_type: &CodeBlockType,
+    old_full_block: &str,
+    existing_context: Option<&str>,
+) -> (Option<(usize, usize)>, Option<String>) {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut candidate_headers = Vec::new();
+    match block_type {
+        CodeBlockType::Function => {
+            candidate_headers.push(format!("fn {}", block_name));
+            candidate_headers.push(format!("async fn {}", block_name));
+            candidate_headers.push(format!("pub fn {}", block_name));
+            candidate_headers.push(format!("pub async fn {}", block_name));
+            candidate_headers.push(format!("pub(crate) fn {}", block_name));
+            candidate_headers.push(format!("pub(crate) async fn {}", block_name));
+        }
+        CodeBlockType::Struct => {
+            candidate_headers.push(format!("struct {}", block_name));
+            candidate_headers.push(format!("pub struct {}", block_name));
+            candidate_headers.push(format!("pub(crate) struct {}", block_name));
+        }
+        CodeBlockType::Enum => {
+            candidate_headers.push(format!("enum {}", block_name));
+            candidate_headers.push(format!("pub enum {}", block_name));
+            candidate_headers.push(format!("pub(crate) enum {}", block_name));
+        }
+    }
+    let mut hits: Vec<(usize, usize)> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if !candidate_headers.iter().any(|h| trimmed.contains(h)) {
+            continue;
+        }
+        let mut start = i;
+        while start > 0 {
+            let prev = lines[start - 1].trim();
+            if prev.starts_with("#[")
+                || prev.starts_with("///")
+                || prev.starts_with("//!")
+                || prev.is_empty()
+            {
+                start -= 1;
+            } else {
+                break;
+            }
+        }
+        let mut brace_depth = 0i32;
+        let mut saw_open = false;
+        let mut end = None;
+        for (j, l) in lines.iter().enumerate().skip(i) {
+            for ch in l.chars() {
+                match ch {
+                    '{' => {
+                        brace_depth += 1;
+                        saw_open = true;
+                    }
+                    '}' => {
+                        brace_depth -= 1;
+                        if saw_open && brace_depth == 0 {
+                            end = Some(j);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if end.is_some() {
+                break;
+            }
+        }
+        if let Some(end_idx) = end {
+            hits.push((start + 1, end_idx + 1));
+        }
+    }
+    let selected_range = if hits.len() == 1 {
+        Some(hits[0])
+    } else if !old_full_block.trim().is_empty() {
+        find_block_line_range(content, old_full_block, &lines)
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let context_label = if existing_context.is_some() {
+        existing_context.map(|s| s.to_string())
+    } else if let Some((start_line, _)) = selected_range {
+        infer_outer_context_label(content, start_line)
+    } else {
+        None
+    };
+    (selected_range, context_label)
+}
+fn infer_outer_context_label(content: &str, start_line: usize) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    if start_line == 0 || start_line > lines.len() {
+        return None;
+    }
+    for i in (0..start_line.saturating_sub(1)).rev() {
+        let trimmed = lines[i].trim();
+        if let Some(rest) = trimmed.strip_prefix("impl ") {
+            let name = rest
+                .split('{')
+                .next()
+                .unwrap_or(rest)
+                .trim()
+                .replace(" where ", " ");
+            return Some(format!("impl {}", name));
+        }
+        if let Some(rest) = trimmed.strip_prefix("trait ") {
+            let name = rest
+                .split('{')
+                .next()
+                .unwrap_or(rest)
+                .trim()
+                .split_whitespace()
+                .next()
+                .unwrap_or("unknown");
+            return Some(format!("trait {}", name));
+        }
+        if let Some(rest) = trimmed.strip_prefix("mod ") {
+            let name = rest
+                .split('{')
+                .next()
+                .unwrap_or(rest)
+                .trim()
+                .trim_end_matches(';')
+                .trim();
+            return Some(format!("mod {}", name));
+        }
+    }
+    None
+}
+fn enrich_match_metadata_parallel(matches: &mut [CodeBlockMatch]) -> Result<()> {
+    if matches.is_empty() {
+        return Ok(());
+    }
+    let started = Instant::now();
+    let mut grouped: HashMap<PathBuf, Vec<(usize, String, CodeBlockType, String, Option<String>)>> =
+        HashMap::new();
+    for (idx, m) in matches.iter().enumerate() {
+        grouped.entry(m.file_path.clone()).or_default().push((
+            idx,
+            m.block_name.clone(),
+            m.block_type.clone(),
+            m.old_full_block.clone(),
+            m.context_label.clone(),
+        ));
+    }
+    let total_files = grouped.len();
+    let total_matches = matches.len();
+    debug!(
+        total_files,
+        total_matches, "starting parallel metadata enrichment"
+    );
+    let processed = AtomicUsize::new(0);
+    let grouped_vec: Vec<(
+        PathBuf,
+        Vec<(usize, String, CodeBlockType, String, Option<String>)>,
+    )> = grouped.into_iter().collect();
+    let results: Vec<Result<Vec<(usize, Option<(usize, usize)>, Option<String>)>>> = grouped_vec
+        .par_iter()
+        .map(|(path, entries)| {
+            let file_started = Instant::now();
+            let content = fs::read_to_string(path)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+            let mut out = Vec::with_capacity(entries.len());
+            for (idx, block_name, block_type, old_full_block, existing_context) in entries {
+                let (line_range, context_label) = find_block_metadata_in_content(
+                    &content,
+                    block_name,
+                    block_type,
+                    old_full_block,
+                    existing_context.as_deref(),
+                );
+                let now = processed.fetch_add(1, Ordering::Relaxed) + 1;
+                if now % 100 == 0 || now == total_matches {
+                    debug!(
+                        processed = now,
+                        total = total_matches,
+                        "metadata enrichment progress"
+                    );
+                }
+                out.push((*idx, line_range, context_label));
+            }
+            debug!(
+                file = % path.display(), entry_count = entries.len(), elapsed_ms =
+                file_started.elapsed().as_millis(),
+                "metadata enrichment finished for file"
+            );
+            Ok(out)
+        })
+        .collect();
+    let mut missing_lines = 0usize;
+    let mut missing_context = 0usize;
+    for result in results {
+        for (idx, line_range, context_label) in result? {
+            matches[idx].line_range = line_range;
+            if matches[idx].context_label.is_none() {
+                matches[idx].context_label = context_label;
+            }
+            if matches[idx].line_range.is_none() {
+                missing_lines += 1;
+                warn!(
+                    file = % matches[idx].file_path.display(), block_name = %
+                    matches[idx].block_name, block_type = ? matches[idx].block_type,
+                    "line_range still missing after enrichment"
+                );
+            }
+            if matches[idx].context_label.is_none() {
+                missing_context += 1;
+            }
+        }
+    }
+    info!(
+        total_matches,
+        missing_lines,
+        missing_context,
+        elapsed_ms = started.elapsed().as_millis(),
+        "metadata enrichment complete"
+    );
+    Ok(())
 }
