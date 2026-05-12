@@ -29,6 +29,7 @@ struct CodeBlockMatch {
     original_unsafety: Option<syn::token::Unsafe>,
     original_attrs: Vec<Attribute>,
     line_range: Option<(usize, usize)>,
+    context_label: Option<String>,
 }
 fn format_code_with_rustfmt(code: &str, file_path: Option<&Path>) -> Result<String> {
     let temp_dir = tempfile::TempDir::new()?;
@@ -300,6 +301,7 @@ fn find_enum_in_file(file_path: &Path, enum_name: &str) -> Result<Vec<CodeBlockM
                     original_unsafety: None,
                     original_attrs: item_enum.attrs,
                     line_range,
+                    context_label: None,
                 });
             }
         }
@@ -326,6 +328,7 @@ fn find_struct_in_file(file_path: &Path, struct_name: &str) -> Result<Vec<CodeBl
                     original_unsafety: None,
                     original_attrs: item_struct.attrs,
                     line_range,
+                    context_label: None,
                 });
             }
         }
@@ -352,17 +355,22 @@ fn find_function_in_file(file_path: &Path, func_name: &str) -> Result<Vec<CodeBl
     fn enclosing_impl_type(file: &File, line_no: usize) -> Option<String> {
         for item in &file.items {
             if let Item::Impl(item_impl) = item {
-                let impl_str = quote::quote!(# item_impl).to_string();
-                let impl_lines = impl_str.lines().count().max(1);
-                for start_guess in 1..=line_no {
-                    let end_guess = start_guess + impl_lines - 1;
-                    if line_no >= start_guess && line_no <= end_guess {
-                        let impl_type = if let syn::Type::Path(type_path) = &*item_impl.self_ty {
-                            last_segment(&type_path.path)
-                        } else {
-                            "unknown".to_string()
-                        };
-                        return Some(impl_type);
+                for method in &item_impl.items {
+                    if let ImplItem::Fn(method_fn) = method {
+                        let method_str = quote::quote!(# method_fn).to_string();
+                        let method_line_count = method_str.lines().count().max(1);
+                        for start_guess in 1..=line_no {
+                            let end_guess = start_guess + method_line_count - 1;
+                            if line_no >= start_guess && line_no <= end_guess {
+                                let impl_type =
+                                    if let syn::Type::Path(type_path) = &*item_impl.self_ty {
+                                        last_segment(&type_path.path)
+                                    } else {
+                                        "unknown".to_string()
+                                    };
+                                return Some(impl_type);
+                            }
+                        }
                     }
                 }
             }
@@ -466,10 +474,6 @@ fn find_function_in_file(file_path: &Path, func_name: &str) -> Result<Vec<CodeBl
         let end_line = byte_offset_to_line(&content, end_pos.saturating_sub(1));
         let parsed_top = parse_str::<ItemFn>(&block_text).ok();
         let parsed_impl = parse_str::<syn::ImplItemFn>(&block_text).ok();
-        if parsed_top.is_none() && parsed_impl.is_none() {
-            search_from = end_pos;
-            continue;
-        }
         if let Some(item_fn) = parsed_top {
             if item_fn.sig.ident == func_name {
                 matches.push(CodeBlockMatch {
@@ -482,6 +486,7 @@ fn find_function_in_file(file_path: &Path, func_name: &str) -> Result<Vec<CodeBl
                     original_unsafety: item_fn.sig.unsafety,
                     original_attrs: item_fn.attrs,
                     line_range: Some((start_line, end_line)),
+                    context_label: None,
                 });
                 search_from = end_pos;
                 continue;
@@ -493,7 +498,7 @@ fn find_function_in_file(file_path: &Path, func_name: &str) -> Result<Vec<CodeBl
                     enclosing_impl_type(&file, start_line).unwrap_or_else(|| "unknown".to_string());
                 matches.push(CodeBlockMatch {
                     file_path: file_path.to_path_buf(),
-                    block_name: format!("{} (in impl {})", func_name, impl_type),
+                    block_name: func_name.to_string(),
                     block_type: CodeBlockType::Function,
                     old_full_block: block_text,
                     original_vis: Some(method_fn.vis),
@@ -501,6 +506,7 @@ fn find_function_in_file(file_path: &Path, func_name: &str) -> Result<Vec<CodeBl
                     original_unsafety: method_fn.sig.unsafety,
                     original_attrs: method_fn.attrs,
                     line_range: Some((start_line, end_line)),
+                    context_label: Some(format!("impl {}", impl_type)),
                 });
             }
         }
@@ -742,40 +748,97 @@ fn select_match_with_fzf(matches: &[CodeBlockMatch]) -> Result<Option<CodeBlockM
     if fzf_check.is_err() {
         bail!("fzf not found");
     }
-    let mut items = Vec::new();
-    for (idx, m) in matches.iter().enumerate() {
-        let type_str = match m.block_type {
-            CodeBlockType::Function => "fn",
-            CodeBlockType::Struct => "struct",
-            CodeBlockType::Enum => "enum",
-        };
-        let location = if let Some((start, end)) = m.line_range {
-            format!("{}:{}-{}", m.file_path.display(), start, end)
-        } else {
-            format!("{} [match {}]", m.file_path.display(), idx + 1)
-        };
-        let preview = m
-            .old_full_block
-            .lines()
-            .find(|l| !l.trim().is_empty())
-            .map(|l| l.trim())
-            .unwrap_or("");
-        items.push(format!(
-            "{}\t{:<7} {:<40} {}\t{}",
-            idx, type_str, m.block_name, location, preview
-        ));
+    if matches.is_empty() {
+        return Ok(None);
     }
-    let item_list = items.join("\n");
+    fn compact_body_preview(block: &str) -> String {
+        let body = block.split_once('{').map(|(_, rest)| rest).unwrap_or(block);
+        for line in body.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed == "}" {
+                continue;
+            }
+            if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+                continue;
+            }
+            return trimmed.chars().take(120).collect();
+        }
+        String::new()
+    }
+    let block_type = match matches[0].block_type {
+        CodeBlockType::Function => "fn",
+        CodeBlockType::Struct => "struct",
+        CodeBlockType::Enum => "enum",
+    };
+    let header_name = &matches[0].block_name;
+    eprintln!(
+        "\n📁 Multiple matches found for \x1b[1;36m{}\x1b[0m \x1b[1;33m{}\x1b[0m. Select one to modify:",
+        block_type, header_name
+    );
+    let rendered_rows: Vec<(usize, String)> = matches
+        .iter()
+        .enumerate()
+        .map(|(idx, m)| {
+            let rel_path = relative_display_path(&m.file_path);
+            let location = if let Some((start, end)) = m.line_range {
+                format!("{}:{}-{}", rel_path, start, end)
+            } else {
+                rel_path
+            };
+            let preview = compact_body_preview(&m.old_full_block);
+            let row = if let Some(ctx) = &m.context_label {
+                format!("{}\t{}\t{}\t{}", idx, location, ctx, preview)
+            } else {
+                format!("{}\t{}\t\t{}", idx, location, preview)
+            };
+            (idx, row)
+        })
+        .collect();
+    let location_width = rendered_rows
+        .iter()
+        .filter_map(|(_, row)| row.split('\t').nth(1))
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(0);
+    let context_width = rendered_rows
+        .iter()
+        .filter_map(|(_, row)| row.split('\t').nth(2))
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(0);
+    let item_list = rendered_rows
+        .into_iter()
+        .map(|(idx, row)| {
+            let mut parts = row.splitn(4, '\t');
+            let idx_part = parts.next().unwrap_or_default();
+            let loc_part = parts.next().unwrap_or_default();
+            let ctx_part = parts.next().unwrap_or_default();
+            let preview_part = parts.next().unwrap_or_default();
+            format!(
+                "{}\t{:<location_width$}  {:<context_width$}  {}",
+                idx,
+                loc_part,
+                ctx_part,
+                preview_part,
+                location_width = location_width,
+                context_width = context_width
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut fzf_child = Command::new("fzf")
         .arg("--height")
         .arg("40%")
         .arg("--border")
         .arg("--layout=reverse")
         .arg("--no-multi")
+        .arg("--ansi")
         .arg("--delimiter")
         .arg("\t")
         .arg("--with-nth")
         .arg("2..")
+        .arg("--prompt")
+        .arg("> ")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -894,8 +957,8 @@ fn main() -> Result<()> {
                         .map(|(s, e)| format!("{}-{}", s, e))
                         .unwrap_or_else(|| "unknown".to_string());
                     eprintln!(
-                        "✓ Using previously selected match: {} (lines {})",
-                        last_match.file_path.display(),
+                        "✓ Using previously selected match: {}:{}",
+                        relative_display_path(&last_match.file_path),
                         range_str
                     );
                     matches = file_matches;
@@ -919,10 +982,11 @@ fn main() -> Result<()> {
         }
         eprintln!("✓ Found {} matching {} block(s):", matches.len(), type_str);
         for m in &matches {
+            let rel_path = relative_display_path(&m.file_path);
             if let Some((start, end)) = m.line_range {
-                eprintln!("  • {} (lines {}-{})", m.file_path.display(), start, end);
+                eprintln!("  • {}:{}-{}", rel_path, start, end);
             } else {
-                eprintln!("  • {}", m.file_path.display());
+                eprintln!("  • {}", rel_path);
             }
         }
         let selected_matches = if matches.len() > 1 {
@@ -942,8 +1006,8 @@ fn main() -> Result<()> {
                     .map(|(s, e)| format!("{}-{}", s, e))
                     .unwrap_or_else(|| "unknown".to_string());
                 eprintln!(
-                    "\n📁 Using previously selected match: {} (lines {})",
-                    matched.file_path.display(),
+                    "\n📁 Using previously selected match: {}:{}",
+                    relative_display_path(&matched.file_path),
                     range_str
                 );
                 vec![matched]
@@ -1075,4 +1139,11 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+fn relative_display_path(path: &Path) -> String {
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    path.strip_prefix(&cwd)
+        .unwrap_or(path)
+        .display()
+        .to_string()
 }
