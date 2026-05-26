@@ -1,3 +1,4 @@
+// src/bin/wcg.rs # 06:17:18 12.05.2026
 use anyhow::{bail, Context, Result};
 use chrono::Local;
 use std::{
@@ -661,6 +662,7 @@ struct Application {
     show_line_numbers: bool,
     show_calls: bool,
     show_fields: bool,
+    show_imports: bool,
 }
 impl Application {
     fn new() -> Result<Self> {
@@ -670,16 +672,20 @@ impl Application {
         let mut show_line_numbers = wcg_config.show_line_numbers;
         let mut show_calls = wcg_config.show_calls;
         let mut show_fields = wcg_config.show_fields;
+        let mut show_imports = wcg_config.show_imports;
         let mut i = 1;
         while i < args.len() {
             match args[i].as_str() {
                 "-n" => show_line_numbers = !wcg_config.show_line_numbers,
                 "-c" => show_calls = !wcg_config.show_calls,
                 "-f" => show_fields = !wcg_config.show_fields,
+                "-i" => show_imports = !wcg_config.show_imports,
                 "--show-calls" => show_calls = true,
                 "--hide-calls" => show_calls = false,
                 "--show-fields" => show_fields = true,
                 "--hide-fields" => show_fields = false,
+                "--show-imports" => show_imports = true,
+                "--hide-imports" => show_imports = false,
                 _ => {}
             }
             i += 1;
@@ -690,6 +696,7 @@ impl Application {
             show_line_numbers,
             show_calls,
             show_fields,
+            show_imports,
         })
     }
     fn run(&self) -> Result<()> {
@@ -737,6 +744,9 @@ impl Application {
         }
         if self.show_fields {
             eprintln!("\x1b[90mStruct fields are shown; use -f to toggle\x1b[0m");
+        }
+        if self.show_imports {
+            eprintln!("\x1b[90mImports are shown; use -i to toggle\x1b[0m");
         }
         Ok(())
     }
@@ -960,7 +970,7 @@ impl Application {
                     .path
                     .strip_prefix(root)
                     .unwrap_or(&struct_info.path);
-                if printed_imports.insert(struct_info.path.clone()) {
+                if self.show_imports && printed_imports.insert(struct_info.path.clone()) {
                     content.push_str(&graph.render_file_imports(&struct_info.path, root));
                 }
                 let visibility = if struct_info.visibility == "pub" {
@@ -1010,7 +1020,7 @@ impl Application {
                     .path
                     .strip_prefix(root)
                     .unwrap_or(&trait_info.path);
-                if printed_imports.insert(trait_info.path.clone()) {
+                if self.show_imports && printed_imports.insert(trait_info.path.clone()) {
                     content.push_str(&graph.render_file_imports(&trait_info.path, root));
                 }
                 let generics = if !trait_info.generics.is_empty() {
@@ -1040,7 +1050,7 @@ impl Application {
             content.push_str("// ============================================================\n\n");
             for func in top_level_functions {
                 let rel_path = func.path.strip_prefix(root).unwrap_or(&func.path);
-                if printed_imports.insert(func.path.clone()) {
+                if self.show_imports && printed_imports.insert(func.path.clone()) {
                     content.push_str(&graph.render_file_imports(&func.path, root));
                 }
                 let visibility = if func.visibility == "pub" { "pub " } else { "" };
@@ -1059,7 +1069,7 @@ impl Application {
             content.push_str("// ============================================================\n\n");
             for impl_info in graph.impls.values() {
                 let rel_path = impl_info.path.strip_prefix(root).unwrap_or(&impl_info.path);
-                if printed_imports.insert(impl_info.path.clone()) {
+                if self.show_imports && printed_imports.insert(impl_info.path.clone()) {
                     content.push_str(&graph.render_file_imports(&impl_info.path, root));
                 }
                 let generics = if !impl_info.generics.is_empty() {

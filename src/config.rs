@@ -80,6 +80,7 @@ pub struct WcgConfig {
     pub show_line_numbers: bool,
     pub show_calls: bool,
     pub show_fields: bool,
+    pub show_imports: bool,  // Added this field
 }
 
 impl Default for WffConfig {
@@ -99,6 +100,7 @@ impl Default for WcgConfig {
             show_line_numbers: true,
             show_calls: true,
             show_fields: true,
+            show_imports: true,  // Added default value (true)
         }
     }
 }
@@ -247,6 +249,7 @@ pub fn show_config() -> Result<()> {
     println!("    show_line_numbers: {}", config.wcg.show_line_numbers);
     println!("    show_calls: {}", config.wcg.show_calls);
     println!("    show_fields: {}", config.wcg.show_fields);
+    println!("    show_imports: {}", config.wcg.show_imports);  // Added this line
     println!();
     println!("  Config file: \x1b[90m{}\x1b[0m", get_config_path().display());
     
@@ -280,7 +283,7 @@ pub fn init_config() -> Result<()> {
     println!("  [wcl] - analyzer settings with {} skip patterns", config.wcl.skip_patterns.len());
     println!("  [wcf] - function replacement settings");
     println!("  [wff] - wff (function finder) settings with time and line number options");
-    println!("  [wcg] - code graph analyzer settings");
+    println!("  [wcg] - code graph analyzer settings with line numbers, calls, fields, and imports");
     
     Ok(())
 }

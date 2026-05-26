@@ -35,6 +35,10 @@ path = "src/bin/wff.rs"
 name = "wce"
 path = "src/bin/wce.rs"
 
+[[bin]]
+name = "wcgv"
+path = "src/bin/wcgv.rs"
+
 [dependencies]
 # Common dependencies
 anyhow = "1.0"
