@@ -1,761 +1,821 @@
-use anyhow::Result;
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::Local;
-use quote::ToTokens;
-use serde_json::json;
-use std::{
-    collections::{HashMap, HashSet},
-    env, fs,
-    path::{Path, PathBuf},
-};
-use syn::{
-    parse_file,
-    spanned::Spanned,
-    visit::Visit,
-    FnArg, GenericParam, Generics, ImplItem, ItemFn, ItemImpl, ReturnType, Signature, WhereClause,
-};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::env;
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
+use url::Url;
+use wcc::config::load_unified_config;
 
-#[derive(Debug, Clone)]
-struct FunctionInfo {
-    name: String,
-    signature: String,
-    calls: HashSet<String>,
-    generics: Vec<String>,
-    visibility: String,
-    path: PathBuf,
-    in_impl: Option<String>,
-    range: SourceRange,
-    source_snippet: String,
-}
-
-#[derive(Debug, Clone)]
-struct StructInfo {
-    name: String,
-    visibility: String,
-    path: PathBuf,
-    range: SourceRange,
-    source_snippet: String,
-}
-
-#[derive(Debug, Clone)]
-struct TraitInfo {
-    name: String,
-    visibility: String,
-    path: PathBuf,
-    range: SourceRange,
-    source_snippet: String,
-}
-
-#[derive(Debug, Clone)]
-struct ImplInfo {
-    target_type: String,
-    methods: Vec<FunctionInfo>,
-    path: PathBuf,
-}
-
-#[derive(Debug, Clone, Default)]
-struct CodeGraph {
-    structs: HashMap<String, StructInfo>,
-    functions: HashMap<String, FunctionInfo>,
-    impls: HashMap<String, ImplInfo>,
-    traits: HashMap<String, TraitInfo>,
-}
-
-#[derive(Debug, Clone)]
-struct GraphNode {
-    id: String,
-    label: String,
-    node_type: String,
-    path: String,
-    visibility: String,
-    size: f64,
-    color: String,
-    level: i32,
-    calls: Vec<String>,
-    signature: Option<String>,
-    range: SourceRange,
-    source_snippet: String,
-}
-
-#[derive(Debug, Clone)]
-struct GraphEdge {
-    source: String,
-    target: String,
-    edge_type: String,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Position {
     line: usize,
     column: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ByteRange {
     start: usize,
     end: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SourceRange {
     start: Position,
     end: Position,
+    #[serde(skip_serializing_if = "Option::is_none")]
     bytes: Option<ByteRange>,
 }
 
-impl Default for SourceRange {
-    fn default() -> Self {
-        Self {
-            start: Position { line: 0, column: 0 },
-            end: Position { line: 0, column: 0 },
-            bytes: None,
+#[derive(Debug, Clone)]
+struct SymbolNode {
+    key: String,
+    label: String,
+    kind: String,
+    path: String,
+    visibility: String,
+    signature: Option<String>,
+    selection_range: SourceRange,
+    full_range: SourceRange,
+    source_snippet: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct FileData {
+    rel_path: String,
+    content: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CliOptions {
+    target_dir: PathBuf,
+    output_path: PathBuf,
+    include_sources: bool,
+    rust_analyzer_bin: String,
+    warmup_ms: u64,
+    show_calls: bool,
+    show_fields: bool,
+    show_imports: bool,
+}
+
+impl CliOptions {
+    fn parse() -> Result<Self> {
+        let cfg = load_unified_config().context("loading unified config")?;
+        let mut args: VecDeque<String> = env::args().skip(1).collect();
+        let mut target_dir = env::current_dir()?;
+        let mut output_path = PathBuf::from("code_graph.json");
+        let mut include_sources = cfg.wcl.copy_file_contents;
+        let mut rust_analyzer_bin = env::var("RUST_ANALYZER_BIN").unwrap_or_else(|_| "rust-analyzer".to_string());
+        let mut warmup_ms = 2500u64;
+        let mut show_calls = cfg.wcg.show_calls;
+        let mut show_fields = cfg.wcg.show_fields;
+        let mut show_imports = cfg.wcg.show_imports;
+
+        while let Some(arg) = args.pop_front() {
+            match arg.as_str() {
+                "-o" | "--output" => {
+                    output_path = PathBuf::from(args.pop_front().ok_or_else(|| anyhow!("missing value for --output"))?);
+                }
+                "-s" | "--sources" => {
+                    include_sources = !include_sources;
+                }
+                "--rust-analyzer" => {
+                    rust_analyzer_bin = args.pop_front().ok_or_else(|| anyhow!("missing value for --rust-analyzer"))?;
+                }
+                "--warmup-ms" => {
+                    warmup_ms = args
+                        .pop_front()
+                        .ok_or_else(|| anyhow!("missing value for --warmup-ms"))?
+                        .parse()
+                        .context("parsing --warmup-ms")?;
+                }
+                "--no-calls" => show_calls = false,
+                "--no-fields" => show_fields = false,
+                "--no-imports" => show_imports = false,
+                other if other.starts_with('-') => bail!("unknown flag: {}", other),
+                path => target_dir = PathBuf::from(path),
+            }
+        }
+
+        Ok(Self {
+            target_dir,
+            output_path,
+            include_sources,
+            rust_analyzer_bin,
+            warmup_ms,
+            show_calls,
+            show_fields,
+            show_imports,
+        })
+    }
+}
+
+struct LspClient {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: AtomicU64,
+}
+
+impl LspClient {
+    fn start(bin: &str, root: &Path) -> Result<Self> {
+        let mut child = Command::new(bin)
+            .current_dir(root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| format!("starting {}", bin))?;
+
+        let stdin = child.stdin.take().context("capturing rust-analyzer stdin")?;
+        let stdout = child.stdout.take().context("capturing rust-analyzer stdout")?;
+
+        Ok(Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            next_id: AtomicU64::new(1),
+        })
+    }
+
+    fn send(&mut self, value: &Value) -> Result<()> {
+        let body = serde_json::to_vec(value)?;
+        write!(self.stdin, "Content-Length: {}\r\n\r\n", body.len())?;
+        self.stdin.write_all(&body)?;
+        self.stdin.flush()?;
+        Ok(())
+    }
+
+    fn read_message(&mut self) -> Result<Value> {
+        let mut content_length = None::<usize>;
+        loop {
+            let mut line = String::new();
+            let n = self.stdout.read_line(&mut line)?;
+            if n == 0 {
+                bail!("rust-analyzer closed stdout");
+            }
+            let line_trim = line.trim_end();
+            if line_trim.is_empty() {
+                break;
+            }
+            if let Some(rest) = line_trim.strip_prefix("Content-Length:") {
+                content_length = Some(rest.trim().parse().context("parsing Content-Length")?);
+            }
+        }
+        let len = content_length.context("missing Content-Length header")?;
+        let mut buf = vec![0u8; len];
+        self.stdout.read_exact(&mut buf)?;
+        Ok(serde_json::from_slice(&buf).context("decoding LSP payload")?)
+    }
+
+    fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }))?;
+
+        let start = Instant::now();
+        loop {
+            if start.elapsed() > timeout {
+                bail!("timeout waiting for {}", method);
+            }
+            let msg = self.read_message()?;
+            if msg.get("id").and_then(Value::as_u64) == Some(id) {
+                if let Some(err) = msg.get("error") {
+                    bail!("LSP {} error: {}", method, err);
+                }
+                return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
+            }
+        }
+    }
+
+    fn notify(&mut self, method: &str, params: Value) -> Result<()> {
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        }))
+    }
+
+    fn initialize(&mut self, root: &Path) -> Result<()> {
+        let root_uri = path_to_uri(root)?;
+        let _ = self.request(
+            "initialize",
+            json!({
+                "processId": std::process::id(),
+                "rootUri": root_uri,
+                "rootPath": root.display().to_string(),
+                "workspaceFolders": [{
+                    "uri": root_uri,
+                    "name": root.file_name().and_then(|s| s.to_str()).unwrap_or("workspace")
+                }],
+                "clientInfo": {"name": "wcgv", "version": env!("CARGO_PKG_VERSION")},
+                "capabilities": {
+                    "textDocument": {
+                        "documentSymbol": {"hierarchicalDocumentSymbolSupport": true},
+                        "references": {},
+                        "callHierarchy": {},
+                        "hover": {}
+                    },
+                    "workspace": {
+                        "workspaceFolders": true,
+                        "symbol": {}
+                    }
+                },
+                "initializationOptions": {
+                    "cargo": {
+                        "allFeatures": true,
+                        "buildScripts": {"enable": true}
+                    },
+                    "procMacro": {"enable": true},
+                    "checkOnSave": true
+                }
+            }),
+            Duration::from_secs(30),
+        )?;
+        self.notify("initialized", Value::Object(Map::new()))?;
+        Ok(())
+    }
+
+    fn shutdown(mut self) -> Result<()> {
+        let _ = self.request("shutdown", Value::Null, Duration::from_secs(5));
+        let _ = self.notify("exit", Value::Null);
+        let _ = self.child.wait();
+        Ok(())
+    }
+}
+
+fn main() -> Result<()> {
+    run_wcgv_lsp()
+}
+
+pub fn run_wcgv_lsp() -> Result<()> {
+    let opts = CliOptions::parse()?;
+    let root = find_workspace_root(&opts.target_dir)?;
+    let cfg = load_unified_config()?;
+    let skip_dirs: HashSet<String> = cfg.wcl.skip_dirs.into_iter().collect();
+
+    eprintln!("🔍 Starting rust-analyzer in {}", root.display());
+    let mut lsp = LspClient::start(&opts.rust_analyzer_bin, &root)?;
+    lsp.initialize(&root)?;
+
+    eprintln!("📚 Collecting symbols via LSP...");
+    let (nodes, files) = build_nodes(&mut lsp, &root, opts.include_sources, &skip_dirs)?;
+    eprintln!("  found {} candidate nodes", nodes.len());
+
+    if opts.warmup_ms > 0 {
+        thread::sleep(Duration::from_millis(opts.warmup_ms));
+    }
+
+    let mut edges: Vec<(String, String, &'static str)> = Vec::new();
+
+    if opts.show_calls {
+        eprintln!("🔗 Building call hierarchy edges...");
+        edges.extend(find_call_hierarchy_edges(&mut lsp, &root, &nodes).unwrap_or_default());
+    }
+
+    eprintln!("🔎 Building reference edges...");
+    edges.extend(find_references_edges(&mut lsp, &root, &nodes).unwrap_or_default());
+
+    if opts.show_imports {
+        eprintln!("📦 Building import edges...");
+        edges.extend(find_use_edges(&nodes));
+    }
+
+    if opts.show_fields {
+        eprintln!("🏗 Building field/type edges...");
+        edges.extend(find_field_edges(&nodes));
+    }
+
+    let mut unique = HashSet::new();
+    edges.retain(|(s, t, ty)| unique.insert((s.clone(), t.clone(), *ty)));
+
+    let output = build_json(&root, &nodes, &files, &edges, opts.include_sources);
+    fs::write(&opts.output_path, serde_json::to_string_pretty(&output)?)
+        .with_context(|| format!("writing {}", opts.output_path.display()))?;
+
+    eprintln!("\x1b[1;32m✓ Graph saved to: {}\x1b[0m", opts.output_path.display());
+    eprintln!("\x1b[36m✓ Nodes: {}  Edges: {}\x1b[0m", nodes.len(), edges.len());
+    eprintln!("\x1b[33m✓ includeSources={} (toggle with -s)\x1b[0m", opts.include_sources);
+    println!("{}", opts.output_path.display());
+
+    lsp.shutdown()?;
+    Ok(())
+}
+
+fn find_workspace_root(path: &Path) -> Result<PathBuf> {
+    let mut cur = fs::canonicalize(path).with_context(|| format!("canonicalizing {}", path.display()))?;
+    if cur.is_file() {
+        cur = cur.parent().context("file path has no parent")?.to_path_buf();
+    }
+    let mut probe = cur.clone();
+    loop {
+        if probe.join("Cargo.toml").exists() {
+            return Ok(probe);
+        }
+        if !probe.pop() {
+            return Ok(cur);
         }
     }
 }
 
-fn line_col_to_byte_index(text: &str, line: usize, column: usize) -> Option<usize> {
-    if line == 0 {
-        return None;
-    }
+fn path_to_uri(path: &Path) -> Result<String> {
+    let abs = fs::canonicalize(path).with_context(|| format!("canonicalizing {}", path.display()))?;
+    let url = Url::from_file_path(&abs).map_err(|_| anyhow!("failed to convert path to URI: {}", abs.display()))?;
+    Ok(url.to_string())
+}
+
+fn uri_to_path(uri: &str) -> Result<PathBuf> {
+    let url = Url::parse(uri)?;
+    url.to_file_path().map_err(|_| anyhow!("invalid file URI: {}", uri))
+}
+
+fn line_col_to_byte_index(text: &str, line1: usize, col0: usize) -> Option<usize> {
     let mut current_line = 1usize;
     let mut current_col = 0usize;
+
     for (idx, ch) in text.char_indices() {
-        if current_line == line && current_col == column {
+        if current_line == line1 && current_col == col0 {
             return Some(idx);
         }
         if ch == '\n' {
             current_line += 1;
             current_col = 0;
-            if current_line == line && column == 0 {
-                return Some(idx + 1);
-            }
         } else {
             current_col += 1;
         }
     }
-    if current_line == line && current_col == column {
+
+    if current_line == line1 && current_col == col0 {
         Some(text.len())
     } else {
         None
     }
 }
 
-fn range_from_span<T: Spanned>(node: &T, content: &str) -> SourceRange {
-    let span = node.span();
-    let start = span.start();
-    let end = span.end();
-    let byte_start = line_col_to_byte_index(content, start.line, start.column);
-    let byte_end = line_col_to_byte_index(content, end.line, end.column);
+fn read_snippet(path: &Path, range: &SourceRange) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    let start = line_col_to_byte_index(&content, range.start.line, range.start.column)?;
+    let end = line_col_to_byte_index(&content, range.end.line, range.end.column).unwrap_or(content.len());
+    if start <= end && end <= content.len() {
+        Some(content[start..end].to_string())
+    } else {
+        None
+    }
+}
 
-    SourceRange {
+fn make_range(v: &Value) -> Result<SourceRange> {
+    let start = v.get("start").context("range.start missing")?;
+    let end = v.get("end").context("range.end missing")?;
+    Ok(SourceRange {
         start: Position {
-            line: start.line,
-            column: start.column,
+            line: start.get("line").and_then(Value::as_u64).unwrap_or(0) as usize + 1,
+            column: start.get("character").and_then(Value::as_u64).unwrap_or(0) as usize,
         },
         end: Position {
-            line: end.line,
-            column: end.column,
+            line: end.get("line").and_then(Value::as_u64).unwrap_or(0) as usize + 1,
+            column: end.get("character").and_then(Value::as_u64).unwrap_or(0) as usize,
         },
-        bytes: match (byte_start, byte_end) {
-            (Some(start), Some(end)) if end >= start => Some(ByteRange { start, end }),
-            _ => None,
-        },
+        bytes: None,
+    })
+}
+
+fn symbol_kind_name(kind: u64) -> &'static str {
+    match kind {
+        5 => "class",
+        6 => "method",
+        7 => "property",
+        8 => "field",
+        9 => "constructor",
+        11 => "interface",
+        12 => "function",
+        13 => "variable",
+        14 => "constant",
+        23 => "struct",
+        26 => "type_parameter",
+        _ => "symbol",
     }
 }
 
-fn snippet_from_range(content: &str, range: &SourceRange) -> String {
-    if let Some(bytes) = &range.bytes {
-        if bytes.start <= bytes.end && bytes.end <= content.len() {
-            return content[bytes.start..bytes.end].to_string();
-        }
-    }
-    let lines: Vec<&str> = content.lines().collect();
-    let start = range.start.line.saturating_sub(1);
-    let end = range.end.line.min(lines.len());
-    if start < end {
-        lines[start..end].join("\n")
-    } else {
-        String::new()
+fn is_interesting_symbol(kind: &str) -> bool {
+    matches!(kind, "function" | "method" | "struct" | "field" | "class" | "interface")
+}
+
+fn visibility_from_signature(sig: Option<&str>) -> String {
+    match sig {
+        Some(s) if s.contains("pub") => "public".to_string(),
+        _ => "private".to_string(),
     }
 }
 
-impl CodeGraph {
-    fn to_visualization_graph(&self, root: &Path) -> (Vec<GraphNode>, Vec<GraphEdge>) {
-        let mut nodes = Vec::new();
-        let mut edges = Vec::new();
-        let mut node_ids = HashSet::new();
+fn make_symbol_key(kind: &str, name: &str, rel_path: &str, selection_range: &SourceRange) -> String {
+    format!(
+        "{}::{}::{}:{}:{}",
+        kind,
+        rel_path,
+        name,
+        selection_range.start.line,
+        selection_range.start.column
+    )
+}
 
-        for (name, func) in &self.functions {
-            let rel_path = func.path.strip_prefix(root).unwrap_or(&func.path);
-            let node_id = if let Some(target) = &func.in_impl {
-                format!("func::{}::{}", target, name)
-            } else {
-                format!("func::{}", name)
-            };
-
-            if node_ids.insert(node_id.clone()) {
-                nodes.push(GraphNode {
-                    id: node_id.clone(),
-                    label: if let Some(target) = &func.in_impl {
-                        format!("{}::{}", target, name)
-                    } else {
-                        name.clone()
-                    },
-                    node_type: if func.in_impl.is_some() { "method".into() } else { "function".into() },
-                    path: rel_path.display().to_string(),
-                    visibility: func.visibility.clone(),
-                    size: if func.in_impl.is_some() { 0.9 } else { 1.0 },
-                    color: if func.in_impl.is_some() {
-                        "#9C27B0".to_string()
-                    } else if func.visibility == "pub" {
-                        "#4CAF50".to_string()
-                    } else {
-                        "#9E9E9E".to_string()
-                    },
-                    level: if func.in_impl.is_some() { 1 } else { 0 },
-                    calls: func.calls.iter().cloned().collect(),
-                    signature: Some(func.signature.clone()),
-                    range: func.range.clone(),
-                    source_snippet: func.source_snippet.clone(),
-                });
+fn collect_rust_files(root: &Path, skip_dirs: &HashSet<String>, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if skip_dirs.contains(name) {
+                continue;
             }
-
-            for call in &func.calls {
-                let target_id = if self.functions.contains_key(call) {
-                    format!("func::{}", call)
-                } else {
-                    format!("unresolved::{}", call)
-                };
-                edges.push(GraphEdge {
-                    source: node_id.clone(),
-                    target: target_id,
-                    edge_type: "calls".to_string(),
-                });
-            }
+            collect_rust_files(&path, skip_dirs, out)?;
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(path);
         }
+    }
+    Ok(())
+}
 
-        for (name, struct_info) in &self.structs {
-            let rel_path = struct_info.path.strip_prefix(root).unwrap_or(&struct_info.path);
-            let node_id = format!("struct::{}", name);
-            if node_ids.insert(node_id.clone()) {
-                nodes.push(GraphNode {
-                    id: node_id,
-                    label: name.clone(),
-                    node_type: "struct".to_string(),
-                    path: rel_path.display().to_string(),
-                    visibility: struct_info.visibility.clone(),
-                    size: 1.2,
-                    color: "#2196F3".to_string(),
-                    level: 0,
-                    calls: Vec::new(),
-                    signature: None,
-                    range: struct_info.range.clone(),
-                    source_snippet: struct_info.source_snippet.clone(),
-                });
-            }
+fn flatten_document_symbols(items: &[Value], out: &mut Vec<Value>) {
+    for item in items {
+        out.push(item.clone());
+        if let Some(children) = item.get("children").and_then(Value::as_array) {
+            flatten_document_symbols(children, out);
         }
+    }
+}
 
-        for (name, trait_info) in &self.traits {
-            let rel_path = trait_info.path.strip_prefix(root).unwrap_or(&trait_info.path);
-            let node_id = format!("trait::{}", name);
-            if node_ids.insert(node_id.clone()) {
-                nodes.push(GraphNode {
-                    id: node_id,
-                    label: name.clone(),
-                    node_type: "trait".to_string(),
-                    path: rel_path.display().to_string(),
-                    visibility: trait_info.visibility.clone(),
-                    size: 1.1,
-                    color: "#FF9800".to_string(),
-                    level: 0,
-                    calls: Vec::new(),
-                    signature: None,
-                    range: trait_info.range.clone(),
-                    source_snippet: trait_info.source_snippet.clone(),
-                });
+fn build_nodes(
+    lsp: &mut LspClient,
+    root: &Path,
+    include_sources: bool,
+    skip_dirs: &HashSet<String>,
+) -> Result<(Vec<SymbolNode>, Vec<FileData>)> {
+    let mut rust_files = Vec::new();
+    collect_rust_files(root, skip_dirs, &mut rust_files)?;
+    rust_files.sort();
+
+    let mut nodes = Vec::new();
+    let mut files = Vec::new();
+
+    for file in rust_files {
+        let uri = path_to_uri(&file)?;
+        let text = fs::read_to_string(&file).unwrap_or_default();
+        let rel_path = file.strip_prefix(root).unwrap_or(&file).display().to_string();
+
+        lsp.notify(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "rust",
+                    "version": 1,
+                    "text": text,
+                }
+            }),
+        )?;
+
+        let result = lsp.request(
+            "textDocument/documentSymbol",
+            json!({"textDocument": {"uri": path_to_uri(&file)?}}),
+            Duration::from_secs(20),
+        )?;
+        let symbols = result.as_array().cloned().unwrap_or_default();
+        let mut flat = Vec::new();
+        flatten_document_symbols(&symbols, &mut flat);
+
+        for sym in flat {
+            let name = sym.get("name").and_then(Value::as_str).unwrap_or("<unnamed>");
+            let kind_num = sym.get("kind").and_then(Value::as_u64).unwrap_or(0);
+            let kind = symbol_kind_name(kind_num).to_string();
+            if !is_interesting_symbol(&kind) {
+                continue;
             }
-        }
 
-        for (target, impl_info) in &self.impls {
-            let impl_id = format!("impl::{}", target);
-            let struct_id = format!("struct::{}", target);
-            edges.push(GraphEdge {
-                source: impl_id.clone(),
-                target: struct_id,
-                edge_type: "implements".to_string(),
+            let full_range = make_range(sym.get("range").context("symbol missing full range")?)?;
+            let selection_range = make_range(
+                sym.get("selectionRange")
+                    .or_else(|| sym.get("range"))
+                    .context("symbol missing selection range")?,
+            )?;
+            let detail = sym.get("detail").and_then(Value::as_str).map(|s| s.to_string());
+            let key = make_symbol_key(&kind, name, &rel_path, &selection_range);
+            let snippet = if include_sources { read_snippet(&file, &full_range) } else { None };
+
+            nodes.push(SymbolNode {
+                key,
+                label: name.to_string(),
+                kind,
+                path: rel_path.clone(),
+                visibility: visibility_from_signature(detail.as_deref()),
+                signature: detail,
+                selection_range,
+                full_range,
+                source_snippet: snippet,
             });
-            for method in &impl_info.methods {
-                let method_id = format!("func::{}::{}", target, method.name);
-                edges.push(GraphEdge {
-                    source: impl_id.clone(),
-                    target: method_id,
-                    edge_type: "contains".to_string(),
-                });
-            }
         }
 
-        (nodes, edges)
+        files.push(FileData {
+            rel_path,
+            content: if include_sources { Some(text) } else { None },
+        });
     }
 
-    fn export_to_json(&self, root: &Path) -> serde_json::Value {
-        let (nodes, edges) = self.to_visualization_graph(root);
-
-        let nodes_json: Vec<_> = nodes
-            .iter()
-            .map(|node| {
-                json!({
-                    "key": node.id,
-                    "attributes": {
-                        "label": node.label,
-                        "type": node.node_type,
-                        "path": node.path,
-                        "visibility": node.visibility,
-                        "size": node.size,
-                        "color": node.color,
-                        "level": node.level,
-                        "calls": node.calls,
-                        "signature": node.signature,
-                        "sourceSnippet": node.source_snippet,
-                        "range": {
-                            "start": {
-                                "line": node.range.start.line,
-                                "column": node.range.start.column,
-                            },
-                            "end": {
-                                "line": node.range.end.line,
-                                "column": node.range.end.column,
-                            },
-                            "bytes": node.range.bytes.as_ref().map(|b| json!({
-                                "start": b.start,
-                                "end": b.end,
-                            }))
-                        }
-                    }
-                })
-            })
-            .collect();
-
-        let edges_json: Vec<_> = edges
-            .iter()
-            .map(|edge| {
-                json!({
-                    "source": edge.source,
-                    "target": edge.target,
-                    "attributes": {
-                        "type": edge.edge_type
-                    }
-                })
-            })
-            .collect();
-
-        json!({
-            "graph": {
-                "nodes": nodes_json,
-                "edges": edges_json
-            },
-            "metadata": {
-                "timestamp": Local::now().to_rfc3339(),
-                "root": root.display().to_string(),
-                "stats": {
-                    "functions": self.functions.len(),
-                    "structs": self.structs.len(),
-                    "traits": self.traits.len(),
-                    "impls": self.impls.len()
-                }
-            }
-        })
-    }
-
-    fn save_for_viewer(&self, root: &Path, output_path: &Path) -> Result<()> {
-        let json_data = self.export_to_json(root);
-        let json_string = serde_json::to_string_pretty(&json_data)?;
-        fs::write(output_path, json_string)?;
-        Ok(())
-    }
+    Ok((nodes, files))
 }
 
-struct CodeGraphVisitor {
-    graph: CodeGraph,
-    current_file: PathBuf,
-    current_file_content: String,
-    current_impl_target: Option<String>,
+fn symbol_position_params(root: &Path, node: &SymbolNode) -> Result<Value> {
+    let abs = root.join(&node.path);
+    Ok(json!({
+        "textDocument": {"uri": path_to_uri(&abs)?},
+        "position": {
+            "line": node.selection_range.start.line.saturating_sub(1),
+            "character": node.selection_range.start.column,
+        }
+    }))
 }
 
-impl CodeGraphVisitor {
-    fn new(file_path: PathBuf, content: String) -> Self {
-        Self {
-            graph: CodeGraph::default(),
-            current_file: file_path,
-            current_file_content: content,
-            current_impl_target: None,
-        }
-    }
-
-    fn get_visibility(&self, vis: &syn::Visibility) -> String {
-        match vis {
-            syn::Visibility::Public(_) => "pub".to_string(),
-            _ => "private".to_string(),
-        }
-    }
-
-    fn parse_generics(&self, generics: &Generics) -> Vec<String> {
-        generics
-            .params
-            .iter()
-            .map(|param| match param {
-                GenericParam::Type(type_param) => type_param.ident.to_string(),
-                GenericParam::Lifetime(lifetime_def) => lifetime_def.lifetime.ident.to_string(),
-                GenericParam::Const(const_param) => const_param.ident.to_string(),
-            })
-            .collect()
-    }
-
-    fn parse_where_clause(&self, where_clause: &Option<WhereClause>) -> Option<String> {
-        where_clause.as_ref().map(|wc| wc.to_token_stream().to_string())
-    }
-
-    fn format_signature(&self, sig: &Signature) -> String {
-        let mut parts = Vec::new();
-        if sig.constness.is_some() {
-            parts.push("const".to_string());
-        }
-        if sig.asyncness.is_some() {
-            parts.push("async".to_string());
-        }
-        if sig.unsafety.is_some() {
-            parts.push("unsafe".to_string());
-        }
-        parts.push("fn".to_string());
-        parts.push(sig.ident.to_string());
-        if !sig.generics.params.is_empty() {
-            parts.push(sig.generics.to_token_stream().to_string());
-        }
-        let params: Vec<String> = sig
-            .inputs
-            .iter()
-            .map(|input| match input {
-                FnArg::Receiver(recv) => {
-                    if recv.reference.is_some() {
-                        if recv.mutability.is_some() {
-                            "&mut self".to_string()
-                        } else {
-                            "&self".to_string()
-                        }
-                    } else {
-                        "self".to_string()
-                    }
-                }
-                FnArg::Typed(pat_type) => pat_type.to_token_stream().to_string(),
-            })
-            .collect();
-        parts.push(format!("({})", params.join(", ")));
-        if let ReturnType::Type(_, ty) = &sig.output {
-            parts.push("->".to_string());
-            parts.push(ty.to_token_stream().to_string());
-        }
-        parts.join(" ")
-    }
-
-    fn extract_function_calls(&self, block: &syn::Block) -> HashSet<String> {
-        fn is_ignored_call(name: &str) -> bool {
-            let simple = name.rsplit("::").next().unwrap_or(name);
-            matches!(
-                simple,
-                "Ok"
-                    | "Err"
-                    | "Some"
-                    | "None"
-                    | "Self"
-                    | "default"
-                    | "new"
-                    | "into"
-                    | "from"
-                    | "clone"
-                    | "iter"
-                    | "collect"
-                    | "len"
-                    | "is_empty"
-                    | "unwrap"
-                    | "expect"
-                    | "map"
-                    | "and_then"
-            )
-        }
-
-        let mut calls = HashSet::new();
-        let mut visitor = FunctionCallVisitor::new(&mut calls);
-        visitor.visit_block(block);
-        calls.into_iter().filter(|call| !is_ignored_call(call)).collect()
-    }
-
-    fn item_range<T: Spanned>(&self, node: &T) -> SourceRange {
-        range_from_span(node, &self.current_file_content)
-    }
-
-    fn item_snippet<T: Spanned>(&self, node: &T) -> String {
-        let range = self.item_range(node);
-        snippet_from_range(&self.current_file_content, &range)
-    }
+fn contains(range: &SourceRange, line: usize, col: usize) -> bool {
+    let starts_before = line > range.start.line || (line == range.start.line && col >= range.start.column);
+    let ends_after = line < range.end.line || (line == range.end.line && col <= range.end.column);
+    starts_before && ends_after
 }
 
-struct FunctionCallVisitor<'a> {
-    calls: &'a mut HashSet<String>,
+fn range_span_score(range: &SourceRange) -> (usize, usize, usize, usize) {
+    (
+        range.end.line.saturating_sub(range.start.line),
+        range.end.column.saturating_sub(range.start.column),
+        range.start.line,
+        range.start.column,
+    )
 }
 
-impl<'a> FunctionCallVisitor<'a> {
-    fn new(calls: &'a mut HashSet<String>) -> Self {
-        Self { calls }
-    }
+fn find_enclosing_symbol<'a>(symbols: &'a [SymbolNode], line: usize, col: usize) -> Option<&'a SymbolNode> {
+    symbols
+        .iter()
+        .filter(|sym| contains(&sym.full_range, line, col))
+        .min_by_key(|sym| range_span_score(&sym.full_range))
 }
 
-impl<'a, 'ast> Visit<'ast> for FunctionCallVisitor<'a> {
-    fn visit_expr_call(&mut self, expr_call: &'ast syn::ExprCall) {
-        if let syn::Expr::Path(expr_path) = &*expr_call.func {
-            let segments: Vec<String> = expr_path
-                .path
-                .segments
-                .iter()
-                .map(|seg| seg.ident.to_string())
-                .collect();
-            self.calls.insert(segments.join("::"));
-        }
-        syn::visit::visit_expr_call(self, expr_call);
+fn build_file_symbol_index(nodes: &[SymbolNode]) -> HashMap<String, Vec<SymbolNode>> {
+    let mut by_file: HashMap<String, Vec<SymbolNode>> = HashMap::new();
+    for node in nodes {
+        by_file.entry(node.path.clone()).or_default().push(node.clone());
     }
-
-    fn visit_expr_method_call(&mut self, method_call: &'ast syn::ExprMethodCall) {
-        self.calls.insert(method_call.method.to_string());
-        syn::visit::visit_expr_method_call(self, method_call);
+    for symbols in by_file.values_mut() {
+        symbols.sort_by_key(|sym| (
+            sym.full_range.start.line,
+            sym.full_range.start.column,
+            sym.full_range.end.line,
+            sym.full_range.end.column,
+        ));
     }
+    by_file
 }
 
-impl<'ast> Visit<'ast> for CodeGraphVisitor {
-    fn visit_item_fn(&mut self, item_fn: &'ast ItemFn) {
-        if self.current_impl_target.is_some() {
-            return;
-        }
-        let func_name = item_fn.sig.ident.to_string();
-        let calls = self.extract_function_calls(&item_fn.block);
-        let func_info = FunctionInfo {
-            name: func_name.clone(),
-            signature: self.format_signature(&item_fn.sig),
-            calls,
-            generics: self.parse_generics(&item_fn.sig.generics),
-            visibility: self.get_visibility(&item_fn.vis),
-            path: self.current_file.clone(),
-            in_impl: None,
-            range: self.item_range(item_fn),
-            source_snippet: self.item_snippet(item_fn),
-        };
-        self.graph.functions.insert(func_name, func_info);
-        syn::visit::visit_item_fn(self, item_fn);
-    }
+fn find_references_edges(
+    lsp: &mut LspClient,
+    root: &Path,
+    nodes: &[SymbolNode],
+) -> Result<Vec<(String, String, &'static str)>> {
+    let mut edges = Vec::new();
+    let file_symbols = build_file_symbol_index(nodes);
 
-    fn visit_item_impl(&mut self, item_impl: &'ast ItemImpl) {
-        let target_type = item_impl.self_ty.as_ref().to_token_stream().to_string();
-        let old_target = self.current_impl_target.take();
-        self.current_impl_target = Some(target_type.clone());
+    for decl in nodes {
+        let mut obj = symbol_position_params(root, decl)?
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        obj.insert("context".to_string(), json!({"includeDeclaration": false}));
 
-        let mut methods = Vec::new();
-        for item in &item_impl.items {
-            if let ImplItem::Fn(method) = item {
-                let func_name = method.sig.ident.to_string();
-                let calls = self.extract_function_calls(&method.block);
-                let func_info = FunctionInfo {
-                    name: func_name.clone(),
-                    signature: self.format_signature(&method.sig),
-                    calls,
-                    generics: self.parse_generics(&method.sig.generics),
-                    visibility: self.get_visibility(&method.vis),
-                    path: self.current_file.clone(),
-                    in_impl: Some(target_type.clone()),
-                    range: self.item_range(method),
-                    source_snippet: self.item_snippet(method),
-                };
-                methods.push(func_info.clone());
-                self.graph
-                    .functions
-                    .insert(format!("{}::{}", target_type, func_name), func_info);
-            }
-        }
+        let refs = lsp.request(
+            "textDocument/references",
+            Value::Object(obj),
+            Duration::from_secs(20),
+        ).unwrap_or(Value::Null);
 
-        let impl_info = ImplInfo {
-            target_type: target_type.clone(),
-            methods,
-            path: self.current_file.clone(),
-        };
-        self.graph.impls.insert(target_type, impl_info);
-        self.current_impl_target = old_target;
-        syn::visit::visit_item_impl(self, item_impl);
-    }
-
-    fn visit_item_struct(&mut self, item_struct: &'ast syn::ItemStruct) {
-        let name = item_struct.ident.to_string();
-        let info = StructInfo {
-            name: name.clone(),
-            visibility: self.get_visibility(&item_struct.vis),
-            path: self.current_file.clone(),
-            range: self.item_range(item_struct),
-            source_snippet: self.item_snippet(item_struct),
-        };
-        self.graph.structs.insert(name, info);
-        syn::visit::visit_item_struct(self, item_struct);
-    }
-
-    fn visit_item_trait(&mut self, item_trait: &'ast syn::ItemTrait) {
-        let name = item_trait.ident.to_string();
-        let info = TraitInfo {
-            name: name.clone(),
-            visibility: "pub".to_string(),
-            path: self.current_file.clone(),
-            range: self.item_range(item_trait),
-            source_snippet: self.item_snippet(item_trait),
-        };
-        self.graph.traits.insert(name, info);
-        syn::visit::visit_item_trait(self, item_trait);
-    }
-}
-
-struct CodeGraphScanner {
-    skip_dirs: Vec<String>,
-}
-
-impl CodeGraphScanner {
-    fn new() -> Self {
-        Self {
-            skip_dirs: vec![
-                "target".to_string(),
-                "node_modules".to_string(),
-                ".git".to_string(),
-                ".cargo".to_string(),
-            ],
-        }
-    }
-
-    fn scan_directory(&self, dir: &Path) -> Result<CodeGraph> {
-        let mut graph = CodeGraph::default();
-        self.walk_directory(dir, &mut graph)?;
-        Ok(graph)
-    }
-
-    fn walk_directory(&self, dir: &Path, graph: &mut CodeGraph) -> Result<()> {
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                if let Some(name) = path.file_name() {
-                    let name_str = name.to_string_lossy();
-                    if self.skip_dirs.iter().any(|d| d == name_str.as_ref()) {
-                        continue;
-                    }
-                }
-                self.walk_directory(&path, graph)?;
-            } else if self.is_rust_file(&path) {
-                if let Ok(file_graph) = self.analyze_file(&path) {
-                    self.merge_graphs(graph, file_graph);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn is_rust_file(&self, path: &Path) -> bool {
-        path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("rs")
-    }
-
-    fn analyze_file(&self, file_path: &Path) -> Result<CodeGraph> {
-        let content = fs::read_to_string(file_path)?;
-        let mut visitor = CodeGraphVisitor::new(file_path.to_path_buf(), content.clone());
-        match parse_file(&content) {
-            Ok(syntax_tree) => {
-                visitor.visit_file(&syntax_tree);
-                Ok(visitor.graph)
-            }
-            Err(e) => {
-                eprintln!("Warning: Failed to parse {}: {}", file_path.display(), e);
-                Ok(CodeGraph::default())
+        let Some(arr) = refs.as_array() else { continue; };
+        for loc in arr {
+            let Some(uri) = loc.get("uri").and_then(Value::as_str) else { continue; };
+            let Ok(path) = uri_to_path(uri) else { continue; };
+            let rel = path.strip_prefix(root).unwrap_or(&path).display().to_string();
+            let Some(range_v) = loc.get("range") else { continue; };
+            let Ok(range) = make_range(range_v) else { continue; };
+            let Some(symbols) = file_symbols.get(&rel) else { continue; };
+            let Some(container) = find_enclosing_symbol(symbols, range.start.line, range.start.column) else { continue; };
+            if container.key != decl.key {
+                edges.push((container.key.clone(), decl.key.clone(), "references"));
             }
         }
     }
 
-    fn merge_graphs(&self, target: &mut CodeGraph, source: CodeGraph) {
-        target.structs.extend(source.structs);
-        target.functions.extend(source.functions);
-        target.impls.extend(source.impls);
-        target.traits.extend(source.traits);
-    }
+    Ok(edges)
 }
 
-struct GraphApp {
-    scanner: CodeGraphScanner,
-    output_path: Option<PathBuf>,
-}
+fn find_call_hierarchy_edges(
+    lsp: &mut LspClient,
+    root: &Path,
+    nodes: &[SymbolNode],
+) -> Result<Vec<(String, String, &'static str)>> {
+    let callable: Vec<&SymbolNode> = nodes
+        .iter()
+        .filter(|n| n.kind == "function" || n.kind == "method")
+        .collect();
 
-impl GraphApp {
-    fn new() -> Self {
-        let args: Vec<String> = env::args().collect();
-        let mut output_path = None;
-        let mut i = 1;
-
-        while i < args.len() {
-            match args[i].as_str() {
-                "--output" | "-o" => {
-                    if i + 1 < args.len() {
-                        output_path = Some(PathBuf::from(&args[i + 1]));
-                        i += 1;
-                    }
-                }
-                _ => {}
-            }
-            i += 1;
-        }
-
-        Self {
-            scanner: CodeGraphScanner::new(),
-            output_path,
-        }
-    }
-
-    fn run(&self) -> Result<()> {
-        let args: Vec<String> = env::args().collect();
-        let target_dir = if args.len() > 1 {
-            let last_arg = args.last().unwrap();
-            if last_arg.starts_with('-') {
-                env::current_dir()?
-            } else {
-                PathBuf::from(last_arg)
-            }
-        } else {
-            env::current_dir()?
-        };
-
-        eprintln!("🔍 Scanning directory: {}", target_dir.display());
-        let start = std::time::Instant::now();
-        let graph = self.scanner.scan_directory(&target_dir)?;
-        let duration = start.elapsed();
-
-        eprintln!(
-            "📊 Found {} functions, {} structs, {} impls, {} traits",
-            graph.functions.len(),
-            graph.structs.len(),
-            graph.impls.len(),
-            graph.traits.len()
+    let mut edges = Vec::new();
+    let mut callable_lookup: HashMap<(String, usize, usize), String> = HashMap::new();
+    for node in &callable {
+        callable_lookup.insert(
+            (
+                node.path.clone(),
+                node.selection_range.start.line,
+                node.selection_range.start.column,
+            ),
+            node.key.clone(),
         );
-
-        let output_file = self
-            .output_path
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("code_graph.json"));
-
-        graph.save_for_viewer(&target_dir, &output_file)?;
-
-        eprintln!("\x1b[1;32m✓ Graph saved to: {}\x1b[0m", output_file.display());
-        eprintln!("\x1b[36m✓ Analysis took {:.2?}\x1b[0m", duration);
-        eprintln!("\x1b[33m✓ Ready for the Bun Sigma GUI\x1b[0m");
-        println!("{}", output_file.display());
-        Ok(())
     }
+
+    for node in callable {
+        let prepared = lsp.request(
+            "textDocument/prepareCallHierarchy",
+            symbol_position_params(root, node)?,
+            Duration::from_secs(20),
+        ).unwrap_or(Value::Null);
+
+        let Some(items) = prepared.as_array() else { continue; };
+        for item in items {
+            let outgoing = lsp.request(
+                "callHierarchy/outgoingCalls",
+                json!({"item": item}),
+                Duration::from_secs(20),
+            ).unwrap_or(Value::Null);
+
+            let Some(arr) = outgoing.as_array() else { continue; };
+            for call in arr {
+                let Some(to) = call.get("to") else { continue; };
+                let Some(uri) = to.get("uri").and_then(Value::as_str) else { continue; };
+                let Ok(path) = uri_to_path(uri) else { continue; };
+                let rel = path.strip_prefix(root).unwrap_or(&path).display().to_string();
+                let Some(sel) = to.get("selectionRange").or_else(|| to.get("range")) else { continue; };
+                let Ok(range) = make_range(sel) else { continue; };
+                if let Some(target_key) = callable_lookup.get(&(rel, range.start.line, range.start.column)) {
+                    edges.push((node.key.clone(), target_key.clone(), "calls"));
+                }
+            }
+        }
+    }
+
+    Ok(edges)
 }
 
-fn main() -> Result<()> {
-    let app = GraphApp::new();
-    app.run()
+fn extract_ident_tokens(text: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            current.push(ch);
+        } else if !current.is_empty() {
+            out.insert(current.clone());
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        out.insert(current);
+    }
+    out
+}
+
+fn find_use_edges(nodes: &[SymbolNode]) -> Vec<(String, String, &'static str)> {
+    let mut edges = Vec::new();
+    let mut type_nodes: HashMap<String, String> = HashMap::new();
+    for n in nodes {
+        if n.kind == "struct" || n.kind == "class" || n.kind == "interface" {
+            type_nodes.entry(n.label.clone()).or_insert_with(|| n.key.clone());
+        }
+    }
+
+    for n in nodes {
+        let Some(sig) = &n.signature else { continue; };
+        let tokens = extract_ident_tokens(sig);
+        for token in tokens {
+            if let Some(target) = type_nodes.get(&token) {
+                if target != &n.key {
+                    edges.push((n.key.clone(), target.clone(), "uses_type"));
+                }
+            }
+        }
+    }
+    edges
+}
+
+fn find_field_edges(nodes: &[SymbolNode]) -> Vec<(String, String, &'static str)> {
+    let mut edges = Vec::new();
+    let mut structs_by_name: HashMap<String, String> = HashMap::new();
+    let mut fields = Vec::new();
+
+    for n in nodes {
+        if n.kind == "struct" {
+            structs_by_name.entry(n.label.clone()).or_insert_with(|| n.key.clone());
+        }
+        if n.kind == "field" {
+            fields.push(n);
+        }
+    }
+
+    for field in fields {
+        let Some(sig) = &field.signature else { continue; };
+        let tokens = extract_ident_tokens(sig);
+        for token in tokens {
+            if let Some(target) = structs_by_name.get(&token) {
+                if target != &field.key {
+                    edges.push((field.key.clone(), target.clone(), "field_type"));
+                }
+            }
+        }
+    }
+
+    edges
+}
+
+fn build_json(
+    root: &Path,
+    nodes: &[SymbolNode],
+    files: &[FileData],
+    edges: &[(String, String, &'static str)],
+    include_sources: bool,
+) -> Value {
+    let node_json: Vec<Value> = nodes
+        .iter()
+        .map(|n| {
+            json!({
+                "key": n.key,
+                "attributes": {
+                    "label": n.label,
+                    "type": n.kind,
+                    "path": n.path,
+                    "visibility": n.visibility,
+                    "level": 0,
+                    "signature": n.signature,
+                    "sourceSnippet": if include_sources { n.source_snippet.clone() } else { None },
+                    "range": {
+                        "start": {"line": n.full_range.start.line, "column": n.full_range.start.column},
+                        "end": {"line": n.full_range.end.line, "column": n.full_range.end.column}
+                    },
+                    "selectionRange": {
+                        "start": {"line": n.selection_range.start.line, "column": n.selection_range.start.column},
+                        "end": {"line": n.selection_range.end.line, "column": n.selection_range.end.column}
+                    }
+                }
+            })
+        })
+        .collect();
+
+    let edge_json: Vec<Value> = edges
+        .iter()
+        .map(|(s, t, ty)| {
+            json!({
+                "source": s,
+                "target": t,
+                "attributes": {"type": ty}
+            })
+        })
+        .collect();
+
+    let file_json: Vec<Value> = files
+        .iter()
+        .map(|f| {
+            json!({
+                "path": f.rel_path,
+                "content": if include_sources { f.content.clone() } else { None }
+            })
+        })
+        .collect();
+
+    json!({
+        "graph": {
+            "nodes": node_json,
+            "edges": edge_json,
+        },
+        "files": file_json,
+        "metadata": {
+            "timestamp": Local::now().to_rfc3339(),
+            "root": root.display().to_string(),
+            "includeSources": include_sources,
+            "stats": {
+                "nodes": nodes.len(),
+                "edges": edges.len(),
+                "files": files.len(),
+            }
+        }
+    })
 }

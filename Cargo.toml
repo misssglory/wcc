@@ -70,6 +70,7 @@ proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
 tempfile = "3.27.0"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+url = "2.5.8"
 
 [lib]
 name = "wcc"
