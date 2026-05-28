@@ -1,8 +1,7 @@
-// src/config.rs
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::fs;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnifiedConfig {
@@ -80,7 +79,9 @@ pub struct WcgConfig {
     pub show_line_numbers: bool,
     pub show_calls: bool,
     pub show_fields: bool,
-    pub show_imports: bool,  // Added this field
+    pub show_imports: bool,
+    pub include_field_nodes: bool,
+    pub show_impl_edges: bool,
 }
 
 impl Default for WffConfig {
@@ -99,8 +100,10 @@ impl Default for WcgConfig {
         Self {
             show_line_numbers: true,
             show_calls: true,
-            show_fields: true,
-            show_imports: true,  // Added default value (true)
+            show_fields: false,
+            show_imports: true,
+            include_field_nodes: false,
+            show_impl_edges: true,
         }
     }
 }
@@ -116,9 +119,7 @@ impl Default for UnifiedConfig {
                 show_time_in_header: true,
                 use_file_modification_time: true,
             },
-            wcp: WcpConfig {
-                auto_backup: true,
-            },
+            wcp: WcpConfig { auto_backup: true },
             wcl: WclConfig {
                 max_file_size_kb: 50,
                 max_file_words_to_copy: 10000,
@@ -175,7 +176,7 @@ pub fn get_config_path() -> PathBuf {
 
 pub fn load_unified_config() -> Result<UnifiedConfig> {
     let path = get_config_path();
-    
+
     if path.exists() {
         let data = fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
@@ -208,7 +209,7 @@ pub fn update_cargo_mode(mode: &str) -> Result<()> {
 
 pub fn show_config() -> Result<()> {
     let config = load_unified_config()?;
-    
+
     println!("\x1b[36m📋 Current wcc configuration:\x1b[0m");
     println!("  [wcc]");
     println!("    default_cargo_mode: \x1b[33m{}\x1b[0m", config.wcc.default_cargo_mode);
@@ -249,16 +250,18 @@ pub fn show_config() -> Result<()> {
     println!("    show_line_numbers: {}", config.wcg.show_line_numbers);
     println!("    show_calls: {}", config.wcg.show_calls);
     println!("    show_fields: {}", config.wcg.show_fields);
-    println!("    show_imports: {}", config.wcg.show_imports);  // Added this line
+    println!("    show_imports: {}", config.wcg.show_imports);
+    println!("    include_field_nodes: {}", config.wcg.include_field_nodes);
+    println!("    show_impl_edges: {}", config.wcg.show_impl_edges);
     println!();
     println!("  Config file: \x1b[90m{}\x1b[0m", get_config_path().display());
-    
+
     Ok(())
 }
 
 pub fn init_config() -> Result<()> {
     let path = get_config_path();
-    
+
     if path.exists() {
         use std::io::Write;
         print!("\x1b[33m⚠ Config already exists at: {}\x1b[0m", path.display());
@@ -271,10 +274,10 @@ pub fn init_config() -> Result<()> {
             return Ok(());
         }
     }
-    
+
     let config = UnifiedConfig::default();
     save_config(&config)?;
-    
+
     println!("\x1b[32m✓ Created default config at: {}\x1b[0m", path.display());
     println!("\nDefault configuration includes:");
     println!("  [wcc] - cargo wrapper settings");
@@ -283,7 +286,7 @@ pub fn init_config() -> Result<()> {
     println!("  [wcl] - analyzer settings with {} skip patterns", config.wcl.skip_patterns.len());
     println!("  [wcf] - function replacement settings");
     println!("  [wff] - wff (function finder) settings with time and line number options");
-    println!("  [wcg] - code graph analyzer settings with line numbers, calls, fields, and imports");
-    
+    println!("  [wcg] - code graph analyzer settings with line numbers, calls, imports, optional field nodes, and impl edges");
+
     Ok(())
 }

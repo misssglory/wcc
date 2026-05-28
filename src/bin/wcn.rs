@@ -1,4 +1,3 @@
-// src/bin/wcn.rs
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -6,9 +5,9 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use chrono::{Local, DateTime};
+use chrono::{DateTime, Local};
 use wcc::common::*;
-use wcc::{config::load_unified_config, };
+use wcc::config::load_unified_config;
 
 #[derive(Debug, Default)]
 struct Args {
@@ -16,13 +15,13 @@ struct Args {
     head_lines: Option<usize>,
     tail_lines: Option<usize>,
     function: Option<String>,
+    number: bool,
 }
 
 fn main() -> Result<()> {
     let config = load_unified_config()?;
     let mut args = parse_args()?;
 
-    // If no file provided, use fzf to select one
     if args.file.is_none() {
         let selected_file = select_file_with_fzf()?;
         args.file = Some(selected_file);
@@ -36,10 +35,13 @@ fn main() -> Result<()> {
     let content =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
 
-    // Extract content based on flags
     let extracted_content = extract_content(&content, &args, &path)?;
+    let extracted_content = if args.number {
+        add_line_numbers(&content, &extracted_content)
+    } else {
+        extracted_content
+    };
 
-    // Get relative path for display
     let current_dir = env::current_dir()?;
     let relative_path = path
         .strip_prefix(&current_dir)
@@ -55,16 +57,13 @@ fn main() -> Result<()> {
 
     let prefix = comment_prefix(&path, &ext);
 
-    // Add timestamp to header if configured
     let timestamp = if config.wcn.show_time_in_header {
         let time_str = if config.wcn.use_file_modification_time {
-            // Get file modification time
             let metadata = fs::metadata(&path)?;
             let modified = metadata.modified()?;
             let datetime: DateTime<Local> = modified.into();
             datetime.format(&config.wcc.time_format).to_string()
         } else {
-            // Use current time
             let now = Local::now();
             now.format(&config.wcc.time_format).to_string()
         };
@@ -88,16 +87,13 @@ fn main() -> Result<()> {
 }
 
 fn select_file_with_fzf() -> Result<PathBuf> {
-    // Check if fzf is available
     let fzf_check = Command::new("fzf").arg("--version").output();
 
     if fzf_check.is_err() {
         bail!("fzf not found. Please install fzf or provide a file argument");
     }
 
-    // Use fd if available for better file listing, otherwise use find
     let files_output = if Command::new("fd").arg("--version").output().is_ok() {
-        // Use fd for faster, gitignore-aware file listing
         let output = Command::new("fd")
             .arg("--type")
             .arg("f")
@@ -113,7 +109,6 @@ fn select_file_with_fzf() -> Result<PathBuf> {
 
         String::from_utf8_lossy(&output.stdout).to_string()
     } else {
-        // Fallback to find
         let output = Command::new("find")
             .arg(".")
             .arg("-type")
@@ -133,7 +128,6 @@ fn select_file_with_fzf() -> Result<PathBuf> {
         String::from_utf8_lossy(&output.stdout).to_string()
     };
 
-    // Pipe files to fzf
     let mut fzf_child = Command::new("fzf")
         .arg("--height")
         .arg("40%")
@@ -202,6 +196,10 @@ fn parse_args() -> Result<Args> {
                     bail!("-f requires a function name argument");
                 }
             }
+            "-n" | "--number" => {
+                args.number = true;
+                i += 1;
+            }
             arg if !arg.starts_with('-') => {
                 if args.file.is_none() {
                     args.file = Some(PathBuf::from(arg));
@@ -220,8 +218,6 @@ fn parse_args() -> Result<Args> {
 }
 
 fn extract_content(content: &str, args: &Args, path: &Path) -> Result<String> {
-    // Priority: function extraction > head/tail combination > full content
-
     if let Some(func_name) = &args.function {
         let ext = path
             .extension()
@@ -264,41 +260,72 @@ fn extract_content(content: &str, args: &Args, path: &Path) -> Result<String> {
     }
 }
 
+fn add_line_numbers(full_content: &str, extracted_content: &str) -> String {
+    let full_lines: Vec<&str> = full_content.lines().collect();
+    let extracted_lines: Vec<&str> = extracted_content.lines().collect();
+
+    if extracted_lines.is_empty() {
+        return String::new();
+    }
+
+    let mut start_line = 1usize;
+
+    'outer: for i in 0..=full_lines.len().saturating_sub(extracted_lines.len()) {
+        for j in 0..extracted_lines.len() {
+            if full_lines[i + j] != extracted_lines[j] {
+                continue 'outer;
+            }
+        }
+        start_line = i + 1;
+        break;
+    }
+
+    let max_line = start_line + extracted_lines.len().saturating_sub(1);
+    let width = max_line.to_string().len();
+
+    extracted_lines
+        .iter()
+        .enumerate()
+        .map(|(idx, line)| format!("{:>width$}: {}", start_line + idx, line, width = width))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn extract_function(content: &str, func_name: &str, ext: &str) -> Result<String> {
     let lines: Vec<&str> = content.lines().collect();
     let escaped_name = regex_escape(func_name);
 
-    // Language-specific function patterns
     let patterns: Vec<String> = match ext {
         "rs" => vec![
-            format!(r"fn\s+{}", escaped_name),
-            format!(r"pub\s+fn\s+{}", escaped_name),
-            format!(r"async\s+fn\s+{}", escaped_name),
+            format!(r".*\bfn\s+{}\b.*", escaped_name),
+            format!(r".*\bpub\s+fn\s+{}\b.*", escaped_name),
+            format!(r".*\basync\s+fn\s+{}\b.*", escaped_name),
+            format!(r".*\bpub\s+async\s+fn\s+{}\b.*", escaped_name),
         ],
         "py" => vec![
-            format!(r"def\s+{}", escaped_name),
-            format!(r"async\s+def\s+{}", escaped_name),
-            format!(r"class\s+{}", escaped_name),
+            format!(r".*\bdef\s+{}\b.*", escaped_name),
+            format!(r".*\basync\s+def\s+{}\b.*", escaped_name),
+            format!(r".*\bclass\s+{}\b.*", escaped_name),
         ],
         "js" | "ts" | "jsx" | "tsx" => vec![
-            format!(r"function\s+{}", escaped_name),
-            format!(r"const\s+{}\s*=", escaped_name),
-            format!(r"let\s+{}\s*=", escaped_name),
-            format!(r"class\s+{}", escaped_name),
+            format!(r".*\bfunction\s+{}\b.*", escaped_name),
+            format!(r".*\bconst\s+{}\s*=.*", escaped_name),
+            format!(r".*\blet\s+{}\s*=.*", escaped_name),
+            format!(r".*\bclass\s+{}\b.*", escaped_name),
         ],
         "c" | "cc" | "cpp" | "h" | "hpp" => vec![
-            format!(r"{}", escaped_name),
-            format!(r"class\s+{}", escaped_name),
+            format!(r".*\b{}\b.*", escaped_name),
+            format!(r".*\bclass\s+{}\b.*", escaped_name),
         ],
         "go" => vec![
-            format!(r"func\s+{}", escaped_name),
-            format!(r"func\s+\([^)]+\)\s+{}", escaped_name),
+            format!(r".*\bfunc\s+{}\b.*", escaped_name),
+            format!(r".*\bfunc\s+\([^)]+\)\s+{}\b.*", escaped_name),
         ],
-        _ => vec![escaped_name],
+        _ => vec![format!(r".*\b{}\b.*", escaped_name)],
     };
 
     let pattern = patterns.join("|");
-    let re = regex::Regex::new(&format!(r"(?m)^{}$", pattern))
+    let re = regex::Regex::new(&format!(r"(?m)^({})$", pattern))
         .context("failed to create function regex")?;
 
     let mut func_start = None;
@@ -389,6 +416,9 @@ fn print_stats(path: &Path, stats: &TextStats, args: &Args) {
     }
     if args.function.is_some() {
         flags.push(format!("-f {}", args.function.as_ref().unwrap()));
+    }
+    if args.number {
+        flags.push("-n".to_string());
     }
 
     let flag_str = if flags.is_empty() {

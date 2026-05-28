@@ -11,6 +11,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
+use syn::spanned::Spanned;
 use url::Url;
 use wcc::config::load_unified_config;
 
@@ -53,6 +54,17 @@ struct FileData {
     content: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct ImplBlock {
+    key: String,
+    path: String,
+    target_label: String,
+    trait_label: Option<String>,
+    full_range: SourceRange,
+    selection_range: SourceRange,
+    source_snippet: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CliOptions {
     target_dir: PathBuf,
@@ -63,6 +75,8 @@ struct CliOptions {
     show_calls: bool,
     show_fields: bool,
     show_imports: bool,
+    include_field_nodes: bool,
+    show_impl_edges: bool,
 }
 
 impl CliOptions {
@@ -77,6 +91,8 @@ impl CliOptions {
         let mut show_calls = cfg.wcg.show_calls;
         let mut show_fields = cfg.wcg.show_fields;
         let mut show_imports = cfg.wcg.show_imports;
+        let mut include_field_nodes = cfg.wcg.include_field_nodes;
+        let mut show_impl_edges = cfg.wcg.show_impl_edges;
 
         while let Some(arg) = args.pop_front() {
             match arg.as_str() {
@@ -99,6 +115,9 @@ impl CliOptions {
                 "--no-calls" => show_calls = false,
                 "--no-fields" => show_fields = false,
                 "--no-imports" => show_imports = false,
+                "--fields-as-nodes" => include_field_nodes = true,
+                "--no-fields-as-nodes" => include_field_nodes = false,
+                "--no-impl-edges" => show_impl_edges = false,
                 other if other.starts_with('-') => bail!("unknown flag: {}", other),
                 path => target_dir = PathBuf::from(path),
             }
@@ -113,6 +132,8 @@ impl CliOptions {
             show_calls,
             show_fields,
             show_imports,
+            include_field_nodes,
+            show_impl_edges,
         })
     }
 }
@@ -122,6 +143,7 @@ struct LspClient {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: AtomicU64,
+    position_encoding: String,
 }
 
 impl LspClient {
@@ -142,6 +164,7 @@ impl LspClient {
             stdin,
             stdout: BufReader::new(stdout),
             next_id: AtomicU64::new(1),
+            position_encoding: "utf-16".to_string(),
         })
     }
 
@@ -209,7 +232,7 @@ impl LspClient {
 
     fn initialize(&mut self, root: &Path) -> Result<()> {
         let root_uri = path_to_uri(root)?;
-        let _ = self.request(
+        let result = self.request(
             "initialize",
             json!({
                 "processId": std::process::id(),
@@ -221,6 +244,9 @@ impl LspClient {
                 }],
                 "clientInfo": {"name": "wcgv", "version": env!("CARGO_PKG_VERSION")},
                 "capabilities": {
+                    "general": {
+                        "positionEncodings": ["utf-8", "utf-16"]
+                    },
                     "textDocument": {
                         "documentSymbol": {"hierarchicalDocumentSymbolSupport": true},
                         "references": {},
@@ -243,6 +269,14 @@ impl LspClient {
             }),
             Duration::from_secs(30),
         )?;
+
+        self.position_encoding = result
+            .get("capabilities")
+            .and_then(|c| c.get("positionEncoding"))
+            .and_then(Value::as_str)
+            .unwrap_or("utf-16")
+            .to_string();
+
         self.notify("initialized", Value::Object(Map::new()))?;
         Ok(())
     }
@@ -268,16 +302,21 @@ pub fn run_wcgv_lsp() -> Result<()> {
     eprintln!("🔍 Starting rust-analyzer in {}", root.display());
     let mut lsp = LspClient::start(&opts.rust_analyzer_bin, &root)?;
     lsp.initialize(&root)?;
+    eprintln!("📐 LSP position encoding: {}", lsp.position_encoding);
 
     eprintln!("📚 Collecting symbols via LSP...");
-    let (nodes, files) = build_nodes(&mut lsp, &root, opts.include_sources, &skip_dirs)?;
+    let (mut nodes, files, mut edges) = build_nodes(&mut lsp, &root, &opts, &skip_dirs)?;
     eprintln!("  found {} candidate nodes", nodes.len());
+
+    if opts.show_impl_edges {
+        eprintln!("🧱 Building impl edges...");
+        let impls = collect_impl_blocks(&root, &files, opts.include_sources)?;
+        attach_impl_nodes_and_edges(&mut nodes, &mut edges, &impls);
+    }
 
     if opts.warmup_ms > 0 {
         thread::sleep(Duration::from_millis(opts.warmup_ms));
     }
-
-    let mut edges: Vec<(String, String, &'static str)> = Vec::new();
 
     if opts.show_calls {
         eprintln!("🔗 Building call hierarchy edges...");
@@ -300,13 +339,14 @@ pub fn run_wcgv_lsp() -> Result<()> {
     let mut unique = HashSet::new();
     edges.retain(|(s, t, ty)| unique.insert((s.clone(), t.clone(), *ty)));
 
-    let output = build_json(&root, &nodes, &files, &edges, opts.include_sources);
+    let output = build_json(&root, &nodes, &files, &edges, opts.include_sources, &lsp.position_encoding);
     fs::write(&opts.output_path, serde_json::to_string_pretty(&output)?)
         .with_context(|| format!("writing {}", opts.output_path.display()))?;
 
     eprintln!("\x1b[1;32m✓ Graph saved to: {}\x1b[0m", opts.output_path.display());
     eprintln!("\x1b[36m✓ Nodes: {}  Edges: {}\x1b[0m", nodes.len(), edges.len());
     eprintln!("\x1b[33m✓ includeSources={} (toggle with -s)\x1b[0m", opts.include_sources);
+    eprintln!("\x1b[33m✓ includeFieldNodes={} (toggle with --fields-as-nodes/--no-fields-as-nodes)\x1b[0m", opts.include_field_nodes);
     println!("{}", opts.output_path.display());
 
     lsp.shutdown()?;
@@ -341,26 +381,34 @@ fn uri_to_path(uri: &str) -> Result<PathBuf> {
 }
 
 fn line_col_to_byte_index(text: &str, line1: usize, col0: usize) -> Option<usize> {
-    let mut current_line = 1usize;
-    let mut current_col = 0usize;
+    let mut line_no = 1usize;
+    let mut line_start = 0usize;
 
-    for (idx, ch) in text.char_indices() {
-        if current_line == line1 && current_col == col0 {
-            return Some(idx);
+    for segment in text.split_inclusive('\n') {
+        let line_text = segment.strip_suffix('\n').unwrap_or(segment);
+        if line_no == line1 {
+            return utf8_column_to_byte_index(line_text, col0).map(|off| line_start + off);
         }
-        if ch == '\n' {
-            current_line += 1;
-            current_col = 0;
-        } else {
-            current_col += 1;
-        }
+        line_start += segment.len();
+        line_no += 1;
     }
 
-    if current_line == line1 && current_col == col0 {
-        Some(text.len())
-    } else {
-        None
+    if line_no == line1 {
+        let line_text = &text[line_start..];
+        return utf8_column_to_byte_index(line_text, col0).map(|off| line_start + off);
     }
+
+    None
+}
+
+fn utf8_column_to_byte_index(line: &str, col0: usize) -> Option<usize> {
+    if col0 > line.len() {
+        return None;
+    }
+    if !line.is_char_boundary(col0) {
+        return None;
+    }
+    Some(col0)
 }
 
 fn read_snippet(path: &Path, range: &SourceRange) -> Option<String> {
@@ -390,6 +438,32 @@ fn make_range(v: &Value) -> Result<SourceRange> {
     })
 }
 
+fn make_syn_range(span: proc_macro2::Span, source: &str) -> SourceRange {
+    let start = span.start();
+    let end = span.end();
+    let start_line = start.line;
+    let start_col = start.column;
+    let end_line = end.line;
+    let end_col = end.column;
+    let start_byte = line_col_to_byte_index(source, start_line, start_col).unwrap_or(0);
+    let end_byte = line_col_to_byte_index(source, end_line, end_col).unwrap_or(source.len());
+
+    SourceRange {
+        start: Position {
+            line: start_line,
+            column: start_col,
+        },
+        end: Position {
+            line: end_line,
+            column: end_col,
+        },
+        bytes: Some(ByteRange {
+            start: start_byte,
+            end: end_byte,
+        }),
+    }
+}
+
 fn symbol_kind_name(kind: u64) -> &'static str {
     match kind {
         5 => "class",
@@ -407,8 +481,9 @@ fn symbol_kind_name(kind: u64) -> &'static str {
     }
 }
 
-fn is_interesting_symbol(kind: &str) -> bool {
+fn is_interesting_symbol(kind: &str, include_field_nodes: bool) -> bool {
     matches!(kind, "function" | "method" | "struct" | "field" | "class" | "interface")
+        && (kind != "field" || include_field_nodes)
 }
 
 fn visibility_from_signature(sig: Option<&str>) -> String {
@@ -429,6 +504,26 @@ fn make_symbol_key(kind: &str, name: &str, rel_path: &str, selection_range: &Sou
     )
 }
 
+fn make_impl_key(rel_path: &str, target_label: &str, trait_label: Option<&str>, selection_range: &SourceRange) -> String {
+    match trait_label {
+        Some(tr) => format!(
+            "impl::{}::{} for {}:{}:{}",
+            rel_path,
+            tr,
+            target_label,
+            selection_range.start.line,
+            selection_range.start.column
+        ),
+        None => format!(
+            "impl::{}::{}:{}:{}",
+            rel_path,
+            target_label,
+            selection_range.start.line,
+            selection_range.start.column
+        ),
+    }
+}
+
 fn collect_rust_files(root: &Path, skip_dirs: &HashSet<String>, out: &mut Vec<PathBuf>) -> Result<()> {
     for entry in fs::read_dir(root)? {
         let entry = entry?;
@@ -446,27 +541,19 @@ fn collect_rust_files(root: &Path, skip_dirs: &HashSet<String>, out: &mut Vec<Pa
     Ok(())
 }
 
-fn flatten_document_symbols(items: &[Value], out: &mut Vec<Value>) {
-    for item in items {
-        out.push(item.clone());
-        if let Some(children) = item.get("children").and_then(Value::as_array) {
-            flatten_document_symbols(children, out);
-        }
-    }
-}
-
 fn build_nodes(
     lsp: &mut LspClient,
     root: &Path,
-    include_sources: bool,
+    opts: &CliOptions,
     skip_dirs: &HashSet<String>,
-) -> Result<(Vec<SymbolNode>, Vec<FileData>)> {
+) -> Result<(Vec<SymbolNode>, Vec<FileData>, Vec<(String, String, &'static str)>)> {
     let mut rust_files = Vec::new();
     collect_rust_files(root, skip_dirs, &mut rust_files)?;
     rust_files.sort();
 
     let mut nodes = Vec::new();
     let mut files = Vec::new();
+    let mut edges = Vec::new();
 
     for file in rust_files {
         let uri = path_to_uri(&file)?;
@@ -491,47 +578,86 @@ fn build_nodes(
             Duration::from_secs(20),
         )?;
         let symbols = result.as_array().cloned().unwrap_or_default();
-        let mut flat = Vec::new();
-        flatten_document_symbols(&symbols, &mut flat);
 
-        for sym in flat {
-            let name = sym.get("name").and_then(Value::as_str).unwrap_or("<unnamed>");
-            let kind_num = sym.get("kind").and_then(Value::as_u64).unwrap_or(0);
-            let kind = symbol_kind_name(kind_num).to_string();
-            if !is_interesting_symbol(&kind) {
-                continue;
-            }
-
-            let full_range = make_range(sym.get("range").context("symbol missing full range")?)?;
-            let selection_range = make_range(
-                sym.get("selectionRange")
-                    .or_else(|| sym.get("range"))
-                    .context("symbol missing selection range")?,
-            )?;
-            let detail = sym.get("detail").and_then(Value::as_str).map(|s| s.to_string());
-            let key = make_symbol_key(&kind, name, &rel_path, &selection_range);
-            let snippet = if include_sources { read_snippet(&file, &full_range) } else { None };
-
-            nodes.push(SymbolNode {
-                key,
-                label: name.to_string(),
-                kind,
-                path: rel_path.clone(),
-                visibility: visibility_from_signature(detail.as_deref()),
-                signature: detail,
-                selection_range,
-                full_range,
-                source_snippet: snippet,
-            });
-        }
+        walk_document_symbols(
+            &symbols,
+            &rel_path,
+            &file,
+            opts.include_sources,
+            opts.include_field_nodes,
+            &mut nodes,
+            &mut edges,
+            None,
+        )?;
 
         files.push(FileData {
             rel_path,
-            content: if include_sources { Some(text) } else { None },
+            content: if opts.include_sources { Some(text) } else { None },
         });
     }
 
-    Ok((nodes, files))
+    Ok((nodes, files, edges))
+}
+
+fn walk_document_symbols(
+    items: &[Value],
+    rel_path: &str,
+    file: &Path,
+    include_sources: bool,
+    include_field_nodes: bool,
+    nodes: &mut Vec<SymbolNode>,
+    edges: &mut Vec<(String, String, &'static str)>,
+    parent_key: Option<&str>,
+) -> Result<()> {
+    for sym in items {
+        let name = sym.get("name").and_then(Value::as_str).unwrap_or("<unnamed>");
+        let kind_num = sym.get("kind").and_then(Value::as_u64).unwrap_or(0);
+        let kind = symbol_kind_name(kind_num).to_string();
+        let full_range = make_range(sym.get("range").context("symbol missing full range")?)?;
+        let selection_range = make_range(
+            sym.get("selectionRange")
+                .or_else(|| sym.get("range"))
+                .context("symbol missing selection range")?,
+        )?;
+        let detail = sym.get("detail").and_then(Value::as_str).map(|s| s.to_string());
+        let key = make_symbol_key(&kind, name, rel_path, &selection_range);
+        let keep_node = is_interesting_symbol(&kind, include_field_nodes);
+
+        let next_parent = if keep_node {
+            let snippet = if include_sources { read_snippet(file, &full_range) } else { None };
+            nodes.push(SymbolNode {
+                key: key.clone(),
+                label: name.to_string(),
+                kind: kind.clone(),
+                path: rel_path.to_string(),
+                visibility: visibility_from_signature(detail.as_deref()),
+                signature: detail,
+                selection_range: selection_range.clone(),
+                full_range: full_range.clone(),
+                source_snippet: snippet,
+            });
+            if let Some(parent) = parent_key {
+                edges.push((parent.to_string(), key.clone(), "contains"));
+            }
+            Some(key)
+        } else {
+            parent_key.map(str::to_string)
+        };
+
+        if let Some(children) = sym.get("children").and_then(Value::as_array) {
+            walk_document_symbols(
+                children,
+                rel_path,
+                file,
+                include_sources,
+                include_field_nodes,
+                nodes,
+                edges,
+                next_parent.as_deref(),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn symbol_position_params(root: &Path, node: &SymbolNode) -> Result<Value> {
@@ -547,8 +673,8 @@ fn symbol_position_params(root: &Path, node: &SymbolNode) -> Result<Value> {
 
 fn contains(range: &SourceRange, line: usize, col: usize) -> bool {
     let starts_before = line > range.start.line || (line == range.start.line && col >= range.start.column);
-    let ends_after = line < range.end.line || (line == range.end.line && col <= range.end.column);
-    starts_before && ends_after
+    let ends_before_end = line < range.end.line || (line == range.end.line && col < range.end.column);
+    starts_before && ends_before_end
 }
 
 fn range_span_score(range: &SourceRange) -> (usize, usize, usize, usize) {
@@ -573,12 +699,14 @@ fn build_file_symbol_index(nodes: &[SymbolNode]) -> HashMap<String, Vec<SymbolNo
         by_file.entry(node.path.clone()).or_default().push(node.clone());
     }
     for symbols in by_file.values_mut() {
-        symbols.sort_by_key(|sym| (
-            sym.full_range.start.line,
-            sym.full_range.start.column,
-            sym.full_range.end.line,
-            sym.full_range.end.column,
-        ));
+        symbols.sort_by_key(|sym| {
+            (
+                sym.full_range.start.line,
+                sym.full_range.start.column,
+                sym.full_range.end.line,
+                sym.full_range.end.column,
+            )
+        });
     }
     by_file
 }
@@ -592,17 +720,23 @@ fn find_references_edges(
     let file_symbols = build_file_symbol_index(nodes);
 
     for decl in nodes {
+        if decl.kind == "field" || decl.kind == "impl" {
+            continue;
+        }
+
         let mut obj = symbol_position_params(root, decl)?
             .as_object()
             .cloned()
             .unwrap_or_default();
         obj.insert("context".to_string(), json!({"includeDeclaration": false}));
 
-        let refs = lsp.request(
-            "textDocument/references",
-            Value::Object(obj),
-            Duration::from_secs(20),
-        ).unwrap_or(Value::Null);
+        let refs = lsp
+            .request(
+                "textDocument/references",
+                Value::Object(obj),
+                Duration::from_secs(20),
+            )
+            .unwrap_or(Value::Null);
 
         let Some(arr) = refs.as_array() else { continue; };
         for loc in arr {
@@ -646,19 +780,23 @@ fn find_call_hierarchy_edges(
     }
 
     for node in callable {
-        let prepared = lsp.request(
-            "textDocument/prepareCallHierarchy",
-            symbol_position_params(root, node)?,
-            Duration::from_secs(20),
-        ).unwrap_or(Value::Null);
+        let prepared = lsp
+            .request(
+                "textDocument/prepareCallHierarchy",
+                symbol_position_params(root, node)?,
+                Duration::from_secs(20),
+            )
+            .unwrap_or(Value::Null);
 
         let Some(items) = prepared.as_array() else { continue; };
         for item in items {
-            let outgoing = lsp.request(
-                "callHierarchy/outgoingCalls",
-                json!({"item": item}),
-                Duration::from_secs(20),
-            ).unwrap_or(Value::Null);
+            let outgoing = lsp
+                .request(
+                    "callHierarchy/outgoingCalls",
+                    json!({"item": item}),
+                    Duration::from_secs(20),
+                )
+                .unwrap_or(Value::Null);
 
             let Some(arr) = outgoing.as_array() else { continue; };
             for call in arr {
@@ -722,23 +860,38 @@ fn find_field_edges(nodes: &[SymbolNode]) -> Vec<(String, String, &'static str)>
     let mut edges = Vec::new();
     let mut structs_by_name: HashMap<String, String> = HashMap::new();
     let mut fields = Vec::new();
+    let mut field_owner: HashMap<String, String> = HashMap::new();
 
     for n in nodes {
         if n.kind == "struct" {
             structs_by_name.entry(n.label.clone()).or_insert_with(|| n.key.clone());
         }
+    }
+
+    for n in nodes {
         if n.kind == "field" {
             fields.push(n);
+        }
+    }
+
+    for n in nodes {
+        if n.kind == "struct" {
+            for field in &fields {
+                if field.path == n.path && contains(&n.full_range, field.selection_range.start.line, field.selection_range.start.column) {
+                    field_owner.insert(field.key.clone(), n.key.clone());
+                }
+            }
         }
     }
 
     for field in fields {
         let Some(sig) = &field.signature else { continue; };
         let tokens = extract_ident_tokens(sig);
+        let source_key = field_owner.get(&field.key).unwrap_or(&field.key);
         for token in tokens {
             if let Some(target) = structs_by_name.get(&token) {
-                if target != &field.key {
-                    edges.push((field.key.clone(), target.clone(), "field_type"));
+                if target != source_key {
+                    edges.push((source_key.clone(), target.clone(), "field_type"));
                 }
             }
         }
@@ -747,12 +900,127 @@ fn find_field_edges(nodes: &[SymbolNode]) -> Vec<(String, String, &'static str)>
     edges
 }
 
+fn collect_impl_blocks(root: &Path, files: &[FileData], include_sources: bool) -> Result<Vec<ImplBlock>> {
+    let mut out = Vec::new();
+
+    for file in files {
+        let abs = root.join(&file.rel_path);
+        let source = fs::read_to_string(&abs).with_context(|| format!("reading {}", abs.display()))?;
+        let syntax = syn::parse_file(&source).with_context(|| format!("parsing {}", abs.display()))?;
+
+        for item in syntax.items {
+            let syn::Item::Impl(item_impl) = item else { continue; };
+            let self_ty = item_impl.self_ty.as_ref();
+            let target_label = type_to_label(self_ty);
+            let trait_label = item_impl.trait_.as_ref().map(|(_, path, _)| path_to_label(path));
+            let full_range = make_syn_range(item_impl.span(), &source);
+            let selection_range = make_impl_selection_range(&item_impl, &source);
+            let key = make_impl_key(&file.rel_path, &target_label, trait_label.as_deref(), &selection_range);
+            let source_snippet = if include_sources {
+                read_range_snippet(&source, &full_range)
+            } else {
+                None
+            };
+
+            out.push(ImplBlock {
+                key,
+                path: file.rel_path.clone(),
+                target_label,
+                trait_label,
+                full_range,
+                selection_range,
+                source_snippet,
+            });
+        }
+    }
+
+    Ok(out)
+}
+
+fn read_range_snippet(source: &str, range: &SourceRange) -> Option<String> {
+    let start = range.bytes.as_ref().map(|b| b.start)?;
+    let end = range.bytes.as_ref().map(|b| b.end)?;
+    if start <= end && end <= source.len() {
+        Some(source[start..end].to_string())
+    } else {
+        None
+    }
+}
+
+fn type_to_label(ty: &syn::Type) -> String {
+    match ty {
+        syn::Type::Path(tp) => tp.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_else(|| "<type>".to_string()),
+        _ => "<type>".to_string(),
+    }
+}
+
+fn path_to_label(path: &syn::Path) -> String {
+    path.segments.iter().map(|s| s.ident.to_string()).collect::<Vec<_>>().join("::")
+}
+
+fn make_impl_selection_range(item_impl: &syn::ItemImpl, source: &str) -> SourceRange {
+    let token = if let Some((_, trait_path, _)) = &item_impl.trait_ {
+        trait_path.segments.last().map(|s| s.ident.span()).unwrap_or_else(|| item_impl.self_ty.span())
+    } else {
+        item_impl.self_ty.span()
+    };
+    make_syn_range(token, source)
+}
+
+fn attach_impl_nodes_and_edges(
+    nodes: &mut Vec<SymbolNode>,
+    edges: &mut Vec<(String, String, &'static str)>,
+    impls: &[ImplBlock],
+) {
+    let mut type_by_label: HashMap<String, String> = HashMap::new();
+    for n in nodes.iter() {
+        if n.kind == "struct" || n.kind == "class" || n.kind == "interface" {
+            type_by_label.entry(n.label.clone()).or_insert_with(|| n.key.clone());
+        }
+    }
+
+    let method_nodes: Vec<SymbolNode> = nodes.iter().filter(|n| n.kind == "method").cloned().collect();
+
+    for imp in impls {
+        nodes.push(SymbolNode {
+            key: imp.key.clone(),
+            label: match &imp.trait_label {
+                Some(tr) => format!("impl {} for {}", tr, imp.target_label),
+                None => format!("impl {}", imp.target_label),
+            },
+            kind: "impl".to_string(),
+            path: imp.path.clone(),
+            visibility: "private".to_string(),
+            signature: Some(match &imp.trait_label {
+                Some(tr) => format!("impl {} for {}", tr, imp.target_label),
+                None => format!("impl {}", imp.target_label),
+            }),
+            selection_range: imp.selection_range.clone(),
+            full_range: imp.full_range.clone(),
+            source_snippet: imp.source_snippet.clone(),
+        });
+
+        if let Some(type_key) = type_by_label.get(&imp.target_label) {
+            edges.push((imp.key.clone(), type_key.clone(), "associated_with"));
+        }
+
+        for method in &method_nodes {
+            if method.path == imp.path
+                && contains(&imp.full_range, method.selection_range.start.line, method.selection_range.start.column)
+            {
+                edges.push((imp.key.clone(), method.key.clone(), "contains"));
+            }
+        }
+    }
+}
+
 fn build_json(
     root: &Path,
     nodes: &[SymbolNode],
     files: &[FileData],
     edges: &[(String, String, &'static str)],
     include_sources: bool,
+    position_encoding: &str,
 ) -> Value {
     let node_json: Vec<Value> = nodes
         .iter()
@@ -769,11 +1037,13 @@ fn build_json(
                     "sourceSnippet": if include_sources { n.source_snippet.clone() } else { None },
                     "range": {
                         "start": {"line": n.full_range.start.line, "column": n.full_range.start.column},
-                        "end": {"line": n.full_range.end.line, "column": n.full_range.end.column}
+                        "end": {"line": n.full_range.end.line, "column": n.full_range.end.column},
+                        "bytes": n.full_range.bytes.as_ref().map(|b| json!({"start": b.start, "end": b.end}))
                     },
                     "selectionRange": {
                         "start": {"line": n.selection_range.start.line, "column": n.selection_range.start.column},
-                        "end": {"line": n.selection_range.end.line, "column": n.selection_range.end.column}
+                        "end": {"line": n.selection_range.end.line, "column": n.selection_range.end.column},
+                        "bytes": n.selection_range.bytes.as_ref().map(|b| json!({"start": b.start, "end": b.end}))
                     }
                 }
             })
@@ -811,6 +1081,7 @@ fn build_json(
             "timestamp": Local::now().to_rfc3339(),
             "root": root.display().to_string(),
             "includeSources": include_sources,
+            "positionEncoding": position_encoding,
             "stats": {
                 "nodes": nodes.len(),
                 "edges": edges.len(),
