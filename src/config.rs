@@ -19,6 +19,8 @@ pub struct UnifiedConfig {
     pub wff: WffConfig,
     #[serde(default)]
     pub wcg: WcgConfig,
+    #[serde(default)]
+    pub wrs: WrsConfig,  // Added for string replacement
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -84,6 +86,22 @@ pub struct WcgConfig {
     pub show_impl_edges: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WrsConfig {
+    pub enabled: bool,
+    pub source_extensions: Vec<String>,
+    pub auto_backup: bool,
+    pub dry_run_by_default: bool,
+    pub show_line_details: bool,
+    pub max_file_size_mb: u64,
+    pub exclude_patterns: Vec<String>,
+    pub exclude_dirs: Vec<String>,
+    pub case_sensitive: bool,
+    pub recursive: bool,
+    pub follow_symlinks: bool,
+    pub preserve_timestamps: bool,
+}
+
 impl Default for WffConfig {
     fn default() -> Self {
         Self {
@@ -104,6 +122,121 @@ impl Default for WcgConfig {
             show_imports: true,
             include_field_nodes: false,
             show_impl_edges: true,
+        }
+    }
+}
+
+impl Default for WrsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            source_extensions: vec![
+                "rs".to_string(),    // Rust
+                "go".to_string(),    // Go
+                "py".to_string(),    // Python
+                "js".to_string(),    // JavaScript
+                "ts".to_string(),    // TypeScript
+                "jsx".to_string(),   // React
+                "tsx".to_string(),   // React TypeScript
+                "c".to_string(),     // C
+                "cpp".to_string(),   // C++
+                "h".to_string(),     // C/C++ header
+                "hpp".to_string(),   // C++ header
+                "java".to_string(),  // Java
+                "kt".to_string(),    // Kotlin
+                "scala".to_string(), // Scala
+                "swift".to_string(), // Swift
+                "rb".to_string(),    // Ruby
+                "php".to_string(),   // PHP
+                "html".to_string(),  // HTML
+                "css".to_string(),   // CSS
+                "scss".to_string(),  // SCSS
+                "sass".to_string(),  // SASS
+                "vue".to_string(),   // Vue.js
+                "svelte".to_string(), // Svelte
+                "lua".to_string(),   // Lua
+                "sh".to_string(),    // Shell
+                "bash".to_string(),  // Bash
+                "zsh".to_string(),   // Zsh
+                "fish".to_string(),  // Fish
+                "toml".to_string(),  // TOML
+                "yaml".to_string(),  // YAML
+                "yml".to_string(),   // YML
+                "json".to_string(),  // JSON
+                "xml".to_string(),   // XML
+                "md".to_string(),    // Markdown
+                "txt".to_string(),   // Text
+                "sql".to_string(),   // SQL
+                "dockerfile".to_string(), // Dockerfile
+                "makefile".to_string(),   // Makefile
+            ],
+            auto_backup: true,
+            dry_run_by_default: false,
+            show_line_details: true,
+            max_file_size_mb: 10,
+            exclude_patterns: vec![
+                "*.o".to_string(),
+                "*.so".to_string(),
+                "*.dll".to_string(),
+                "*.dylib".to_string(),
+                "*.exe".to_string(),
+                "*.class".to_string(),
+                "*.jar".to_string(),
+                "*.pyc".to_string(),
+                "*.pyo".to_string(),
+                "*.zip".to_string(),
+                "*.tar".to_string(),
+                "*.gz".to_string(),
+                "*.bz2".to_string(),
+                "*.xz".to_string(),
+                "*.7z".to_string(),
+                "*.rar".to_string(),
+                "*.png".to_string(),
+                "*.jpg".to_string(),
+                "*.jpeg".to_string(),
+                "*.gif".to_string(),
+                "*.bmp".to_string(),
+                "*.ico".to_string(),
+                "*.mp3".to_string(),
+                "*.mp4".to_string(),
+                "*.avi".to_string(),
+                "*.mov".to_string(),
+                "*.pdf".to_string(),
+                "*.doc".to_string(),
+                "*.docx".to_string(),
+                "*.bkp".to_string(),
+                "*.log".to_string(),
+                "*.tmp".to_string(),
+                "*.temp".to_string(),
+                "*.cache".to_string(),
+            ],
+            exclude_dirs: vec![
+                "target".to_string(),
+                "node_modules".to_string(),
+                ".git".to_string(),
+                ".svn".to_string(),
+                ".hg".to_string(),
+                "build".to_string(),
+                "dist".to_string(),
+                "__pycache__".to_string(),
+                ".cache".to_string(),
+                ".cargo".to_string(),
+                ".idea".to_string(),
+                ".vscode".to_string(),
+                "vendor".to_string(),
+                "tmp".to_string(),
+                "temp".to_string(),
+                "logs".to_string(),
+                "coverage".to_string(),
+                ".venv".to_string(),
+                "venv".to_string(),
+                "env".to_string(),
+                ".env".to_string(),
+            ],
+            case_sensitive: true,
+            recursive: true,
+            follow_symlinks: false,
+            preserve_timestamps: true,
         }
     }
 }
@@ -164,6 +297,7 @@ impl Default for UnifiedConfig {
             },
             wff: WffConfig::default(),
             wcg: WcgConfig::default(),
+            wrs: WrsConfig::default(),
         }
     }
 }
@@ -253,6 +387,19 @@ pub fn show_config() -> Result<()> {
     println!("    show_imports: {}", config.wcg.show_imports);
     println!("    include_field_nodes: {}", config.wcg.include_field_nodes);
     println!("    show_impl_edges: {}", config.wcg.show_impl_edges);
+    println!("  [wrs]");
+    println!("    enabled: {}", config.wrs.enabled);
+    println!("    source_extensions: {:?}", config.wrs.source_extensions);
+    println!("    auto_backup: {}", config.wrs.auto_backup);
+    println!("    dry_run_by_default: {}", config.wrs.dry_run_by_default);
+    println!("    show_line_details: {}", config.wrs.show_line_details);
+    println!("    max_file_size_mb: {} MB", config.wrs.max_file_size_mb);
+    println!("    exclude_patterns: {:?}", config.wrs.exclude_patterns);
+    println!("    exclude_dirs: {:?}", config.wrs.exclude_dirs);
+    println!("    case_sensitive: {}", config.wrs.case_sensitive);
+    println!("    recursive: {}", config.wrs.recursive);
+    println!("    follow_symlinks: {}", config.wrs.follow_symlinks);
+    println!("    preserve_timestamps: {}", config.wrs.preserve_timestamps);
     println!();
     println!("  Config file: \x1b[90m{}\x1b[0m", get_config_path().display());
 
@@ -287,6 +434,7 @@ pub fn init_config() -> Result<()> {
     println!("  [wcf] - function replacement settings");
     println!("  [wff] - wff (function finder) settings with time and line number options");
     println!("  [wcg] - code graph analyzer settings with line numbers, calls, imports, optional field nodes, and impl edges");
+    println!("  [wrs] - string replacement settings for source files with {} extensions", config.wrs.source_extensions.len());
 
     Ok(())
 }
