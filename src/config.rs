@@ -84,6 +84,8 @@ pub struct WcgConfig {
     pub show_imports: bool,
     pub include_field_nodes: bool,
     pub show_impl_edges: bool,
+    #[serde(default = "default_impl_body_mode")]
+    pub impl_body_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +102,10 @@ pub struct WrsConfig {
     pub recursive: bool,
     pub follow_symlinks: bool,
     pub preserve_timestamps: bool,
+}
+
+fn default_impl_body_mode() -> String {
+    "full".to_string()
 }
 
 impl Default for WffConfig {
@@ -122,6 +128,7 @@ impl Default for WcgConfig {
             show_imports: true,
             include_field_nodes: false,
             show_impl_edges: true,
+            impl_body_mode: "full".to_string(),
         }
     }
 }
@@ -387,6 +394,7 @@ pub fn show_config() -> Result<()> {
     println!("    show_imports: {}", config.wcg.show_imports);
     println!("    include_field_nodes: {}", config.wcg.include_field_nodes);
     println!("    show_impl_edges: {}", config.wcg.show_impl_edges);
+    println!("    impl_body_mode: {}", config.wcg.impl_body_mode);
     println!("  [wrs]");
     println!("    enabled: {}", config.wrs.enabled);
     println!("    source_extensions: {:?}", config.wrs.source_extensions);
