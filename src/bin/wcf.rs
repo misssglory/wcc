@@ -106,6 +106,20 @@ fn print_colored_formatted_diff(old: &str, new: &str, file_path: Option<&Path>) 
     print!("{}", diff);
     Ok(true)
 }
+
+fn format_not_found_blocks_for_clipboard(blocks: &[(String, String)]) -> String {
+    let mut payload = blocks
+        .iter()
+        .map(|(_, block)| block.trim())
+        .filter(|block| !block.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if !payload.is_empty() {
+        payload.push('\n');
+    }
+    payload
+}
+
 fn parse_clipboard_blocks(content: &str) -> Result<Vec<(String, CodeBlockType, String)>> {
     let content = content.trim();
     let mut blocks = Vec::new();
@@ -907,6 +921,7 @@ fn main() -> Result<()> {
     let mut processed_blocks: Vec<String> = Vec::new();
     let mut skipped_no_changes_blocks: Vec<String> = Vec::new();
     let mut not_found_blocks: Vec<String> = Vec::new();
+    let mut not_found_clipboard_blocks: Vec<(String, String)> = Vec::new();
     let mut manually_skipped_blocks: Vec<String> = Vec::new();
     while !blocks.is_empty() {
         let (block_name, block_type, new_block_str) = blocks.remove(0);
@@ -998,7 +1013,9 @@ fn main() -> Result<()> {
         if matches.is_empty() {
             eprintln!("⚠ No matches found for '{}', skipping", block_name);
             skipped_count += 1;
-            not_found_blocks.push(format!("{} {}", type_str, block_name));
+            let block_label = format!("{} {}", type_str, block_name);
+            not_found_blocks.push(block_label.clone());
+            not_found_clipboard_blocks.push((block_label, new_block_str));
             last_selected_match = None;
             continue;
         }
@@ -1139,6 +1156,20 @@ fn main() -> Result<()> {
     } else {
         for block in &not_found_blocks {
             eprintln!("  • {}", block);
+        }
+    }
+    if !not_found_clipboard_blocks.is_empty() {
+        let not_found_payload = format_not_found_blocks_for_clipboard(&not_found_clipboard_blocks);
+        if not_found_payload.is_empty() {
+            eprintln!("\n⚠ No non-empty not-found blocks available to copy to clipboard");
+        } else {
+            match set_clipboard(&not_found_payload) {
+                Ok(()) => eprintln!(
+                    "\n📋 Copied {} not-found block(s) to clipboard",
+                    not_found_clipboard_blocks.len()
+                ),
+                Err(e) => eprintln!("\n⚠ Failed to copy not-found blocks to clipboard: {}", e),
+            }
         }
     }
     Ok(())
@@ -1476,5 +1507,37 @@ fn colorized_range(range: Option<(usize, usize)>, total_lines: usize) -> String 
             format!("{}-{}", start_colored, end_colored)
         }
         None => ansi_dim("?L"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_not_found_blocks_as_rust_snippets() {
+        let blocks = vec![
+            (
+                "function alpha".to_string(),
+                "  fn alpha() {}  ".to_string(),
+            ),
+            ("struct Beta".to_string(), "struct Beta;".to_string()),
+        ];
+
+        let payload = format_not_found_blocks_for_clipboard(&blocks);
+
+        assert_eq!(payload, "fn alpha() {}\n\nstruct Beta;\n");
+    }
+
+    #[test]
+    fn ignores_empty_not_found_blocks() {
+        let blocks = vec![
+            ("function empty".to_string(), "   ".to_string()),
+            ("enum Present".to_string(), "enum Present { A }".to_string()),
+        ];
+
+        let payload = format_not_found_blocks_for_clipboard(&blocks);
+
+        assert_eq!(payload, "enum Present { A }\n");
     }
 }
