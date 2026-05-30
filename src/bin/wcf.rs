@@ -1478,3 +1478,53 @@ fn colorized_range(range: Option<(usize, usize)>, total_lines: usize) -> String 
         None => ansi_dim("?L"),
     }
 }
+
+fn extract_block_by_line_range(content: &str, range: (usize, usize)) -> Result<String> {
+    let (start_line, end_line) = range;
+
+    if start_line == 0 || end_line == 0 || start_line > end_line {
+        bail!("Invalid line range {}-{}", start_line, end_line);
+    }
+
+    let lines: Vec<&str> = content.lines().collect();
+    let start_idx = start_line - 1;
+    let end_idx = end_line - 1;
+
+    if start_idx >= lines.len() || end_idx >= lines.len() {
+        bail!(
+            "Line range {}-{} out of bounds for content with {} lines",
+            start_line,
+            end_line,
+            lines.len()
+        );
+    }
+
+    Ok(lines[start_idx..=end_idx].join("\n"))
+}
+
+fn get_preview_old_block(block_match: &CodeBlockMatch) -> Result<String> {
+    let content = fs::read_to_string(&block_match.file_path).with_context(|| {
+        format!(
+            "Failed to read file for preview: {}",
+            block_match.file_path.display()
+        )
+    })?;
+
+    if let Some(range) = block_match.line_range {
+        return extract_block_by_line_range(&content, range).with_context(|| {
+            format!(
+                "Failed to extract preview block at lines {}-{} from {}",
+                range.0,
+                range.1,
+                block_match.file_path.display()
+            )
+        });
+    }
+
+    Ok(block_match.old_full_block.clone())
+}
+
+fn print_match_preview_diff(block_match: &CodeBlockMatch, new_block: &str) -> Result<bool> {
+    let old_block = get_preview_old_block(block_match)?;
+    print_colored_formatted_diff(&old_block, new_block, Some(block_match.file_path.as_path()))
+}

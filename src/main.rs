@@ -1,9 +1,9 @@
-// src/main.rs
 use std::{
+    collections::HashSet,
     fs,
     io::{self, BufRead, BufReader, Read, Write},
-    path::PathBuf,
-    process::{Command, Stdio},
+    path::{Path, PathBuf},
+    process::{ChildStdin, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Sender},
@@ -19,9 +19,8 @@ use clap::{Parser, Subcommand};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::flag;
 use thiserror::Error;
-use wcc::load_unified_config;
 use wcc::config::init_config;
-
+use wcc::load_unified_config;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Run commands and copy output to clipboard")]
@@ -151,7 +150,7 @@ fn spawn_reader<R: io::Read + Send + 'static>(reader: R, tx: Sender<Msg>, is_err
     });
 }
 
-fn spawn_stdin_forwarder(mut child_stdin: std::process::ChildStdin) {
+fn spawn_stdin_forwarder(mut child_stdin: ChildStdin) {
     thread::spawn(move || {
         let mut input = io::stdin();
         let mut buf = [0u8; 4096];
@@ -175,6 +174,39 @@ fn spawn_stdin_forwarder(mut child_stdin: std::process::ChildStdin) {
 fn strip_ansi_codes(s: &str) -> String {
     let re = regex::Regex::new(r"\x1b\[[0-9;]*[mK]").unwrap();
     re.replace_all(s, "").to_string()
+}
+
+fn wcc_history_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("wcc").join("history"))
+}
+
+fn append_wcc_history_entry(cmd: &str) {
+    if let Some(path) = wcc_history_path() {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = writeln!(file, "{}", cmd);
+        }
+    }
+}
+
+fn read_wcc_history() -> Vec<String> {
+    if let Some(path) = wcc_history_path() {
+        if let Ok(content) = fs::read_to_string(path) {
+            return content
+                .lines()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+        }
+    }
+    Vec::new()
 }
 
 fn run_cargo_build(release: bool, debug: bool, args: Vec<String>) -> Result<()> {
@@ -356,7 +388,6 @@ fn update_cargo_mode(mode: &str) -> Result<()> {
     Ok(())
 }
 
-
 fn show_config() -> Result<()> {
     let config = load_unified_config()?;
 
@@ -388,6 +419,9 @@ fn show_config() -> Result<()> {
 
 fn run_shell_command(command: &str) -> Result<()> {
     use chrono::Local;
+
+    append_wcc_history_entry(command);
+
     let timestamp = Local::now().format("%H:%M:%S %d.%m.%Y");
     eprintln!("\x1b[36m🔧 Running: {}\x1b[0m # {}", command, timestamp);
 
@@ -458,6 +492,9 @@ fn run_watch_command(command: Vec<String>) -> Result<()> {
     flag::register(SIGTERM, Arc::clone(&term))?;
 
     let started = Instant::now();
+
+    let cmd_str = command.join(" ");
+    append_wcc_history_entry(&cmd_str);
 
     let mut child = Command::new(&command[0])
         .args(&command[1..])
@@ -552,6 +589,105 @@ fn is_shell_builtin_or_alias(command: &str) -> bool {
     false
 }
 
+fn read_shell_history_merged() -> Result<Vec<String>> {
+    let mut lines: Vec<String> = read_wcc_history();
+
+    let home = std::env::var("HOME").context("HOME not set")?;
+    let candidates = [
+        format!("{home}/.zsh_history"),
+        format!("{home}/.bash_history"),
+        format!("{home}/.local/share/fish/fish_history"),
+    ];
+
+    for path in candidates {
+        let p = Path::new(&path);
+        if !p.exists() {
+            continue;
+        }
+
+        let content =
+            fs::read_to_string(p).with_context(|| format!("failed to read history file: {path}"))?;
+
+        let mut new_lines: Vec<String> = if path.ends_with(".zsh_history") {
+            content
+                .lines()
+                .filter_map(|line| {
+                    line.split_once(';')
+                        .map(|(_, cmd)| cmd.trim().to_string())
+                })
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else if path.ends_with("fish_history") {
+            content
+                .lines()
+                .filter_map(|line| line.strip_prefix("- cmd: ").map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else {
+            content
+                .lines()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        };
+
+        new_lines.reverse();
+        lines.extend(new_lines);
+    }
+
+    let mut seen = HashSet::new();
+    lines.retain(|cmd| seen.insert(cmd.clone()));
+
+    Ok(lines)
+}
+
+fn prompt_command_from_history() -> Result<Option<String>> {
+    let history = read_shell_history_merged().unwrap_or_default();
+
+    let mut child = Command::new("fzf")
+        .args([
+            "--scheme=history",
+            "--height=40%",
+            "--layout=reverse",
+            "--border",
+            "--prompt=command> ",
+            "--print-query",
+            "--bind=enter:replace-query+print-query",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to spawn fzf")?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        for line in &history {
+            writeln!(stdin, "{line}")?;
+        }
+    }
+
+    let output = child.wait_with_output()?;
+
+    if output.status.code() == Some(130) {
+        return Ok(None);
+    }
+
+    let out = String::from_utf8(output.stdout)?;
+    let command = out
+        .lines()
+        .last()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if command.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(command))
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -605,14 +741,18 @@ fn main() -> Result<()> {
         }
         None => {
             if cli.cmd.is_empty() {
-                return Err(WccError::NoCommand.into());
-            }
-            let command_str = cli.cmd.join(" ");
-
-            if is_shell_builtin_or_alias(&command_str) {
-                run_shell_command(&command_str)?;
+                if let Some(command_str) = prompt_command_from_history()? {
+                    run_shell_command(&command_str)?;
+                } else {
+                    return Ok(());
+                }
             } else {
-                run_watch_command(cli.cmd)?;
+                let command_str = cli.cmd.join(" ");
+                if is_shell_builtin_or_alias(&command_str) {
+                    run_shell_command(&command_str)?;
+                } else {
+                    run_watch_command(cli.cmd)?;
+                }
             }
         }
     }
