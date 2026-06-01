@@ -44,6 +44,9 @@ path = "src/bin/wcgv.rs"
 name = "wcs"
 path = "src/bin/wcs.rs"
 
+[[bin]]
+name = "wcm"
+path = "src/bin/wcm.rs"
 
 [dependencies]
 # Common dependencies
@@ -79,6 +82,8 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
 walkdir = "2.5.0"
 filetime = "0.2.29"
+jwalk = "0.8.1"
+lz4_flex = "0.13.1"
 
 [lib]
 name = "wcc"
