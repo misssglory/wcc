@@ -1,0 +1,4 @@
+cargo run --bin wcm -- --latest-file-only tg_eth .
+cargo run --bin wcm -- -l --no-info 0xAe22dDac32D1fa7CC914D324E8024334F1863c48 .
+cargo run --bin wcm -- --latest-file-only -t 50 --warn --error memebuybot .
+cargo run --bin wcm -- -h 20 --selected-only unauthorized .

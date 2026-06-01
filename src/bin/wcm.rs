@@ -1,9 +1,9 @@
 use std::borrow::Cow;
-use std::collections::HashSet;
-use std::env;
-use std::fs::File;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use arboard::Clipboard;
 use clap::{ArgAction, Parser};
@@ -20,8 +20,8 @@ mod common;
 type DynRead = Box<dyn Read + Send>;
 
 #[derive(Parser, Debug)]
-#[command(name = "wcm")]
-#[command(about = "Parallel recursive text finder with on-the-fly decompression and clipboard output")]
+#[command(name = "wcm", disable_help_flag = true)]
+#[command(about = "Parallel recursive text finder with decompression, coloring and clipboard output")]
 struct Args {
     /// Search string
     needle: String,
@@ -37,6 +37,14 @@ struct Args {
     /// Put only first N matched lines into clipboard
     #[arg(short = 'h', long = "head")]
     head: Option<usize>,
+
+    /// Search only in the most recently modified file
+    #[arg(long = "latest-file-only", action = ArgAction::SetTrue)]
+    latest_file_only: bool,
+
+    /// List only filenames with occurrence count and mtime, sorted by mtime ascending
+    #[arg(short = 'l', long = "list-files", action = ArgAction::SetTrue)]
+    list_files: bool,
 
     /// Include INFO lines
     #[arg(long = "info", default_value_t = true, action = ArgAction::Set)]
@@ -69,10 +77,16 @@ struct Args {
     /// Print only clipboard selection to terminal instead of full matched output
     #[arg(long = "selected-only", action = ArgAction::SetTrue)]
     selected_only: bool,
+
+    /// Long help only because -h is used for head
+    #[arg(long = "help", action = ArgAction::Help, help = "Print help")]
+    help: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Level {
+    Trace,
+    Debug,
     Info,
     Warn,
     Error,
@@ -84,6 +98,12 @@ struct MatchLine {
     file: PathBuf,
     line_no: usize,
     raw_line: String,
+}
+
+#[derive(Debug, Clone)]
+struct FileInfo {
+    path: PathBuf,
+    modified: SystemTime,
 }
 
 fn main() -> io::Result<()> {
@@ -101,12 +121,11 @@ fn main() -> io::Result<()> {
 
     let allowed_levels = build_allowed_levels(&args);
 
-    let files: Vec<PathBuf> = WalkDir::new(&args.dir)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file())
-        .map(|e| e.path())
-        .collect();
+    let mut files = collect_files(&args.dir);
+
+    if args.latest_file_only {
+        files = latest_only(files);
+    }
 
     let needle_cmp = if args.ignore_case {
         args.needle.to_lowercase()
@@ -116,7 +135,7 @@ fn main() -> io::Result<()> {
 
     let mut matches: Vec<MatchLine> = files
         .par_iter()
-        .flat_map_iter(|path| search_file(path, &needle_cmp, args.ignore_case, &allowed_levels))
+        .flat_map_iter(|fi| search_file(&fi.path, &needle_cmp, args.ignore_case, &allowed_levels))
         .collect();
 
     matches.sort_by(|a, b| {
@@ -124,6 +143,11 @@ fn main() -> io::Result<()> {
             .cmp(&b.file)
             .then_with(|| a.line_no.cmp(&b.line_no))
     });
+
+    if args.list_files {
+        print_list_mode(&matches, &files);
+        return Ok(());
+    }
 
     let full_plain = build_plain_output(&matches);
     let selected = select_lines(&matches, args.head, args.tail);
@@ -136,9 +160,9 @@ fn main() -> io::Result<()> {
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clipboard set failed: {e}")))?;
 
     if args.selected_only {
-        print_colored_chunked(&selected);
+        print_colored_chunked(&selected, &args.needle, args.ignore_case);
     } else {
-        print_colored_chunked(&matches);
+        print_colored_chunked(&matches, &args.needle, args.ignore_case);
     }
 
     print_stats(&selected_plain, &full_plain);
@@ -146,8 +170,34 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
+fn collect_files(root: &Path) -> Vec<FileInfo> {
+    WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file())
+        .filter_map(|e| {
+            let path = e.path();
+            let modified = fs::metadata(&path).ok()?.modified().ok()?;
+            Some(FileInfo { path, modified })
+        })
+        .collect()
+}
+
+fn latest_only(files: Vec<FileInfo>) -> Vec<FileInfo> {
+    files.into_iter()
+        .max_by_key(|f| {
+            f.modified
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+        })
+        .into_iter()
+        .collect()
+}
+
 fn build_allowed_levels(args: &Args) -> HashSet<Level> {
     let mut set = HashSet::new();
+    set.insert(Level::Trace);
+    set.insert(Level::Debug);
     if args.info {
         set.insert(Level::Info);
     }
@@ -214,7 +264,6 @@ fn search_file(
 
 fn open_maybe_compressed(path: &Path) -> io::Result<DynRead> {
     let file = File::open(path)?;
-
     match path.extension().and_then(|s| s.to_str()) {
         Some("lz4") => Ok(Box::new(FrameDecoder::new(file))),
         Some("gz") => Ok(Box::new(MultiGzDecoder::new(file))),
@@ -229,6 +278,10 @@ fn detect_level(line: &str) -> Level {
         Level::Warn
     } else if line.contains(" INFO ") {
         Level::Info
+    } else if line.contains(" DEBUG ") {
+        Level::Debug
+    } else if line.contains(" TRACE ") {
+        Level::Trace
     } else {
         Level::Other
     }
@@ -275,7 +328,7 @@ fn build_plain_output(lines: &[MatchLine]) -> String {
     out
 }
 
-fn print_colored_chunked(lines: &[MatchLine]) {
+fn print_colored_chunked(lines: &[MatchLine], needle: &str, ignore_case: bool) {
     let mut current_file: Option<&Path> = None;
 
     for m in lines {
@@ -292,15 +345,43 @@ fn print_colored_chunked(lines: &[MatchLine]) {
         }
 
         let prefix = format!("{}:", cyan(&m.line_no.to_string()));
-        let rendered = colorize_line(&m.raw_line);
+        let rendered = colorize_line(&m.raw_line, needle, ignore_case);
         println!("{}{}", prefix, rendered);
     }
 }
 
-fn colorize_line(line: &str) -> String {
+fn print_list_mode(matches: &[MatchLine], files: &[FileInfo]) {
+    let mut counts: HashMap<&Path, usize> = HashMap::new();
+    for m in matches {
+        *counts.entry(m.file.as_path()).or_insert(0) += 1;
+    }
+
+    let mut rows: Vec<(&Path, usize, SystemTime)> = files
+        .iter()
+        .filter_map(|fi| {
+            let count = counts.get(fi.path.as_path())?;
+            Some((fi.path.as_path(), *count, fi.modified))
+        })
+        .collect();
+
+    rows.sort_by_key(|(_, _, modified)| modified.duration_since(UNIX_EPOCH).unwrap_or_default());
+
+    for (path, count, modified) in rows {
+        let ts = format_system_time(modified);
+        let file_colored = common::color_filename(&path.display().to_string());
+        println!(
+            "{}  {}  {}",
+            bright_black(&ts),
+            yellow(&format!("count={count}")),
+            file_colored
+        );
+    }
+}
+
+fn colorize_line(line: &str, needle: &str, ignore_case: bool) -> String {
     let mut s = line.to_string();
 
-    s = colorize_timestamp(&s);
+    s = colorize_log_timestamps(&s);
     s = colorize_level(&s);
     s = colorize_thread(&s);
     s = colorize_module_and_source(&s);
@@ -308,19 +389,29 @@ fn colorize_line(line: &str) -> String {
     s = colorize_kv_pairs(&s);
     s = colorize_hexes(&s);
     s = colorize_numbers(&s);
+    s = highlight_match(&s, needle, ignore_case);
+
     s
 }
 
-fn colorize_timestamp(input: &str) -> String {
-    let re = Regex::new(r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b").unwrap();
-    re.replace_all(input, |caps: &Captures| bright_black(&caps[0])).into_owned()
+fn colorize_log_timestamps(input: &str) -> String {
+    let iso = Regex::new(r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b").unwrap();
+    let s = iso
+        .replace_all(input, |caps: &Captures| bright_black(&caps[0]))
+        .into_owned();
+
+    let hms = Regex::new(r"\b\d{2}:\d{2}:\d{2}(?:\.\d+)?\b").unwrap();
+    hms.replace_all(&s, |caps: &Captures| bright_black(&caps[0]))
+        .into_owned()
 }
 
 fn colorize_level(input: &str) -> String {
-    let re = Regex::new(r"(?P<pre>\s)(?P<lvl>INFO|WARN|ERROR)(?P<post>\s)").unwrap();
+    let re = Regex::new(r"(?P<pre>\s)(?P<lvl>TRACE|DEBUG|INFO|WARN|ERROR)(?P<post>\s)").unwrap();
     re.replace_all(input, |caps: &Captures| {
         let lvl = &caps["lvl"];
         let colored = match lvl {
+            "TRACE" => bright_black(lvl),
+            "DEBUG" => magenta(lvl),
             "INFO" => blue_bold(lvl),
             "WARN" => yellow_bold(lvl),
             "ERROR" => red_bold(lvl),
@@ -368,7 +459,7 @@ fn colorize_kv_pairs(input: &str) -> String {
         })
         .into_owned();
 
-    let colon_re = Regex::new(r"(?m)(^|[\s(])([A-Za-z_][A-Za-z0-9_. -]{0,40}?):\s+([^\n]+?)$").unwrap();
+    let colon_re = Regex::new(r"(?m)(^|[\s(])([A-Za-z_][A-Za-z0-9_. @()/+-]{0,50}?):\s+([^\n]+?)$").unwrap();
     colon_re
         .replace_all(&s, |caps: &Captures| {
             let pre = &caps[1];
@@ -389,6 +480,20 @@ fn colorize_numbers(input: &str) -> String {
     re.replace_all(input, |caps: &Captures| bright_blue(&caps[0])).into_owned()
 }
 
+fn highlight_match(input: &str, needle: &str, ignore_case: bool) -> String {
+    if needle.is_empty() {
+        return input.to_string();
+    }
+
+    if ignore_case {
+        let re = Regex::new(&format!("(?i){}", regex::escape(needle))).unwrap();
+        re.replace_all(input, |caps: &Captures| highlight(&caps[0])).into_owned()
+    } else {
+        let re = Regex::new(&regex::escape(needle)).unwrap();
+        re.replace_all(input, |caps: &Captures| highlight(&caps[0])).into_owned()
+    }
+}
+
 fn color_key_name(key: &str) -> String {
     let hash = key
         .chars()
@@ -401,9 +506,9 @@ fn color_key_name(key: &str) -> String {
 }
 
 fn color_value(value: &str) -> String {
-    if value.eq("none") || value.eq("None") {
+    if matches!(value, "none" | "None" | "null") {
         bright_black(value)
-    } else if value.eq("true") || value.eq("false") {
+    } else if matches!(value, "true" | "false") {
         yellow(value)
     } else if value.starts_with("0x") {
         cyan_bold(value)
@@ -413,10 +518,8 @@ fn color_value(value: &str) -> String {
         green(value)
     } else if value.starts_with("Err(") {
         red(value)
-    } else if value.starts_with('{') || value.starts_with('[') || value.starts_with('"') {
-        white(value)
     } else {
-        bright_green(value)
+        white(value)
     }
 }
 
@@ -472,6 +575,16 @@ fn text_stats(s: &str) -> TextStats {
     }
 }
 
+fn format_system_time(t: SystemTime) -> String {
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => {
+            let secs = d.as_secs();
+            format!("mtime={secs}")
+        }
+        Err(_) => "mtime=<before-epoch>".to_string(),
+    }
+}
+
 fn hsl_to_rgb(h: f64, s: f64, l: f64) -> (u8, u8, u8) {
     let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
     let x = c * (1.0 - (((h / 60.0) % 2.0) - 1.0).abs());
@@ -500,6 +613,10 @@ fn bold(s: &str) -> String {
     format!("\x1b[1m{}\x1b[0m", s)
 }
 
+fn highlight(s: &str) -> String {
+    format!("\x1b[48;2;80;60;0m\x1b[38;2;255;230;120m\x1b[1m{}\x1b[0m", s)
+}
+
 fn bright_black(s: &str) -> String {
     ansi_rgb(140, 140, 140, s)
 }
@@ -520,10 +637,6 @@ fn green(s: &str) -> String {
     ansi_rgb(114, 220, 120, s)
 }
 
-fn bright_green(s: &str) -> String {
-    ansi_rgb(150, 240, 150, s)
-}
-
 fn yellow(s: &str) -> String {
     ansi_rgb(240, 210, 90, s)
 }
@@ -536,12 +649,12 @@ fn blue(s: &str) -> String {
     ansi_rgb(110, 170, 255, s)
 }
 
-fn bright_blue(s: &str) -> String {
-    ansi_rgb(140, 190, 255, s)
-}
-
 fn blue_bold(s: &str) -> String {
     format!("\x1b[1m{}\x1b[0m", blue(s))
+}
+
+fn bright_blue(s: &str) -> String {
+    ansi_rgb(140, 190, 255, s)
 }
 
 fn cyan(s: &str) -> String {
