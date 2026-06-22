@@ -65,17 +65,17 @@ fn main() -> Result<()> {
         let function_display = color_function_name(&group.function_name);
         let file_display = color_path_for_display(&group.file_path);
 
-        eprintln!(
-            "\x1b[1;36mFunction {}: {}{}{}\x1b[0m",
-            idx + 1,
-            if visibility.is_empty() {
-                ""
-            } else {
-                &format!("{} ", visibility)
-            },
-            asyncness,
-            function_display
-        );
+        // eprintln!(
+        //     "\x1b[1;36mFunction {}: {}{}{}\x1b[0m",
+        //     idx + 1,
+        //     if visibility.is_empty() {
+        //         ""
+        //     } else {
+        //         &format!("{} ", visibility)
+        //     },
+        //     asyncness,
+        //     function_display
+        // );
 
         eprintln!(
             "\x1b[90m  {}: lines {}-{}\x1b[0m",
@@ -341,17 +341,17 @@ fn build_grouped_error_report(groups: &[FunctionErrorGroup]) -> Result<String> {
         let colored_function_name = color_function_name(&group.function_name);
         let colored_file_path = color_path_for_display(&group.file_path);
         output.push_str("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-        output.push_str(&format!(
-            "Function {}: {}{}{}\n",
-            idx + 1,
-            if visibility.is_empty() {
-                ""
-            } else {
-                &format!("{} ", visibility)
-            },
-            asyncness,
-            colored_function_name
-        ));
+        // output.push_str(&format!(
+        // "Function {}: {}{}{}\n",
+        // idx + 1,
+        // if visibility.is_empty() {
+        //     ""
+        // } else {
+        //     &format!("{} ", visibility)
+        // },
+        // asyncness,
+        // colored_function_name
+        // ));
         output.push_str(&format!(
             "  {}: lines {}-{}\n",
             colored_file_path, group.function_start_line, group.function_end_line

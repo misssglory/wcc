@@ -48,6 +48,11 @@ path = "src/bin/wcs.rs"
 name = "wcm"
 path = "src/bin/wcm.rs"
 
+[[bin]]
+name = "wcmr"
+path = "src/bin/wcmr.rs"
+
+
 [dependencies]
 # Common dependencies
 anyhow = "1.0"
