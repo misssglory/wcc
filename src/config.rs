@@ -21,6 +21,8 @@ pub struct UnifiedConfig {
     pub wcg: WcgConfig,
     #[serde(default)]
     pub wrs: WrsConfig,  // Added for string replacement
+    #[serde(default)]
+    pub wcz: WczConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -102,6 +104,39 @@ pub struct WrsConfig {
     pub recursive: bool,
     pub follow_symlinks: bool,
     pub preserve_timestamps: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WczConfig {
+    /// Directory where archives are written when --output is not supplied.
+    /// None means the current working directory.
+    #[serde(default)]
+    pub default_folder: Option<String>,
+    /// Literal/glob-style ignore rules. Examples: target, .git, *.bkp.
+    #[serde(default = "default_wcz_ignore")]
+    pub ignore: Vec<String>,
+    /// Regex ignore rules matched against normalized relative paths.
+    #[serde(default)]
+    pub ignore_regexes: Vec<String>,
+}
+
+fn default_wcz_ignore() -> Vec<String> {
+    vec![
+        "target".to_string(),
+        ".git".to_string(),
+        "*.bkp".to_string(),
+    ]
+}
+
+impl Default for WczConfig {
+    fn default() -> Self {
+        Self {
+            // Missing [wcz] in an older config intentionally falls back to cwd.
+            default_folder: None,
+            ignore: default_wcz_ignore(),
+            ignore_regexes: Vec::new(),
+        }
+    }
 }
 
 fn default_impl_body_mode() -> String {
@@ -305,6 +340,10 @@ impl Default for UnifiedConfig {
             wff: WffConfig::default(),
             wcg: WcgConfig::default(),
             wrs: WrsConfig::default(),
+            wcz: WczConfig {
+                default_folder: Some("~/mg/zips/".to_string()),
+                ..WczConfig::default()
+            },
         }
     }
 }
@@ -408,6 +447,10 @@ pub fn show_config() -> Result<()> {
     println!("    recursive: {}", config.wrs.recursive);
     println!("    follow_symlinks: {}", config.wrs.follow_symlinks);
     println!("    preserve_timestamps: {}", config.wrs.preserve_timestamps);
+    println!("  [wcz]");
+    println!("    default_folder: {:?}", config.wcz.default_folder);
+    println!("    ignore: {:?}", config.wcz.ignore);
+    println!("    ignore_regexes: {:?}", config.wcz.ignore_regexes);
     println!();
     println!("  Config file: \x1b[90m{}\x1b[0m", get_config_path().display());
 
@@ -443,6 +486,7 @@ pub fn init_config() -> Result<()> {
     println!("  [wff] - wff (function finder) settings with time and line number options");
     println!("  [wcg] - code graph analyzer settings with line numbers, calls, imports, optional field nodes, and impl edges");
     println!("  [wrs] - string replacement settings for source files with {} extensions", config.wrs.source_extensions.len());
+    println!("  [wcz] - zip archive settings with {} ignore rules", config.wcz.ignore.len());
 
     Ok(())
 }

@@ -11,6 +11,7 @@ A collection of command-line tools for clipboard operations, code analysis, and 
 | `wcf` | Function replacement | Replace function implementations across Rust files |
 | `wcl` | List/Analyze | Analyze directories and copy file contents |
 | `wcc` | Command wrapper | Run commands and capture stdout/stderr to clipboard |
+| `wcz` | Zip folders | Archive one or more folders with configurable ignore rules |
 
 ## Installation
 
@@ -23,6 +24,7 @@ cargo build --release --bin wcp
 cargo build --release --bin wcf
 cargo build --release --bin wcl
 cargo build --release --bin wcc
+cargo build --release --bin wcz
 ```
 
 ## Configuration
@@ -54,6 +56,11 @@ backup_suffix = ".bkp"
 [wcf]
 auto_format = true
 backup_before_replace = true
+
+[wcz]
+default_folder = "~/mg/zips/"
+ignore = ["target", ".git", "*.bkp"]
+ignore_regexes = []
 ```
 
 
@@ -217,6 +224,28 @@ wcc config --set-cargo-mode release
 - Configurable default build mode
 
 - Shows diff statistics for changes
+
+## wcz - Zip Folders
+Archive the contents of one or more folders. For a single folder, its contents are placed at the archive root; with multiple folders each input gets its own top-level folder.
+
+```bash
+# Uses [wcz].default_folder when configured
+wcz ./project
+
+# Multiple folders
+wcz ./src ./tests
+
+# Override destination directory
+wcz -o ./zips ./project
+
+# Explicit archive path
+wcz -o ./backup.zip ./project
+
+# Override archive filename while keeping configured/default destination
+wcz -n source-snapshot ./project
+```
+
+Configuration lives in the same unified file as the other tools: `~/.config/wcc/config.toml`. `ignore` accepts literal names and `*`/`?` glob-style rules. `ignore_regexes` are matched against normalized relative paths. If `default_folder` is absent from an existing config and `--output` is not supplied, `wcz` writes to the current directory.
 
 ## Shared Features
 ### Colored Output

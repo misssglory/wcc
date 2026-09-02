@@ -52,6 +52,10 @@ path = "src/bin/wcm.rs"
 name = "wcmr"
 path = "src/bin/wcmr.rs"
 
+[[bin]]
+name = "wcz"
+path = "src/bin/wcz.rs"
+
 
 [dependencies]
 # Common dependencies
@@ -89,6 +93,7 @@ walkdir = "2.5.0"
 filetime = "0.2.29"
 jwalk = "0.8.1"
 lz4_flex = "0.13.1"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
 
 [lib]
 name = "wcc"
