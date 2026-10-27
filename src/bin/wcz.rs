@@ -29,6 +29,16 @@ struct Args {
     /// Explicit archive filename (without changing the destination directory).
     #[arg(short = 'n', long, value_name = "NAME")]
     name: Option<String>,
+
+    /// Additional ignore glob/name. Repeat the option or pass comma-separated values.
+    /// These rules are added to [wcz].ignore from the config.
+    #[arg(short = 'i', long = "ignore", value_name = "PATTERN", value_delimiter = ',')]
+    ignore: Vec<String>,
+
+    /// Additional ignore regex. Repeat the option or pass comma-separated values.
+    /// These rules are added to [wcz].ignore_regexes from the config.
+    #[arg(long = "ignore-regex", value_name = "REGEX", value_delimiter = ',')]
+    ignore_regexes: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -52,7 +62,7 @@ impl IgnoreMatcher {
             .iter()
             .map(|pattern| {
                 Regex::new(pattern)
-                    .with_context(|| format!("invalid [wcz].ignore_regexes entry {pattern:?}"))
+                    .with_context(|| format!("invalid wcz ignore regex {pattern:?}"))
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -87,7 +97,14 @@ struct ArchiveEntry {
 fn main() -> Result<()> {
     let args = Args::parse();
     let config = load_unified_config()?;
-    let matcher = IgnoreMatcher::new(&config.wcz.ignore, &config.wcz.ignore_regexes)?;
+
+    let mut ignore = config.wcz.ignore.clone();
+    ignore.extend(args.ignore.iter().cloned());
+
+    let mut ignore_regexes = config.wcz.ignore_regexes.clone();
+    ignore_regexes.extend(args.ignore_regexes.iter().cloned());
+
+    let matcher = IgnoreMatcher::new(&ignore, &ignore_regexes)?;
 
     let roots = validate_roots(&args.folders)?;
     let output_path = resolve_output_path(&args, &config.wcz.default_folder, &roots)?;

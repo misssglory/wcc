@@ -243,9 +243,18 @@ wcz -o ./backup.zip ./project
 
 # Override archive filename while keeping configured/default destination
 wcz -n source-snapshot ./project
+
+# Add one-off ignores on top of config
+wcz --ignore target --ignore '*.log' ./project
+
+# Short form; comma-separated values are also accepted
+wcz -i 'target,.git,*.tmp' ./project
+
+# Add one-off regex ignores on top of config regexes
+wcz --ignore-regex '^generated/' --ignore-regex '\\.cache$' ./project
 ```
 
-Configuration lives in the same unified file as the other tools: `~/.config/wcc/config.toml`. `ignore` accepts literal names and `*`/`?` glob-style rules. `ignore_regexes` are matched against normalized relative paths. If `default_folder` is absent from an existing config and `--output` is not supplied, `wcz` writes to the current directory.
+Configuration lives in the same unified file as the other tools: `~/.config/wcc/config.toml`. `ignore` accepts literal names and `*`/`?` glob-style rules. `ignore_regexes` are matched against normalized relative paths. CLI `--ignore`/`-i` and `--ignore-regex` values are additive: they are appended to the configured rules for that invocation only. Both flags are repeatable and also accept comma-separated values. If `default_folder` is absent from an existing config and `--output` is not supplied, `wcz` writes to the current directory.
 
 ## Shared Features
 ### Colored Output
