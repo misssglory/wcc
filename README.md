@@ -364,3 +364,14 @@ The tools share common modules:
 
 ## License
 MIT
+
+## Nix development shells
+
+`nix develop` does **not** include Nix-provided `cargo` or `rustc`, so
+entering the default shell will not fetch the large Rust compiler. It uses
+whatever Rust toolchain is already on your `PATH` (e.g. rustup's
+`~/.cargo/bin`). Verify with `command -v cargo && rustc --version`.
+
+If Rust is not installed, run `nix develop .#nix-rust` to explicitly use
+Nix-provided Cargo and rustc. `nix build` still uses Nix-managed Rust and
+may download the compiler.

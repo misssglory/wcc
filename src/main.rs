@@ -94,15 +94,16 @@ enum Msg {
     Stderr(String),
 }
 
-fn set_clipboard(command: &[String], stdout: &str, stderr: &str) -> Result<()> {
+fn set_clipboard(command: &[String], stdout: &str, stderr: &str, exit_code: Option<i32>) -> Result<()> {
     use chrono::Local;
     let timestamp = Local::now().format("%H:%M:%S %d.%m.%Y");
     let payload = format!(
-        "$ {} # {}\n\n[stdout]\n{}\n\n[stderr]\n{}",
+        "$ {} # {}\n\n[stdout]\n{}\n\n[stderr]\n{}\n\n[exit code]\n{}",
         command.join(" "),
         timestamp,
         stdout,
-        stderr
+        stderr,
+        exit_code.map(|code| code.to_string()).unwrap_or_else(|| "terminated by signal".to_string())
     );
     #[cfg(target_os = "linux")]
     {
@@ -273,6 +274,7 @@ fn run_cargo_build(release: bool, debug: bool, args: Vec<String>) -> Result<()> 
         &vec![command_str.clone()],
         &clean_stdout_str,
         &clean_stderr_str,
+        status.code(),
     );
 
     if status.success() {
@@ -349,6 +351,7 @@ fn run_cargo_run(release: bool, debug: bool, args: Vec<String>) -> Result<()> {
         &vec![command_str.clone()],
         &clean_stdout_str,
         &clean_stderr_str,
+        status.code(),
     );
 
     if status.success() {
@@ -464,7 +467,7 @@ fn run_shell_command(command: &str) -> Result<()> {
     let clean_stdout = strip_ansi_codes(&out.content);
     let clean_stderr = strip_ansi_codes(&err.content);
 
-    let _ = set_clipboard(&vec![command.to_string()], &clean_stdout, &clean_stderr);
+    let _ = set_clipboard(&vec![command.to_string()], &clean_stdout, &clean_stderr, status.code());
 
     if status.success() {
         eprintln!(
@@ -559,7 +562,7 @@ fn run_watch_command(command: Vec<String>) -> Result<()> {
     let status = child.wait().ok();
     let duration_ms = started.elapsed().as_millis();
 
-    let _ = set_clipboard(&command, &out.content, &err.content);
+    let _ = set_clipboard(&command, &out.content, &err.content, status.as_ref().and_then(|s| s.code()));
 
     use chrono::Local;
     let timestamp_local = Local::now().format("%H:%M:%S %d.%m.%Y");
