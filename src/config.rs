@@ -25,11 +25,41 @@ pub struct UnifiedConfig {
     pub wcz: WczConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WccConfig {
     pub default_cargo_mode: String,
     pub time_format: String,
+    #[serde(default = "default_editor_run_key")]
+    pub editor_run_key: String,
+    #[serde(default = "default_editor_run_alt_key")]
+    pub editor_run_alt_key: String,
+    #[serde(default = "default_editor_history_prev_key")]
+    pub editor_history_prev_key: String,
+    #[serde(default = "default_editor_history_next_key")]
+    pub editor_history_next_key: String,
+    #[serde(default = "default_editor_syntax_highlighting")]
+    pub editor_syntax_highlighting: bool,
 }
+
+impl Default for WccConfig {
+    fn default() -> Self {
+        Self {
+            default_cargo_mode: "debug".into(),
+            time_format: "%H:%M:%S %d.%m.%Y".into(),
+            editor_run_key: default_editor_run_key(),
+            editor_run_alt_key: default_editor_run_alt_key(),
+            editor_history_prev_key: default_editor_history_prev_key(),
+            editor_history_next_key: default_editor_history_next_key(),
+            editor_syntax_highlighting: true,
+        }
+    }
+}
+
+pub fn default_editor_run_key() -> String { "Ctrl+S".into() }
+pub fn default_editor_run_alt_key() -> String { "F5".into() }
+pub fn default_editor_history_prev_key() -> String { "Alt+Up".into() }
+pub fn default_editor_history_next_key() -> String { "Alt+Down".into() }
+pub fn default_editor_syntax_highlighting() -> bool { true }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WcnConfig {
@@ -289,6 +319,11 @@ impl Default for UnifiedConfig {
             wcc: WccConfig {
                 default_cargo_mode: "debug".to_string(),
                 time_format: "%H:%M:%S %d.%m.%Y".to_string(),
+                editor_run_key: default_editor_run_key(),
+                editor_run_alt_key: default_editor_run_alt_key(),
+                editor_history_prev_key: default_editor_history_prev_key(),
+                editor_history_next_key: default_editor_history_next_key(),
+                editor_syntax_highlighting: true,
             },
             wcn: WcnConfig {
                 show_time_in_header: true,
@@ -394,6 +429,11 @@ pub fn show_config() -> Result<()> {
     println!("  [wcc]");
     println!("    default_cargo_mode: \x1b[33m{}\x1b[0m", config.wcc.default_cargo_mode);
     println!("    time_format: {}", config.wcc.time_format);
+    println!("    editor_run_key: {}", config.wcc.editor_run_key);
+    println!("    editor_run_alt_key: {}", config.wcc.editor_run_alt_key);
+    println!("    editor_history_prev_key: {}", config.wcc.editor_history_prev_key);
+    println!("    editor_history_next_key: {}", config.wcc.editor_history_next_key);
+    println!("    editor_syntax_highlighting: {}", config.wcc.editor_syntax_highlighting);
     println!("  [wcn]");
     println!("    show_time_in_header: {}", config.wcn.show_time_in_header);
     println!("    use_file_modification_time: {}", config.wcn.use_file_modification_time);

@@ -36,6 +36,12 @@ history_dir = "/home/user/.local/state/wcc/history"
 compress_above_bytes = 16384
 time_format = "%H:%M:%S %d.%m.%Y"
 default_cargo_mode = "debug"
+# Multiline editor shortcuts (change these to avoid Zellij key conflicts)
+editor_run_key = "Ctrl+Enter"
+editor_run_alt_key = "F6"
+editor_history_prev_key = "F7"
+editor_history_next_key = "F8"
+editor_syntax_highlighting = true
 
 [wcl]
 max_file_size_kb = 50
@@ -213,6 +219,44 @@ wcc config --show
 wcc config --set-cargo-mode release
 ```
 
+### Interactive multiline commands
+
+Running `wcc` without arguments opens a built-in Ratatui script editor. You can
+paste or type complete Bash scripts, including newlines, loops, redirects,
+`&&`, `||`, and pipelines. The editor restores your terminal before execution;
+command output is shown normally and copied to the clipboard with the script,
+stdout, stderr, and exit code.
+
+- **Enter** inserts a newline; run/history keys are configurable under `[wcc]`.
+  Defaults: **Ctrl+S** or **F5** to run, **Alt+Up / Alt+Down** for history.
+  To avoid Zellij bindings use **Ctrl+Enter** (if supported by your terminal) or **F6**
+  to run, **F7 / F8** for history as in the example above.
+- Set any binding to `"none"` to disable it (e.g. `editor_run_key = "none"`).
+- Supported keys: `Ctrl+...`, `Alt+...`, `Shift+...`, combinations, `F1`–`F24`,
+  `Enter`, `Up`, `Down`, `Left`, `Right`, `Tab`, `Esc`, `Home`, `End`, `Delete`,
+  `Backspace`, `Insert`, `Space`, and single character keys.
+- **Esc** / **Ctrl+C** cancel (these safety keys are fixed).
+- Bash syntax highlighting is enabled by default, and can be disabled using
+  `editor_syntax_highlighting = false`. Highlighting is lexical, not full shell parsing.
+- **Arrow keys, Home, End, Backspace, Delete** edit text; bracketed paste is supported.
+- Scripts run in `bash -o pipefail -c` (falling back to `sh -c` if Bash is absent).
+  With Bash, errors in earlier pipeline stages are reflected in the final exit code.
+
+Example of an interactive script:
+
+```bash
+set -e
+cargo build --release 2>&1 | tee /tmp/wcc-build.log
+rg 'warning:|error:' /tmp/wcc-build.log || true
+```
+
+Non-interactive use is supported as well:
+
+```bash
+printf 'echo first\nprintf "hello\n" | wc -l\n' | wcc -
+wcc 'printf "hello\n" | wc -l'
+```
+
 ### Features:
 
 - Captures both stdout and stderr
@@ -375,3 +419,25 @@ whatever Rust toolchain is already on your `PATH` (e.g. rustup's
 If Rust is not installed, run `nix develop .#nix-rust` to explicitly use
 Nix-provided Cargo and rustc. `nix build` still uses Nix-managed Rust and
 may download the compiler.
+
+### Multiline editor history (F7/F8 example)
+
+`wcc` saves submitted commands, including multiline Bash scripts, as JSON lines in
+`~/.config/wcc/history` (or `$XDG_CONFIG_HOME/wcc/history`). They are now
+recalled newest-first; the first history-previous keypress loads the latest
+command. The footer shows the history count and a status message. Executing an
+empty editor no longer closes it.
+
+To configure Zellij-friendly bindings in the existing `[wcc]` section of
+`~/.config/wcc/config.toml`:
+
+```toml
+editor_run_key = "F6"
+editor_run_alt_key = "none"
+editor_history_prev_key = "F7"
+editor_history_next_key = "F8"
+editor_syntax_highlighting = true
+```
+
+If history count is zero after a successful command, inspect the writable
+`~/.config/wcc/history` file and `$XDG_CONFIG_HOME`.
