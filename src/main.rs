@@ -676,11 +676,16 @@ fn read_shell_history_merged() -> Result<Vec<String>> {
 
 // A built-in multiline editor is used when `wcc` has no arguments.
 // We deliberately avoid readline/fzf as they cannot conveniently edit whole scripts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EditorSnapshot { lines: Vec<String>, row: usize, col: usize, scroll: usize }
+
 struct CommandEditor {
     lines: Vec<String>,
     row: usize,
     col: usize, // character index, not byte index
     scroll: usize,
+    undo: Vec<EditorSnapshot>,
+    redo: Vec<EditorSnapshot>,
 }
 
 impl CommandEditor {
@@ -690,11 +695,121 @@ impl CommandEditor {
             row: 0,
             col: 0,
             scroll: 0,
+            undo: Vec::new(),
+            redo: Vec::new(),
         }
     }
 
     fn content(&self) -> String {
         self.lines.join("\n")
+    }
+
+    fn snapshot(&self) -> EditorSnapshot {
+        EditorSnapshot { lines: self.lines.clone(), row: self.row, col: self.col, scroll: self.scroll }
+    }
+
+    fn restore(&mut self, snapshot: EditorSnapshot) {
+        self.lines = snapshot.lines;
+        self.row = snapshot.row;
+        self.col = snapshot.col;
+        self.scroll = snapshot.scroll;
+    }
+
+    // One undo unit per editing action, including a whole bracketed paste or word deletion.
+    fn edit(&mut self, action: impl FnOnce(&mut Self)) {
+        let before = self.snapshot();
+        action(self);
+        if self.snapshot() != before {
+            self.undo.push(before);
+            if self.undo.len() > 500 { self.undo.remove(0); }
+            self.redo.clear();
+        }
+    }
+
+    fn undo(&mut self) -> bool {
+        if let Some(previous) = self.undo.pop() {
+            self.redo.push(self.snapshot());
+            self.restore(previous);
+            true
+        } else { false }
+    }
+
+    fn redo(&mut self) -> bool {
+        if let Some(next) = self.redo.pop() {
+            self.undo.push(self.snapshot());
+            self.restore(next);
+            true
+        } else { false }
+    }
+
+    fn absolute_col(&self) -> usize {
+        self.lines[..self.row].iter().map(|l| l.chars().count() + 1).sum::<usize>() + self.col
+    }
+
+    fn set_absolute_col(&mut self, mut position: usize) {
+        for (row, line) in self.lines.iter().enumerate() {
+            let len = line.chars().count();
+            if position <= len || row + 1 == self.lines.len() {
+                self.row = row;
+                self.col = position.min(len);
+                return;
+            }
+            position -= len + 1;
+        }
+    }
+
+    fn word_class(ch: char) -> u8 {
+        if ch.is_whitespace() { 0 }
+        else if ch.is_alphanumeric() || ch == '_' { 1 }
+        else { 2 }
+    }
+
+    fn previous_word_boundary(&self) -> usize {
+        let chars: Vec<char> = self.content().chars().collect();
+        let mut pos = self.absolute_col();
+        while pos > 0 && Self::word_class(chars[pos-1]) == 0 { pos -= 1; }
+        if pos > 0 {
+            let class = Self::word_class(chars[pos-1]);
+            while pos > 0 && Self::word_class(chars[pos-1]) == class { pos -= 1; }
+        }
+        pos
+    }
+
+    fn next_word_boundary(&self) -> usize {
+        let chars: Vec<char> = self.content().chars().collect();
+        let mut pos = self.absolute_col();
+        if pos < chars.len() && Self::word_class(chars[pos]) != 0 {
+            let class = Self::word_class(chars[pos]);
+            while pos < chars.len() && Self::word_class(chars[pos]) == class { pos += 1; }
+        }
+        while pos < chars.len() && Self::word_class(chars[pos]) == 0 { pos += 1; }
+        pos
+    }
+
+    fn move_word_left(&mut self) { let position = self.previous_word_boundary(); self.set_absolute_col(position); }
+    fn move_word_right(&mut self) { let position = self.next_word_boundary(); self.set_absolute_col(position); }
+
+    fn delete_word_backward(&mut self) {
+        let end = self.absolute_col();
+        let start = self.previous_word_boundary();
+        self.delete_char_range(start, end);
+    }
+
+    fn delete_word_forward(&mut self) {
+        let start = self.absolute_col();
+        let end = self.next_word_boundary();
+        self.delete_char_range(start, end);
+    }
+
+    fn delete_char_range(&mut self, start: usize, end: usize) {
+        if start >= end { return; }
+        let text = self.content();
+        let from = Self::byte_index(&text, start);
+        let to = Self::byte_index(&text, end);
+        let mut updated = text;
+        updated.replace_range(from..to, "");
+        self.lines = updated.split('\n').map(str::to_owned).collect();
+        self.set_absolute_col(start);
     }
 
     fn byte_index(s: &str, char_index: usize) -> usize {
@@ -762,6 +877,55 @@ impl Drop for TerminalGuard {
     }
 }
 
+// Zellij locked mode is the equivalent of Ctrl+G with the default Zellij
+// keymap. Use the action API instead of writing Ctrl+G to the terminal: that
+// could be delivered to the application, not to Zellij. A drop guard restores
+// normal mode on editor exit, cancellation and error paths.
+struct ZellijEditorLock { active: bool }
+
+impl ZellijEditorLock {
+    fn enter(enabled: bool) -> Self {
+        if !enabled || std::env::var_os("ZELLIJ").is_none() {
+            return Self { active: false };
+        }
+        match Command::new("zellij")
+            .args(["action", "switch-mode", "locked"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Ok(status) if status.success() => Self { active: true },
+            Ok(status) => {
+                eprintln!("wcc: Zellij lock failed (exit status {status}); continuing unlocked");
+                Self { active: false }
+            }
+            Err(err) => {
+                eprintln!("wcc: cannot lock Zellij: {err}; continuing unlocked");
+                Self { active: false }
+            }
+        }
+    }
+}
+
+impl Drop for ZellijEditorLock {
+    fn drop(&mut self) {
+        if self.active {
+            match Command::new("zellij")
+                .args(["action", "switch-mode", "normal"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+            {
+                Ok(status) if status.success() => (),
+                Ok(status) => eprintln!("wcc: failed to unlock Zellij (exit status {status}); press Ctrl+G"),
+                Err(err) => eprintln!("wcc: failed to unlock Zellij ({err}); press Ctrl+G"),
+            }
+        }
+    }
+}
+
 // Terminal key bindings, independent of Zellij's keymap. "none" disables a binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EditorKey { code: KeyCode, modifiers: KeyModifiers }
@@ -802,7 +966,10 @@ fn parse_editor_key(input: &str) -> Result<Option<EditorKey>> {
 
 fn editor_key_matches(binding: &Option<EditorKey>, key: &crossterm::event::KeyEvent) -> bool {
     binding.as_ref().is_some_and(|bind| {
-        bind.code == key.code && bind.modifiers ==
+        (match (bind.code, key.code) {
+            (KeyCode::Char(a), KeyCode::Char(b)) => a.eq_ignore_ascii_case(&b),
+            (a, b) => a == b,
+        }) && bind.modifiers ==
             (key.modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT))
     })
 }
@@ -875,6 +1042,12 @@ fn prompt_multiline_command() -> Result<Option<String>> {
     let run_alt_key = parse_editor_key(&config.wcc.editor_run_alt_key)?;
     let history_prev_key = parse_editor_key(&config.wcc.editor_history_prev_key)?;
     let history_next_key = parse_editor_key(&config.wcc.editor_history_next_key)?;
+    let undo_key = parse_editor_key(&config.wcc.editor_undo_key)?;
+    let redo_key = parse_editor_key(&config.wcc.editor_redo_key)?;
+    let word_left_key = parse_editor_key(&config.wcc.editor_word_left_key)?;
+    let word_right_key = parse_editor_key(&config.wcc.editor_word_right_key)?;
+    let delete_word_backward_key = parse_editor_key(&config.wcc.editor_delete_word_backward_key)?;
+    let delete_word_forward_key = parse_editor_key(&config.wcc.editor_delete_word_forward_key)?;
     let history = read_shell_history_merged().unwrap_or_else(|err| {
         eprintln!("wcc: unable to read shell history: {err:#}");
         newest_first(read_wcc_history())
@@ -883,6 +1056,7 @@ fn prompt_multiline_command() -> Result<Option<String>> {
     let mut history_index: Option<usize> = None;
     let mut draft = String::new();
     let mut editor_message = String::new();
+    let _zellij_lock = ZellijEditorLock::enter(config.wcc.editor_zellij_lock);
     enable_raw_mode()?;
     let _guard = TerminalGuard;
     execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
@@ -937,7 +1111,7 @@ fn prompt_multiline_command() -> Result<Option<String>> {
         })?;
 
         match event::read()? {
-            Event::Paste(text) => { editor.insert(&text); history_index = None; editor_message.clear(); }
+            Event::Paste(text) => { editor.edit(|ed| ed.insert(&text)); history_index = None; editor_message.clear(); }
             Event::Key(key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                 let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -949,7 +1123,21 @@ fn prompt_multiline_command() -> Result<Option<String>> {
                     break;
                 }
                 if key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && ctrl) { return Ok(None); }
-                if editor_key_matches(&history_prev_key, &key) {
+                if editor_key_matches(&undo_key, &key) {
+                    editor_message = if editor.undo() { "Undo" } else { "Nothing to undo" }.into();
+                    history_index = None;
+                } else if editor_key_matches(&redo_key, &key) {
+                    editor_message = if editor.redo() { "Redo" } else { "Nothing to redo" }.into();
+                    history_index = None;
+                } else if editor_key_matches(&word_left_key, &key) {
+                    editor.move_word_left(); editor_message.clear();
+                } else if editor_key_matches(&word_right_key, &key) {
+                    editor.move_word_right(); editor_message.clear();
+                } else if editor_key_matches(&delete_word_backward_key, &key) {
+                    editor.edit(|ed| ed.delete_word_backward()); editor_message.clear(); history_index = None;
+                } else if editor_key_matches(&delete_word_forward_key, &key) {
+                    editor.edit(|ed| ed.delete_word_forward()); editor_message.clear(); history_index = None;
+                } else if editor_key_matches(&history_prev_key, &key) {
                         if history_index.is_none() { draft = editor.content(); }
                         let index = history_index.map_or(0, |i| i.saturating_add(1));
                         if let Some(command) = history.get(index) {
@@ -974,25 +1162,25 @@ fn prompt_multiline_command() -> Result<Option<String>> {
                         }
                 } else {
                 match key.code {
-                    KeyCode::Enter => editor.newline(),
-                    KeyCode::Backspace => editor.backspace(),
-                    KeyCode::Delete => editor.delete(),
-                    KeyCode::Left => {
+                    KeyCode::Enter if !ctrl && !alt => editor.edit(|ed| ed.newline()),
+                    KeyCode::Backspace if !ctrl && !alt => editor.edit(|ed| ed.backspace()),
+                    KeyCode::Delete if !ctrl && !alt => editor.edit(|ed| ed.delete()),
+                    KeyCode::Left if !ctrl && !alt => {
                         if editor.col > 0 { editor.col -= 1; }
                         else if editor.row > 0 { editor.row -= 1; editor.col = editor.line_len(); }
                     }
-                    KeyCode::Right => {
+                    KeyCode::Right if !ctrl && !alt => {
                         if editor.col < editor.line_len() { editor.col += 1; }
                         else if editor.row + 1 < editor.lines.len() { editor.row += 1; editor.col = 0; }
                     }
-                    KeyCode::Up => editor.move_row(-1),
-                    KeyCode::Down => editor.move_row(1),
+                    KeyCode::Up if !ctrl && !alt => editor.move_row(-1),
+                    KeyCode::Down if !ctrl && !alt => editor.move_row(1),
                     KeyCode::Home => editor.col = 0,
                     KeyCode::End => editor.col = editor.line_len(),
-                    KeyCode::Tab => editor.insert("    "),
+                    KeyCode::Tab if !ctrl && !alt => editor.edit(|ed| ed.insert("    ")),
                     KeyCode::Char('a') if ctrl => editor.col = 0,
                     KeyCode::Char('e') if ctrl => editor.col = editor.line_len(),
-                    KeyCode::Char(ch) if !ctrl && !alt => editor.insert(&ch.to_string()),
+                    KeyCode::Char(ch) if !ctrl && !alt => editor.edit(|ed| ed.insert(&ch.to_string())),
                     _ => {}
                 }
                 }
@@ -1091,6 +1279,44 @@ mod multiline_editor_tests {
         assert_eq!(super::parse_editor_key("F7").unwrap().unwrap().code, crossterm::event::KeyCode::F(7));
         assert!(super::parse_editor_key("none").unwrap().is_none());
         assert!(super::parse_editor_key("Ctrl+Bogus").is_err());
+    }
+
+    #[test]
+    fn configurable_word_and_undo_keys() {
+        for key in ["Ctrl+Z", "Ctrl+Shift+Z", "Ctrl+Left", "Ctrl+Right", "Ctrl+Backspace", "Ctrl+Delete", "Alt+U"] {
+            assert!(super::parse_editor_key(key).unwrap().is_some());
+        }
+        let key = super::parse_editor_key("Ctrl+Shift+Z").unwrap().unwrap();
+        assert_eq!(key.modifiers, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        let uppercase = crossterm::event::KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert!(super::editor_key_matches(&Some(key), &uppercase));
+    }
+
+    #[test]
+    fn word_navigation_and_deletion_across_multiline_unicode() {
+        let mut ed = CommandEditor::new("echo café |\n grep ok");
+        ed.set_absolute_col(ed.content().chars().count());
+        ed.move_word_left();
+        assert_eq!(ed.content().chars().nth(ed.absolute_col()), Some('o'));
+        ed.move_word_right();
+        ed.edit(|e| e.delete_word_backward());
+        assert_eq!(ed.content(), "echo café |\n grep ");
+        ed.edit(|e| e.delete_word_backward());
+        assert_eq!(ed.content(), "echo café |\n ");
+        assert!(ed.undo());
+        assert_eq!(ed.content(), "echo café |\n grep ");
+        assert!(ed.undo());
+        assert_eq!(ed.content(), "echo café |\n grep ok");
+        assert!(ed.redo());
+        assert_eq!(ed.content(), "echo café |\n grep ");
+        ed.edit(|e| e.insert("new"));
+        assert!(!ed.redo());
+        let mut cross = CommandEditor::new("echo hi\nfoo bar");
+        cross.set_absolute_col(7);
+        cross.edit(|e| e.delete_word_forward());
+        assert_eq!(cross.content(), "echo hi bar");
+        cross.undo();
+        assert_eq!(cross.content(), "echo hi\nfoo bar");
     }
 
     #[test]

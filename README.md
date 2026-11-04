@@ -41,7 +41,15 @@ editor_run_key = "Ctrl+Enter"
 editor_run_alt_key = "F6"
 editor_history_prev_key = "F7"
 editor_history_next_key = "F8"
+editor_undo_key = "Ctrl+Z"
+editor_redo_key = "Ctrl+Shift+Z"
+editor_word_left_key = "Ctrl+Left"
+editor_word_right_key = "Ctrl+Right"
+editor_delete_word_backward_key = "Ctrl+Backspace"
+editor_delete_word_forward_key = "Ctrl+Delete"
 editor_syntax_highlighting = true
+# Opt-in: lock Zellij hotkeys while the no-argument editor is open
+editor_zellij_lock = false
 
 [wcl]
 max_file_size_kb = 50
@@ -235,6 +243,12 @@ stdout, stderr, and exit code.
 - Supported keys: `Ctrl+...`, `Alt+...`, `Shift+...`, combinations, `F1`–`F24`,
   `Enter`, `Up`, `Down`, `Left`, `Right`, `Tab`, `Esc`, `Home`, `End`, `Delete`,
   `Backspace`, `Insert`, `Space`, and single character keys.
+- **Ctrl+Z** undo, **Ctrl+Shift+Z** redo; **Ctrl+Left / Ctrl+Right** move by word;
+  **Ctrl+Backspace / Ctrl+Delete** delete a word backward/forward. All six
+  shortcuts can be overridden or set to `"none"` under `[wcc]`. Undo stores
+  up to 500 editing actions; paste and word deletion are single undo actions.
+- Terminal and Zellij must forward the configured key events to wcc. In terminals
+  that do not distinguish Ctrl+Shift+Z, choose an alternative such as `Alt+U`.
 - **Esc** / **Ctrl+C** cancel (these safety keys are fixed).
 - Bash syntax highlighting is enabled by default, and can be disabled using
   `editor_syntax_highlighting = false`. Highlighting is lexical, not full shell parsing.
@@ -441,3 +455,28 @@ editor_syntax_highlighting = true
 
 If history count is zero after a successful command, inspect the writable
 `~/.config/wcc/history` file and `$XDG_CONFIG_HOME`.
+
+### Temporarily disable Zellij shortcuts inside `wcc`
+
+In `~/.config/wcc/config.toml`, **add this setting to the existing `[wcc]` section**:
+
+```toml
+editor_zellij_lock = true
+```
+
+By default this is **false**. When enabled, interactive `wcc` (without
+arguments) checks the `ZELLIJ` environment variable and calls
+`zellij action switch-mode locked` before opening its Ratatui editor.
+This is functionally equivalent to Zellij's default **Ctrl+G** lock binding,
+but avoids injecting terminal keystrokes. On Ctrl+C, Esc, the configured
+`editor_run_key` / `editor_run_alt_key`, or an ordinary editor error, the
+editor is closed and `zellij action switch-mode normal` is invoked before
+the submitted command runs. An empty submission keeps the editor open and
+Zellij locked. Outside Zellij, the setting has no effect.
+
+The Zellij CLI must be available on PATH. Only successful locks are undone;
+failed locks show a warning and the editor continues unlocked.
+Zellij's `switch-mode` affects all clients attached to the current session,
+not just this pane. A force kill (`SIGKILL`) or power loss cannot run cleanup;
+if stuck in locked mode use **Ctrl+G** to manually unlock. This assumes the
+standard Zellij locked/normal modes and the default Ctrl+G unlock binding.

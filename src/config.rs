@@ -37,8 +37,22 @@ pub struct WccConfig {
     pub editor_history_prev_key: String,
     #[serde(default = "default_editor_history_next_key")]
     pub editor_history_next_key: String,
+    #[serde(default = "default_editor_undo_key")]
+    pub editor_undo_key: String,
+    #[serde(default = "default_editor_redo_key")]
+    pub editor_redo_key: String,
+    #[serde(default = "default_editor_word_left_key")]
+    pub editor_word_left_key: String,
+    #[serde(default = "default_editor_word_right_key")]
+    pub editor_word_right_key: String,
+    #[serde(default = "default_editor_delete_word_backward_key")]
+    pub editor_delete_word_backward_key: String,
+    #[serde(default = "default_editor_delete_word_forward_key")]
+    pub editor_delete_word_forward_key: String,
     #[serde(default = "default_editor_syntax_highlighting")]
     pub editor_syntax_highlighting: bool,
+    #[serde(default)]
+    pub editor_zellij_lock: bool,
 }
 
 impl Default for WccConfig {
@@ -50,7 +64,14 @@ impl Default for WccConfig {
             editor_run_alt_key: default_editor_run_alt_key(),
             editor_history_prev_key: default_editor_history_prev_key(),
             editor_history_next_key: default_editor_history_next_key(),
+            editor_undo_key: default_editor_undo_key(),
+            editor_redo_key: default_editor_redo_key(),
+            editor_word_left_key: default_editor_word_left_key(),
+            editor_word_right_key: default_editor_word_right_key(),
+            editor_delete_word_backward_key: default_editor_delete_word_backward_key(),
+            editor_delete_word_forward_key: default_editor_delete_word_forward_key(),
             editor_syntax_highlighting: true,
+            editor_zellij_lock: false,
         }
     }
 }
@@ -59,6 +80,12 @@ pub fn default_editor_run_key() -> String { "Ctrl+S".into() }
 pub fn default_editor_run_alt_key() -> String { "F5".into() }
 pub fn default_editor_history_prev_key() -> String { "Alt+Up".into() }
 pub fn default_editor_history_next_key() -> String { "Alt+Down".into() }
+pub fn default_editor_undo_key() -> String { "Ctrl+Z".into() }
+pub fn default_editor_redo_key() -> String { "Ctrl+Shift+Z".into() }
+pub fn default_editor_word_left_key() -> String { "Ctrl+Left".into() }
+pub fn default_editor_word_right_key() -> String { "Ctrl+Right".into() }
+pub fn default_editor_delete_word_backward_key() -> String { "Ctrl+Backspace".into() }
+pub fn default_editor_delete_word_forward_key() -> String { "Ctrl+Delete".into() }
 pub fn default_editor_syntax_highlighting() -> bool { true }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -323,7 +350,14 @@ impl Default for UnifiedConfig {
                 editor_run_alt_key: default_editor_run_alt_key(),
                 editor_history_prev_key: default_editor_history_prev_key(),
                 editor_history_next_key: default_editor_history_next_key(),
-                editor_syntax_highlighting: true,
+                editor_undo_key: default_editor_undo_key(),
+            editor_redo_key: default_editor_redo_key(),
+            editor_word_left_key: default_editor_word_left_key(),
+            editor_word_right_key: default_editor_word_right_key(),
+            editor_delete_word_backward_key: default_editor_delete_word_backward_key(),
+            editor_delete_word_forward_key: default_editor_delete_word_forward_key(),
+            editor_syntax_highlighting: true,
+            editor_zellij_lock: false,
             },
             wcn: WcnConfig {
                 show_time_in_header: true,
@@ -433,7 +467,14 @@ pub fn show_config() -> Result<()> {
     println!("    editor_run_alt_key: {}", config.wcc.editor_run_alt_key);
     println!("    editor_history_prev_key: {}", config.wcc.editor_history_prev_key);
     println!("    editor_history_next_key: {}", config.wcc.editor_history_next_key);
+    println!("    editor_undo_key: {}", config.wcc.editor_undo_key);
+    println!("    editor_redo_key: {}", config.wcc.editor_redo_key);
+    println!("    editor_word_left_key: {}", config.wcc.editor_word_left_key);
+    println!("    editor_word_right_key: {}", config.wcc.editor_word_right_key);
+    println!("    editor_delete_word_backward_key: {}", config.wcc.editor_delete_word_backward_key);
+    println!("    editor_delete_word_forward_key: {}", config.wcc.editor_delete_word_forward_key);
     println!("    editor_syntax_highlighting: {}", config.wcc.editor_syntax_highlighting);
+    println!("    editor_zellij_lock: {}", config.wcc.editor_zellij_lock);
     println!("  [wcn]");
     println!("    show_time_in_header: {}", config.wcn.show_time_in_header);
     println!("    use_file_modification_time: {}", config.wcn.use_file_modification_time);
