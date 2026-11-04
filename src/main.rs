@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use arboard::Clipboard;
 use clap::{Parser, Subcommand};
 use crossterm::{
-    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -873,7 +873,7 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags, DisableBracketedPaste, LeaveAlternateScreen);
     }
 }
 
@@ -1044,6 +1044,7 @@ fn prompt_multiline_command() -> Result<Option<String>> {
     let history_next_key = parse_editor_key(&config.wcc.editor_history_next_key)?;
     let undo_key = parse_editor_key(&config.wcc.editor_undo_key)?;
     let redo_key = parse_editor_key(&config.wcc.editor_redo_key)?;
+    let redo_alt_key = parse_editor_key(&config.wcc.editor_redo_alt_key)?;
     let word_left_key = parse_editor_key(&config.wcc.editor_word_left_key)?;
     let word_right_key = parse_editor_key(&config.wcc.editor_word_right_key)?;
     let delete_word_backward_key = parse_editor_key(&config.wcc.editor_delete_word_backward_key)?;
@@ -1059,7 +1060,10 @@ fn prompt_multiline_command() -> Result<Option<String>> {
     let _zellij_lock = ZellijEditorLock::enter(config.wcc.editor_zellij_lock);
     enable_raw_mode()?;
     let _guard = TerminalGuard;
-    execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+    // Kitty keyboard enhancement preserves Ctrl+Shift+Z as distinct from Ctrl+Z
+    // on terminals/multiplexers that support the protocol.
+    execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES))?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     loop {
@@ -1123,11 +1127,12 @@ fn prompt_multiline_command() -> Result<Option<String>> {
                     break;
                 }
                 if key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && ctrl) { return Ok(None); }
-                if editor_key_matches(&undo_key, &key) {
-                    editor_message = if editor.undo() { "Undo" } else { "Nothing to undo" }.into();
-                    history_index = None;
-                } else if editor_key_matches(&redo_key, &key) {
+                // Redo before undo so distinct modifiers take precedence.
+                if editor_key_matches(&redo_key, &key) || editor_key_matches(&redo_alt_key, &key) {
                     editor_message = if editor.redo() { "Redo" } else { "Nothing to redo" }.into();
+                    history_index = None;
+                } else if editor_key_matches(&undo_key, &key) {
+                    editor_message = if editor.undo() { "Undo" } else { "Nothing to undo" }.into();
                     history_index = None;
                 } else if editor_key_matches(&word_left_key, &key) {
                     editor.move_word_left(); editor_message.clear();
@@ -1290,6 +1295,21 @@ mod multiline_editor_tests {
         assert_eq!(key.modifiers, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
         let uppercase = crossterm::event::KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
         assert!(super::editor_key_matches(&Some(key), &uppercase));
+    }
+
+    #[test]
+    fn redo_fallback_is_distinct_from_undo() {
+        let undo = super::parse_editor_key("Ctrl+Z").unwrap();
+        let redo = super::parse_editor_key("Ctrl+Shift+Z").unwrap();
+        let fallback = super::parse_editor_key("Alt+U").unwrap();
+        let ctrl_z = crossterm::event::KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL);
+        let ctrl_shift_z = crossterm::event::KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        let alt_u = crossterm::event::KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT);
+        assert!(super::editor_key_matches(&undo, &ctrl_z));
+        assert!(!super::editor_key_matches(&redo, &ctrl_z));
+        assert!(super::editor_key_matches(&redo, &ctrl_shift_z));
+        assert!(!super::editor_key_matches(&undo, &ctrl_shift_z));
+        assert!(super::editor_key_matches(&fallback, &alt_u));
     }
 
     #[test]

@@ -43,6 +43,7 @@ editor_history_prev_key = "F7"
 editor_history_next_key = "F8"
 editor_undo_key = "Ctrl+Z"
 editor_redo_key = "Ctrl+Shift+Z"
+editor_redo_alt_key = "Alt+U" # fallback when terminal/Zellij loses Ctrl+Shift modifier
 editor_word_left_key = "Ctrl+Left"
 editor_word_right_key = "Ctrl+Right"
 editor_delete_word_backward_key = "Ctrl+Backspace"
@@ -480,3 +481,11 @@ Zellij's `switch-mode` affects all clients attached to the current session,
 not just this pane. A force kill (`SIGKILL`) or power loss cannot run cleanup;
 if stuck in locked mode use **Ctrl+G** to manually unlock. This assumes the
 standard Zellij locked/normal modes and the default Ctrl+G unlock binding.
+
+### Redo and terminal key encoding
+
+The editor requests Kitty keyboard enhancement (`DISAMBIGUATE_ESCAPE_CODES`)
+so compatible terminals/Zellij can distinguish `Ctrl+Shift+Z` from `Ctrl+Z`.
+If the terminal still emits identical events, the application cannot distinguish
+them. Use `Alt+U` to redo (configured via `editor_redo_alt_key`), or override
+`editor_redo_key = "Alt+U"` and `editor_redo_alt_key = "none"`.

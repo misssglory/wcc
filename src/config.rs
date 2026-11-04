@@ -41,6 +41,8 @@ pub struct WccConfig {
     pub editor_undo_key: String,
     #[serde(default = "default_editor_redo_key")]
     pub editor_redo_key: String,
+    #[serde(default = "default_editor_redo_alt_key")]
+    pub editor_redo_alt_key: String,
     #[serde(default = "default_editor_word_left_key")]
     pub editor_word_left_key: String,
     #[serde(default = "default_editor_word_right_key")]
@@ -66,6 +68,7 @@ impl Default for WccConfig {
             editor_history_next_key: default_editor_history_next_key(),
             editor_undo_key: default_editor_undo_key(),
             editor_redo_key: default_editor_redo_key(),
+            editor_redo_alt_key: default_editor_redo_alt_key(),
             editor_word_left_key: default_editor_word_left_key(),
             editor_word_right_key: default_editor_word_right_key(),
             editor_delete_word_backward_key: default_editor_delete_word_backward_key(),
@@ -82,6 +85,7 @@ pub fn default_editor_history_prev_key() -> String { "Alt+Up".into() }
 pub fn default_editor_history_next_key() -> String { "Alt+Down".into() }
 pub fn default_editor_undo_key() -> String { "Ctrl+Z".into() }
 pub fn default_editor_redo_key() -> String { "Ctrl+Shift+Z".into() }
+pub fn default_editor_redo_alt_key() -> String { "Alt+U".into() }
 pub fn default_editor_word_left_key() -> String { "Ctrl+Left".into() }
 pub fn default_editor_word_right_key() -> String { "Ctrl+Right".into() }
 pub fn default_editor_delete_word_backward_key() -> String { "Ctrl+Backspace".into() }
@@ -352,6 +356,7 @@ impl Default for UnifiedConfig {
                 editor_history_next_key: default_editor_history_next_key(),
                 editor_undo_key: default_editor_undo_key(),
             editor_redo_key: default_editor_redo_key(),
+            editor_redo_alt_key: default_editor_redo_alt_key(),
             editor_word_left_key: default_editor_word_left_key(),
             editor_word_right_key: default_editor_word_right_key(),
             editor_delete_word_backward_key: default_editor_delete_word_backward_key(),
@@ -469,6 +474,7 @@ pub fn show_config() -> Result<()> {
     println!("    editor_history_next_key: {}", config.wcc.editor_history_next_key);
     println!("    editor_undo_key: {}", config.wcc.editor_undo_key);
     println!("    editor_redo_key: {}", config.wcc.editor_redo_key);
+    println!("    editor_redo_alt_key: {}", config.wcc.editor_redo_alt_key);
     println!("    editor_word_left_key: {}", config.wcc.editor_word_left_key);
     println!("    editor_word_right_key: {}", config.wcc.editor_word_right_key);
     println!("    editor_delete_word_backward_key: {}", config.wcc.editor_delete_word_backward_key);
