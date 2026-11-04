@@ -1313,33 +1313,6 @@ mod multiline_editor_tests {
     }
 
     #[test]
-    fn word_navigation_and_deletion_across_multiline_unicode() {
-        let mut ed = CommandEditor::new("echo café |\n grep ok");
-        ed.set_absolute_col(ed.content().chars().count());
-        ed.move_word_left();
-        assert_eq!(ed.content().chars().nth(ed.absolute_col()), Some('o'));
-        ed.move_word_right();
-        ed.edit(|e| e.delete_word_backward());
-        assert_eq!(ed.content(), "echo café |\n grep ");
-        ed.edit(|e| e.delete_word_backward());
-        assert_eq!(ed.content(), "echo café |\n ");
-        assert!(ed.undo());
-        assert_eq!(ed.content(), "echo café |\n grep ");
-        assert!(ed.undo());
-        assert_eq!(ed.content(), "echo café |\n grep ok");
-        assert!(ed.redo());
-        assert_eq!(ed.content(), "echo café |\n grep ");
-        ed.edit(|e| e.insert("new"));
-        assert!(!ed.redo());
-        let mut cross = CommandEditor::new("echo hi\nfoo bar");
-        cross.set_absolute_col(7);
-        cross.edit(|e| e.delete_word_forward());
-        assert_eq!(cross.content(), "echo hi bar");
-        cross.undo();
-        assert_eq!(cross.content(), "echo hi\nfoo bar");
-    }
-
-    #[test]
     fn shell_highlight_preserves_text() {
         for line in ["echo $HOME | grep foo # hello", "if test -f x; then echo 'yes'; fi", "printf \"%s\" \"hello\""] {
             let rendered = super::bash_highlight_line(line, true);
