@@ -228,6 +228,26 @@ wcc config --show
 wcc config --set-cargo-mode release
 ```
 
+### Plain clipboard payload on stdout (`-o` / `--output`)
+
+Use `-o` to write the **exact plain-text clipboard payload** to stdout instead of
+copying it. Normal command output and colored status messages are suppressed in
+this mode; the command's stdout, stderr and exit code are embedded in the payload.
+The flag applies to normal commands, the multiline editor, and Cargo wrappers.
+Failures still return a nonzero exit status. Regular mode is unchanged.
+
+```bash
+wcc -o 'echo hello' > command-result.txt
+wcc -o 'echo hello | wc -c' | cat
+wcc -o build --release > build-result.txt
+wcc -o run > run-result.txt
+wcc -o               # interactive: editor uses /dev/tty, stdout stays clean
+```
+
+The payload format is `$ command # timestamp`, `[stdout]`, `[stderr]`,
+`[exit code]`. No ANSI color codes, live output, or additional status text
+is written to stdout. Clipboard contents are not replaced when `-o` is used.
+
 ### Interactive multiline commands
 
 Running `wcc` without arguments opens a built-in Ratatui script editor. You can

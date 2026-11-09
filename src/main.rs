@@ -38,6 +38,10 @@ use wcc::load_unified_config;
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Run commands and copy output to clipboard")]
 struct Cli {
+    /// Print the clipboard payload to stdout as plain text instead of copying it.
+    #[arg(short = 'o', long = "output", global = true)]
+    output: bool,
+
     #[command(subcommand)]
     command: Option<Mode>,
 
@@ -107,17 +111,31 @@ enum Msg {
     Stderr(String),
 }
 
-fn set_clipboard(command: &[String], stdout: &str, stderr: &str, exit_code: Option<i32>) -> Result<()> {
+fn format_clipboard_payload(command: &[String], stdout: &str, stderr: &str, exit_code: Option<i32>) -> String {
     use chrono::Local;
     let timestamp = Local::now().format("%H:%M:%S %d.%m.%Y");
-    let payload = format!(
+    format!(
         "$ {} # {}\n\n[stdout]\n{}\n\n[stderr]\n{}\n\n[exit code]\n{}",
         command.join(" "),
         timestamp,
-        stdout,
-        stderr,
+        strip_ansi_codes(stdout),
+        strip_ansi_codes(stderr),
         exit_code.map(|code| code.to_string()).unwrap_or_else(|| "terminated by signal".to_string())
-    );
+    )
+}
+
+fn emit_output(command: &[String], stdout: &str, stderr: &str, exit_code: Option<i32>, output: bool) -> Result<()> {
+    let payload = format_clipboard_payload(command, stdout, stderr, exit_code);
+    if output {
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(payload.as_bytes())?;
+        stdout.flush()?;
+        return Ok(());
+    }
+    set_clipboard_text(&payload)
+}
+
+fn set_clipboard_text(payload: &str) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         if std::env::var_os("WAYLAND_DISPLAY").is_some() {
@@ -139,7 +157,7 @@ fn set_clipboard(command: &[String], stdout: &str, stderr: &str, exit_code: Opti
         }
     }
     let mut cb = Clipboard::new().context("clipboard init failed")?;
-    cb.set_text(payload)?;
+    cb.set_text(payload.to_owned())?;
     Ok(())
 }
 
@@ -227,7 +245,7 @@ fn read_wcc_history() -> Vec<String> {
     Vec::new()
 }
 
-fn run_cargo_build(release: bool, debug: bool, args: Vec<String>) -> Result<()> {
+fn run_cargo_build(release: bool, debug: bool, args: Vec<String>, output: bool) -> Result<()> {
     let config = load_unified_config()?;
 
     let is_release = if release {
@@ -247,7 +265,7 @@ fn run_cargo_build(release: bool, debug: bool, args: Vec<String>) -> Result<()> 
     let timestamp = chrono::Local::now().format("%H:%M:%S %d.%m.%Y");
     let command_str = format!("cargo {}", cargo_args.join(" "));
 
-    eprintln!("\x1b[36m📦 Running {}\x1b[0m # {}", command_str, timestamp);
+    if !output { eprintln!("\x1b[36m📦 Running {}\x1b[0m # {}", command_str, timestamp); }
 
     let mut child = Command::new("cargo")
         .args(&cargo_args)
@@ -271,13 +289,11 @@ fn run_cargo_build(release: bool, debug: bool, args: Vec<String>) -> Result<()> 
         match msg {
             Msg::Stdout(s) => {
                 out.push(&s);
-                print!("{s}");
-                io::stdout().flush()?;
+                if !output { print!("{s}"); io::stdout().flush()?; }
             }
             Msg::Stderr(s) => {
                 err.push(&s);
-                eprint!("{s}");
-                io::stderr().flush()?;
+                if !output { eprint!("{s}"); io::stderr().flush()?; }
             }
         }
     }
@@ -287,24 +303,19 @@ fn run_cargo_build(release: bool, debug: bool, args: Vec<String>) -> Result<()> 
     let clean_stdout_str = strip_ansi_codes(&out.content);
     let clean_stderr_str = strip_ansi_codes(&err.content);
 
-    let _ = set_clipboard(
-        &vec![command_str.clone()],
-        &clean_stdout_str,
-        &clean_stderr_str,
-        status.code(),
-    );
+    emit_output(&[command_str.clone()], &clean_stdout_str, &clean_stderr_str, status.code(), output)?;
 
     if status.success() {
-        eprintln!("\n\x1b[1;32m✓ Build successful\x1b[0m");
+        if !output { eprintln!("\n\x1b[1;32m✓ Build successful\x1b[0m"); }
     } else {
-        eprintln!("\n\x1b[1;31m✗ Build failed\x1b[0m");
+        if !output { eprintln!("\n\x1b[1;31m✗ Build failed\x1b[0m"); }
         std::process::exit(status.code().unwrap_or(1));
     }
 
     Ok(())
 }
 
-fn run_cargo_run(release: bool, debug: bool, args: Vec<String>) -> Result<()> {
+fn run_cargo_run(release: bool, debug: bool, args: Vec<String>, output: bool) -> Result<()> {
     let config = load_unified_config()?;
 
     let is_release = if release {
@@ -324,7 +335,7 @@ fn run_cargo_run(release: bool, debug: bool, args: Vec<String>) -> Result<()> {
     let timestamp = chrono::Local::now().format("%H:%M:%S %d.%m.%Y");
     let command_str = format!("cargo {}", cargo_args.join(" "));
 
-    eprintln!("\x1b[36m🏃 Running {}\x1b[0m # {}", command_str, timestamp);
+    if !output { eprintln!("\x1b[36m🏃 Running {}\x1b[0m # {}", command_str, timestamp); }
 
     let mut child = Command::new("cargo")
         .args(&cargo_args)
@@ -348,13 +359,11 @@ fn run_cargo_run(release: bool, debug: bool, args: Vec<String>) -> Result<()> {
         match msg {
             Msg::Stdout(s) => {
                 out.push(&s);
-                print!("{s}");
-                io::stdout().flush()?;
+                if !output { print!("{s}"); io::stdout().flush()?; }
             }
             Msg::Stderr(s) => {
                 err.push(&s);
-                eprint!("{s}");
-                io::stderr().flush()?;
+                if !output { eprint!("{s}"); io::stderr().flush()?; }
             }
         }
     }
@@ -364,20 +373,15 @@ fn run_cargo_run(release: bool, debug: bool, args: Vec<String>) -> Result<()> {
     let clean_stdout_str = strip_ansi_codes(&out.content);
     let clean_stderr_str = strip_ansi_codes(&err.content);
 
-    let _ = set_clipboard(
-        &vec![command_str.clone()],
-        &clean_stdout_str,
-        &clean_stderr_str,
-        status.code(),
-    );
+    emit_output(&[command_str.clone()], &clean_stdout_str, &clean_stderr_str, status.code(), output)?;
 
     if status.success() {
-        eprintln!("\n\x1b[1;32m✓ Run completed\x1b[0m");
+        if !output { eprintln!("\n\x1b[1;32m✓ Run completed\x1b[0m"); }
     } else {
-        eprintln!(
+        if !output { eprintln!(
             "\n\x1b[1;31m✗ Run failed with exit code: {:?}\x1b[0m",
             status.code()
-        );
+        ); }
         std::process::exit(status.code().unwrap_or(1));
     }
 
@@ -437,13 +441,13 @@ fn show_config() -> Result<()> {
     Ok(())
 }
 
-fn run_shell_command(command: &str) -> Result<()> {
+fn run_shell_command(command: &str, output: bool) -> Result<()> {
     use chrono::Local;
 
     append_wcc_history_entry(command);
 
     let timestamp = Local::now().format("%H:%M:%S %d.%m.%Y");
-    eprintln!("\x1b[36m🔧 Running: {}\x1b[0m # {}", command, timestamp);
+    if !output { eprintln!("\x1b[36m🔧 Running: {}\x1b[0m # {}", command, timestamp); }
 
     // Bash + pipefail: a failure in any pipeline stage gives a nonzero status.
     // Fall back to POSIX sh if bash is not available.
@@ -473,13 +477,11 @@ fn run_shell_command(command: &str) -> Result<()> {
         match msg {
             Msg::Stdout(s) => {
                 out.push(&s);
-                print!("{s}");
-                io::stdout().flush()?;
+                if !output { print!("{s}"); io::stdout().flush()?; }
             }
             Msg::Stderr(s) => {
                 err.push(&s);
-                eprint!("{s}");
-                io::stderr().flush()?;
+                if !output { eprint!("{s}"); io::stderr().flush()?; }
             }
         }
     }
@@ -489,28 +491,28 @@ fn run_shell_command(command: &str) -> Result<()> {
     let clean_stdout = strip_ansi_codes(&out.content);
     let clean_stderr = strip_ansi_codes(&err.content);
 
-    let _ = set_clipboard(&vec![command.to_string()], &clean_stdout, &clean_stderr, status.code());
+    emit_output(&[command.to_string()], &clean_stdout, &clean_stderr, status.code(), output)?;
 
     if status.success() {
-        eprintln!(
+        if !output { eprintln!(
             "\n\x1b[1;32m✓ Command completed\x1b[0m # {}",
             timestamp_local
-        );
+        ); }
     } else {
-        eprintln!(
+        if !output { eprintln!(
             "\n\x1b[1;31m✗ Command failed with exit code: {}\x1b[0m # {}",
             status.code().map(|code| code.to_string()).unwrap_or_else(|| "terminated by signal".into()),
             timestamp_local
-        );
+        ); }
         std::process::exit(status.code().unwrap_or(1));
     }
 
-    eprintln!("  Copied to clipboard!");
+    if !output { eprintln!("  Copied to clipboard!"); }
 
     Ok(())
 }
 
-fn run_watch_command(command: Vec<String>) -> Result<()> {
+fn run_watch_command(command: Vec<String>, output: bool) -> Result<()> {
     anyhow::ensure!(!command.is_empty(), "usage: wcc -- cmd args");
     let term = Arc::new(AtomicBool::new(false));
     flag::register(SIGINT, Arc::clone(&term))?;
@@ -547,13 +549,11 @@ fn run_watch_command(command: Vec<String>) -> Result<()> {
             match msg {
                 Msg::Stdout(s) => {
                     out.push(&s);
-                    print!("{s}");
-                    io::stdout().flush()?;
+                    if !output { print!("{s}"); io::stdout().flush()?; }
                 }
                 Msg::Stderr(s) => {
                     err.push(&s);
-                    eprint!("{s}");
-                    io::stderr().flush()?;
+                    if !output { eprint!("{s}"); io::stderr().flush()?; }
                 }
             }
         }
@@ -566,13 +566,11 @@ fn run_watch_command(command: Vec<String>) -> Result<()> {
                 match msg {
                     Msg::Stdout(s) => {
                         out.push(&s);
-                        print!("{s}");
-                        io::stdout().flush()?;
+                        if !output { print!("{s}"); io::stdout().flush()?; }
                     }
                     Msg::Stderr(s) => {
                         err.push(&s);
-                        eprint!("{s}");
-                        io::stderr().flush()?;
+                        if !output { eprint!("{s}"); io::stderr().flush()?; }
                     }
                 }
             }
@@ -584,21 +582,24 @@ fn run_watch_command(command: Vec<String>) -> Result<()> {
     let status = child.wait().ok();
     let duration_ms = started.elapsed().as_millis();
 
-    let _ = set_clipboard(&command, &out.content, &err.content, status.as_ref().and_then(|s| s.code()));
+    emit_output(&command, &out.content, &err.content, status.as_ref().and_then(|s| s.code()), output)?;
 
     use chrono::Local;
     let timestamp_local = Local::now().format("%H:%M:%S %d.%m.%Y");
-    eprintln!(
-        "\n\x1b[1;32m✓ Command completed\x1b[0m # {}",
-        timestamp_local
-    );
-    eprintln!("  Exit code: {:?}", status.and_then(|s| s.code()));
-    eprintln!(
-        "  Duration: {:.2?}",
-        Duration::from_millis(duration_ms as u64)
-    );
-    eprintln!("  Copied to clipboard!");
-
+    if !output {
+        eprintln!(
+            "\n\x1b[1;32m✓ Command completed\x1b[0m # {}",
+            timestamp_local
+        );
+        eprintln!("  Exit code: {:?}", status.as_ref().and_then(|s| s.code()));
+        eprintln!("  Duration: {:.2?}", Duration::from_millis(duration_ms as u64));
+    }
+    if !output { eprintln!("  Copied to clipboard!"); }
+    if output {
+        if let Some(code) = status.and_then(|s| s.code()) {
+            if code != 0 { std::process::exit(code); }
+        }
+    }
     Ok(())
 }
 
@@ -868,12 +869,22 @@ impl CommandEditor {
     }
 }
 
-struct TerminalGuard;
+struct TerminalGuard { use_tty: bool }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags, DisableBracketedPaste, LeaveAlternateScreen);
+        if self.use_tty {
+            if let Ok(tty) = fs::OpenOptions::new().write(true).open("/dev/tty") {
+                // Crossterm's execute! calls by_ref(), which requires a sized
+                // writer and is ambiguous on File (both Read and Write).
+                // BufWriter<File> implements Write only and is sized.
+                let mut writer = io::BufWriter::new(tty);
+                let _ = execute!(writer, PopKeyboardEnhancementFlags, DisableBracketedPaste, LeaveAlternateScreen);
+            }
+        } else {
+            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags, DisableBracketedPaste, LeaveAlternateScreen);
+        }
     }
 }
 
@@ -1032,8 +1043,8 @@ fn bash_highlight_line(text: &str, enabled: bool) -> Line<'static> {
     Line::from(spans)
 }
 
-fn prompt_multiline_command() -> Result<Option<String>> {
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+fn prompt_multiline_command(output: bool) -> Result<Option<String>> {
+    if !io::stdin().is_terminal() || (!output && !io::stdout().is_terminal()) {
         anyhow::bail!("interactive wcc requires a terminal; use wcc 'script' or pipe a script into wcc -");
     }
 
@@ -1059,12 +1070,18 @@ fn prompt_multiline_command() -> Result<Option<String>> {
     let mut editor_message = String::new();
     let _zellij_lock = ZellijEditorLock::enter(config.wcc.editor_zellij_lock);
     enable_raw_mode()?;
-    let _guard = TerminalGuard;
+    let _guard = TerminalGuard { use_tty: output };
     // Kitty keyboard enhancement preserves Ctrl+Shift+Z as distinct from Ctrl+Z
     // on terminals/multiplexers that support the protocol.
-    execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste,
+    let mut terminal_output: Box<dyn Write> = if output {
+        Box::new(fs::OpenOptions::new().write(true).open("/dev/tty")
+            .context("-o interactive editor requires /dev/tty")?)
+    } else {
+        Box::new(io::stdout())
+    };
+    execute!(terminal_output, EnterAlternateScreen, EnableBracketedPaste,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES))?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(terminal_output))?;
 
     loop {
         terminal.draw(|frame| {
@@ -1206,14 +1223,14 @@ fn main() -> Result<()> {
             debug,
             args,
         }) => {
-            run_cargo_build(release, debug, args)?;
+            run_cargo_build(release, debug, args, cli.output)?;
         }
         Some(Mode::Run {
             release,
             debug,
             args,
         }) => {
-            run_cargo_run(release, debug, args)?;
+            run_cargo_run(release, debug, args, cli.output)?;
         }
         Some(Mode::Config {
             set_cargo_mode,
@@ -1253,21 +1270,21 @@ fn main() -> Result<()> {
                 if !io::stdin().is_terminal() {
                     let mut script = String::new();
                     io::stdin().read_to_string(&mut script)?;
-                    if !script.trim().is_empty() { run_shell_command(&script)?; }
-                } else if let Some(command_str) = prompt_multiline_command()? {
-                    run_shell_command(&command_str)?;
+                    if !script.trim().is_empty() { run_shell_command(&script, cli.output)?; }
+                } else if let Some(command_str) = prompt_multiline_command(cli.output)? {
+                    run_shell_command(&command_str, cli.output)?;
                 }
             } else if cli.cmd.len() == 1 && cli.cmd[0] == "-" {
                 let mut script = String::new();
                 io::stdin().read_to_string(&mut script)?;
                 anyhow::ensure!(!script.trim().is_empty(), "no script supplied on stdin");
-                run_shell_command(&script)?;
+                run_shell_command(&script, cli.output)?;
             } else {
                 let command_str = cli.cmd.join(" ");
                 if is_shell_builtin_or_alias(&command_str) {
-                    run_shell_command(&command_str)?;
+                    run_shell_command(&command_str, cli.output)?;
                 } else {
-                    run_watch_command(cli.cmd)?;
+                    run_watch_command(cli.cmd, cli.output)?;
                 }
             }
         }
@@ -1347,5 +1364,27 @@ mod multiline_editor_tests {
         editor.col = 0;
         editor.delete();
         assert!(editor.content().starts_with("cho café"));
+    }
+}
+
+#[cfg(test)]
+mod output_mode_tests {
+    use super::*;
+
+    #[test]
+    fn clipboard_payload_format_and_ansi_stripping() {
+        let data = format_clipboard_payload(
+            &["echo hi".to_owned()], "\x1b[31mred\x1b[0m\n", "\x1b[33mwarning\x1b[0m", Some(7)
+        );
+        assert!(data.starts_with("$ echo hi # "));
+        assert!(data.contains("[stdout]\nred\n\n[stderr]\nwarning\n\n[exit code]\n7"));
+        assert!(!data.contains('\x1b'));
+    }
+
+    #[test]
+    fn output_flag_parses_with_shell_and_cargo() {
+        assert!(Cli::try_parse_from(["wcc", "-o", "echo hello"]).unwrap().output);
+        assert!(Cli::try_parse_from(["wcc", "-o", "build"]).unwrap().output);
+        assert!(Cli::try_parse_from(["wcc", "run", "-o"]).unwrap().output);
     }
 }
