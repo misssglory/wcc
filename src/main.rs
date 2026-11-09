@@ -1377,7 +1377,9 @@ mod output_mode_tests {
             &["echo hi".to_owned()], "\x1b[31mred\x1b[0m\n", "\x1b[33mwarning\x1b[0m", Some(7)
         );
         assert!(data.starts_with("$ echo hi # "));
-        assert!(data.contains("[stdout]\nred\n\n[stderr]\nwarning\n\n[exit code]\n7"));
+        // stdout already ends in a newline; the payload adds two more
+        // before the stderr heading. Preserve command output verbatim.
+        assert!(data.contains("[stdout]\nred\n\n\n[stderr]\nwarning\n\n[exit code]\n7"));
         assert!(!data.contains('\x1b'));
     }
 
